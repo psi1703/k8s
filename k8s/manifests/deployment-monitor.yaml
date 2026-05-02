@@ -17,6 +17,9 @@ spec:
       labels:
         app: otp-monitor
     spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+
       securityContext:
         runAsNonRoot: true
         runAsUser: 999
@@ -27,13 +30,13 @@ spec:
           image: otp-monitor:latest
           imagePullPolicy: IfNotPresent
 
-          # ── Environment: non-secret config from ConfigMap ────────────────
           envFrom:
             - configMapRef:
                 name: otp-relay-config
 
-          # ── Environment: secrets ─────────────────────────────────────────
           env:
+            - name: OTP_RELAY_DATA_DIR
+              value: /app/data
             - name: WHATSAPP_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -45,15 +48,14 @@ spec:
                   name: otp-relay-secrets
                   key: WHATSAPP_RECIPIENT
 
-          # ── CAP_NET_RAW — required for arping ────────────────────────────
-          # arping sends raw ARP packets which requires this capability.
-          # We add only this capability and drop all others for least privilege.
           securityContext:
+            allowPrivilegeEscalation: false
             capabilities:
-              add: ["NET_RAW"]
-              drop: ["ALL"]
+              drop:
+                - ALL
+              add:
+                - NET_RAW
 
-          # ── Resource limits ──────────────────────────────────────────────
           resources:
             requests:
               cpu: 50m
@@ -62,10 +64,6 @@ spec:
               cpu: 200m
               memory: 128Mi
 
-          # ── Volume mount — shares PVC with the app pod ───────────────────
-          # The monitor reads and writes the audit log at /app/data/audit.log.
-          # This is the same PVC mounted by the app pod, so both services
-          # share a single audit log file on the same node.
           volumeMounts:
             - name: data
               mountPath: /app/data
