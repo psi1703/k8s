@@ -1,23 +1,38 @@
 # OTP Relay Server — main.py
-# Stack: FastAPI + Python 3.12
+# Stack: FastAPI + Python 3.12 + Exchange SMTP (internal only)
 # No external APIs. Runs entirely on your company LAN.
 #
-# Delivery model: OTP is displayed on-screen via polling.
-# No email. No SMTP. No external dependencies.
+# Delivery model: OTP is displayed on-screen via polling. Email is NOT used
+# for OTP delivery. SMTP config and /admin/smtp-test are retained for
+# diagnostics only.
 
-import os, re, asyncio, logging, json
+import os, re, asyncio, logging, smtplib, json, secrets
 from collections import deque
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Optional, Any, Dict, List
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
 
 import openpyxl
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+import bcrypt
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+FRONTEND_DIR = BASE_DIR / "frontend"
+
+
+def _resolve_runtime_path(value: str) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else BASE_DIR / path
+
+
+load_dotenv(BASE_DIR / ".env")
 
 app = FastAPI(title="OTP Relay")
 
@@ -31,18 +46,27 @@ app.add_middleware(
 # ── Config ────────────────────────────────────────────────────────────────────
 SMS_SECRET_TOKEN = os.getenv("SMS_SECRET_TOKEN", "changeme")
 
+SMTP_HOST        = os.getenv("SMTP_HOST", "mail.company.local")
+SMTP_PORT        = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER        = os.getenv("SMTP_USER", "otp-relay@company.com")
+SMTP_PASSWORD    = os.getenv("SMTP_PASSWORD", "")
+SMTP_USE_TLS     = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
+SMTP_AUTH        = os.getenv("SMTP_AUTH", "true").lower() == "true"
+FROM_EMAIL       = os.getenv("FROM_EMAIL", SMTP_USER)
+FROM_NAME        = os.getenv("FROM_NAME", "OTP Relay")
+
 # How long the active user has to trigger their OTP before being evicted.
 # Other users wait until this window expires or OTP is delivered.
-CLAIM_EXPIRY_SEC    = int(os.getenv("CLAIM_EXPIRY_SEC",    "90"))
+CLAIM_EXPIRY_SEC  = int(os.getenv("CLAIM_EXPIRY_SEC", "90"))
 
 # How long the delivered OTP stays visible on-screen before being purged.
-OTP_DISPLAY_SEC     = int(os.getenv("OTP_DISPLAY_SEC",     "285"))   # 4 min 45 sec
+OTP_DISPLAY_SEC   = int(os.getenv("OTP_DISPLAY_SEC", "285"))   # 4 min 45 sec
 
 # If two claims arrive within this window, log a concurrent_risk event.
 CONCURRENT_RISK_SEC = int(os.getenv("CONCURRENT_RISK_SEC", "30"))
 
-USERS_EXCEL_PATH = os.getenv("USERS_EXCEL_PATH", "data/users.xlsx")
-AUDIT_LOG_PATH   = os.getenv("AUDIT_LOG_PATH",   "data/audit.log")
+USERS_EXCEL_PATH = str(_resolve_runtime_path(os.getenv("USERS_EXCEL_PATH", "data/users.xlsx")))
+AUDIT_LOG_PATH   = str(_resolve_runtime_path(os.getenv("AUDIT_LOG_PATH", "data/audit.log")))
 
 # ── State ─────────────────────────────────────────────────────────────────────
 # Queue: max depth 1 enforced at claim time. Others wait and poll.
@@ -59,6 +83,88 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
 logger = logging.getLogger("otp-relay")
+
+
+# ── Server-backed wizard/admin state ─────────────────────────────────────────
+DATA_DIR = _resolve_runtime_path(os.environ.get("OTP_RELAY_DATA_DIR", "data"))
+WIZARD_FILE = DATA_DIR / "wizard_progress.json"
+AUTH_FILE = DATA_DIR / "admin_auth.json"
+CONFIG_FILE = DATA_DIR / "admin_config.json"
+DEFAULT_ADMIN_TOKENS = ["JPR", "AMD", "SCH"]
+ADMIN_TTL_SECONDS = 8 * 60 * 60
+ADMIN_SESSIONS: Dict[str, float] = {}
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _ensure_data_dir() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+def _read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"Could not read {path}: {e}")
+        return default
+
+def _write_json(path: Path, payload: Any) -> None:
+    _ensure_data_dir()
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+def _wizard_db() -> Dict[str, dict]:
+    return _read_json(WIZARD_FILE, {})
+
+def _save_wizard_db(db: Dict[str, dict]) -> None:
+    _write_json(WIZARD_FILE, db)
+
+def _auth_db() -> Dict[str, Any]:
+    return _read_json(AUTH_FILE, {})
+
+def _save_auth_db(db: Dict[str, Any]) -> None:
+    _write_json(AUTH_FILE, db)
+
+def _config_db() -> Dict[str, Any]:
+    env_tokens = os.environ.get("ADMIN_TOKENS", "")
+    env_default = [t.strip().upper() for t in env_tokens.split(",") if t.strip()] or DEFAULT_ADMIN_TOKENS
+    return _read_json(CONFIG_FILE, {"admin_tokens": env_default})
+
+def _save_config_db(db: Dict[str, Any]) -> None:
+    _write_json(CONFIG_FILE, db)
+
+def _purge_admin_sessions() -> None:
+    now_ts = datetime.now(timezone.utc).timestamp()
+    stale = [s for s, ts in ADMIN_SESSIONS.items() if now_ts - ts > ADMIN_TTL_SECONDS]
+    for s in stale:
+        ADMIN_SESSIONS.pop(s, None)
+
+def _require_admin(session: Optional[str]) -> None:
+    _purge_admin_sessions()
+    if not session:
+        raise HTTPException(status_code=401, detail="Missing admin session")
+    ts = ADMIN_SESSIONS.get(session)
+    if not ts:
+        raise HTTPException(status_code=401, detail="Invalid admin session")
+    ADMIN_SESSIONS[session] = datetime.now(timezone.utc).timestamp()
+
+class WizardRecord(BaseModel):
+    token: str
+    display_name: str = ""
+    iits_username: str = ""
+    adm_username: str = ""
+    completed: List[str] = Field(default_factory=list)
+    adminCompleted: List[str] = Field(default_factory=list)
+    iits_pw_date: Optional[str] = None
+    adm_pw_date: Optional[str] = None
+    vpn_date: Optional[str] = None
+
+class CredentialPayload(BaseModel):
+    credential: str
+    current: Optional[str] = None
+
+class ConfigPayload(BaseModel):
+    admin_tokens: List[str]
 
 
 # ── User loading ──────────────────────────────────────────────────────────────
@@ -78,8 +184,8 @@ def load_users_from_excel(path: str) -> int:
         for c in next(ws.iter_rows(min_row=1, max_row=1))
     ]
 
-    loaded      = 0
-    skipped     = 0
+    loaded   = 0
+    skipped  = 0
     seen_tokens = {}
 
     for row_num, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
@@ -189,6 +295,28 @@ def extract_otp(text: str) -> str:
     return match.group() if match else "—"
 
 
+# ── Email (diagnostics only — not used for OTP delivery) ─────────────────────
+def send_email(to_email: str, name: str, subject: str, html: str):
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = f"{FROM_NAME} <{FROM_EMAIL}>"
+    msg["To"]      = to_email
+    msg.attach(MIMEText(html, "html"))
+
+    if SMTP_USE_TLS:
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+        server.ehlo()
+        server.starttls()
+    else:
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+
+    if SMTP_AUTH:
+        server.login(SMTP_USER, SMTP_PASSWORD)
+
+    server.sendmail(FROM_EMAIL, to_email, msg.as_string())
+    server.quit()
+
+
 # ── Background task ───────────────────────────────────────────────────────────
 async def background_purge():
     """Runs every 15 seconds to expire stale queue entries and OTP display windows."""
@@ -230,9 +358,9 @@ async def claim_otp(request: Request):
             remaining = max(0, int(CLAIM_EXPIRY_SEC - age))
             audit("claim_duplicate", token, f"Already at position {i+1}", "warn")
             return {
-                "status":      "already_queued",
-                "position":    i + 1,
-                "expires_in":  remaining,
+                "status":     "already_queued",
+                "position":   i + 1,
+                "expires_in": remaining,
                 "queue_depth": len(claim_queue),
             }
 
@@ -263,10 +391,10 @@ async def claim_otp(request: Request):
         "claimed_at": now,
     })
 
-    position    = len(claim_queue)
+    position   = len(claim_queue)
     queue_depth = len(claim_queue)
 
-    # Worst-case wait: each person ahead gets the full CLAIM_EXPIRY_SEC.
+    # Worst-case wait: each person ahead of them gets the full CLAIM_EXPIRY_SEC.
     # Position 1 = active now, position 2 = up to 1×90s, etc.
     wait_estimate = max(0, (position - 1) * CLAIM_EXPIRY_SEC)
 
@@ -277,7 +405,7 @@ async def claim_otp(request: Request):
         "name":          users[token]["name"],
         "expires_in":    CLAIM_EXPIRY_SEC,
         "queue_depth":   queue_depth,
-        "wait_estimate": wait_estimate,
+        "wait_estimate": wait_estimate,   # seconds, worst case
     }
 
 
@@ -301,8 +429,9 @@ async def claim_status(token: str):
     # Still in the claim queue
     for i, claim in enumerate(claim_queue):
         if claim["token"] == token:
-            age           = (datetime.utcnow() - claim["claimed_at"]).total_seconds()
-            remaining     = max(0, int(CLAIM_EXPIRY_SEC - age))
+            age       = (datetime.utcnow() - claim["claimed_at"]).total_seconds()
+            remaining = max(0, int(CLAIM_EXPIRY_SEC - age))
+            # Worst-case wait for users behind position 1
             wait_estimate = max(0, i * CLAIM_EXPIRY_SEC)
             return {
                 "status":        "waiting",
@@ -419,5 +548,156 @@ async def reload_users():
     return {"status": "ok", "users_loaded": count}
 
 
+@app.get("/admin/smtp-test")
+async def smtp_test():
+    """Sends a test email to the relay account — use to verify Exchange connectivity."""
+    html = """<div style="font-family:Arial,sans-serif;padding:24px">
+      <p>OTP Relay SMTP test — if you can read this, Exchange is working. 🎉</p>
+    </div>"""
+    try:
+        send_email(FROM_EMAIL, "OTP Relay", "OTP Relay — SMTP connectivity test", html)
+        return {"status": "ok", "sent_to": FROM_EMAIL}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+
+
+# ── Wizard/admin server-backed endpoints ─────────────────────────────────────
+@app.get("/admin/auth/status")
+async def admin_auth_status():
+    return {"configured": bool(_auth_db().get("password_hash"))}
+
+
+@app.post("/admin/auth/setup")
+async def admin_auth_setup(payload: CredentialPayload):
+    cred = (payload.credential or "").strip()
+    if len(cred) < 4:
+        raise HTTPException(status_code=400, detail="Credential too short")
+    db = _auth_db()
+    if db.get("password_hash"):
+        if not payload.current:
+            raise HTTPException(status_code=400, detail="Current credential required")
+        if not bcrypt.checkpw(payload.current.encode("utf-8"), db["password_hash"].encode("utf-8")):
+            raise HTTPException(status_code=401, detail="Current credential incorrect")
+    hashed = bcrypt.hashpw(cred.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    _save_auth_db({"password_hash": hashed, "updated_at": _now_iso()})
+    session = secrets.token_urlsafe(24)
+    ADMIN_SESSIONS[session] = datetime.now(timezone.utc).timestamp()
+    audit("admin_auth_setup", detail="Admin credential configured")
+    return {"status": "ok", "session": session}
+
+
+@app.post("/admin/auth/login")
+async def admin_auth_login(payload: CredentialPayload):
+    db = _auth_db()
+    stored = db.get("password_hash")
+    if not stored:
+        raise HTTPException(status_code=400, detail="Admin credential not configured")
+    if not bcrypt.checkpw((payload.credential or "").encode("utf-8"), stored.encode("utf-8")):
+        audit("admin_auth_failed", detail="Incorrect admin credential", status="warn")
+        raise HTTPException(status_code=401, detail="Incorrect credential")
+    session = secrets.token_urlsafe(24)
+    ADMIN_SESSIONS[session] = datetime.now(timezone.utc).timestamp()
+    audit("admin_auth_login", detail="Admin session opened")
+    return {"status": "ok", "session": session}
+
+
+@app.post("/admin/auth/logout")
+async def admin_auth_logout(x_admin_session: Optional[str] = Header(default=None)):
+    if x_admin_session:
+        ADMIN_SESSIONS.pop(x_admin_session, None)
+    return {"status": "ok"}
+
+
+@app.get("/admin/config")
+async def admin_config(x_admin_session: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_session)
+    return _config_db()
+
+
+@app.post("/admin/config")
+async def admin_config_save(payload: ConfigPayload, x_admin_session: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_session)
+    tokens = [t.strip().upper() for t in payload.admin_tokens if t.strip()]
+    _save_config_db({"admin_tokens": tokens, "updated_at": _now_iso()})
+    audit("admin_config_saved", detail=f"Configured admin tokens: {', '.join(tokens) or 'none'}")
+    return {"status": "ok", "admin_tokens": tokens}
+
+
+@app.post("/wizard/progress")
+async def wizard_progress_save(payload: WizardRecord):
+    token = payload.token.strip().upper()
+    if token not in users:
+        raise HTTPException(status_code=404, detail="Unknown token")
+    db = _wizard_db()
+    row = payload.model_dump()
+    row["token"] = token
+    row["updated_at"] = _now_iso()
+    db[token] = row
+    _save_wizard_db(db)
+    audit("wizard_progress_saved", token=token, detail="Wizard profile/progress updated")
+    return {"status": "ok", "record": row}
+
+
+@app.get("/wizard/progress/{token}")
+async def wizard_progress_get(token: str):
+    token = token.strip().upper()
+    if token not in users:
+        raise HTTPException(status_code=404, detail="Unknown token")
+    db = _wizard_db()
+    return db.get(token, {
+        "token": token,
+        "display_name": users[token]["name"],
+        "iits_username": "",
+        "adm_username": "",
+        "completed": [],
+        "adminCompleted": [],
+        "iits_pw_date": None,
+        "adm_pw_date": None,
+        "vpn_date": None,
+    })
+
+
+@app.get("/admin/wizard")
+async def admin_wizard(x_admin_session: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_session)
+    db = _wizard_db()
+    merged = []
+    for token, u in sorted(users.items()):
+        rec = db.get(token, {})
+        merged.append({
+            "token": token,
+            "display_name": rec.get("display_name") or u.get("name", ""),
+            "email": u.get("email", ""),
+            "iits_username": rec.get("iits_username", ""),
+            "adm_username": rec.get("adm_username", ""),
+            "completed": rec.get("completed", []),
+            "adminCompleted": rec.get("adminCompleted", []),
+            "iits_pw_date": rec.get("iits_pw_date"),
+            "adm_pw_date": rec.get("adm_pw_date"),
+            "vpn_date": rec.get("vpn_date"),
+            "updated_at": rec.get("updated_at"),
+        })
+    return {"users": merged}
+
+
+@app.post("/api/onboard/notify")
+async def onboard_notify(request: Request):
+    payload = await request.json()
+    token = str(payload.get("token", "") or "").strip().upper() or None
+    detail = json.dumps(payload, sort_keys=True)[:500]
+    audit("onboard_notify", token=token, detail=detail)
+    return {"status": "ok", "received": payload, "ts": _now_iso()}
+
+
+@app.get("/guide.html", include_in_schema=False)
+def serve_guide_html():
+    guide_path = FRONTEND_DIR / "guide.html"
+    if not guide_path.exists():
+        raise HTTPException(status_code=404, detail="guide.html not deployed")
+    return FileResponse(guide_path)
+
+
 # Serve frontend — must be last
-app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
+app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
