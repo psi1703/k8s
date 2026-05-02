@@ -1,4 +1,4 @@
-# OTP Relay Server — main.py
+# OTP Relay Server - main.py
 # Stack: FastAPI + Python 3.12 + Exchange SMTP (internal only)
 # No external APIs. Runs entirely on your company LAN.
 #
@@ -6,22 +6,28 @@
 # for OTP delivery. SMTP config and /admin/smtp-test are retained for
 # diagnostics only.
 
-import os, re, asyncio, logging, smtplib, json, secrets
+import asyncio
+import json
+import logging
+import os
+import re
+import secrets
+import smtplib
 from collections import deque
 from datetime import datetime, timezone
-from typing import Optional, Any, Dict, List
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
+import bcrypt
 import openpyxl
-from fastapi import FastAPI, Request, HTTPException, Header
+from dotenv import load_dotenv
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-import bcrypt
 
 BASE_DIR = Path(__file__).resolve().parent
 FRONTEND_DIR = BASE_DIR / "frontend"
@@ -38,44 +44,43 @@ app = FastAPI(title="OTP Relay")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # safe — server is LAN-only
+    allow_origins=["*"],  # safe for current LAN-only deployment
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# -- Config -------------------------------------------------------------------
 SMS_SECRET_TOKEN = os.getenv("SMS_SECRET_TOKEN", "changeme")
 
-SMTP_HOST        = os.getenv("SMTP_HOST", "mail.company.local")
-SMTP_PORT        = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER        = os.getenv("SMTP_USER", "otp-relay@company.com")
-SMTP_PASSWORD    = os.getenv("SMTP_PASSWORD", "")
-SMTP_USE_TLS     = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
-SMTP_AUTH        = os.getenv("SMTP_AUTH", "true").lower() == "true"
-FROM_EMAIL       = os.getenv("FROM_EMAIL", SMTP_USER)
-FROM_NAME        = os.getenv("FROM_NAME", "OTP Relay")
+SMTP_HOST = os.getenv("SMTP_HOST", "mail.company.local")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "otp-relay@company.com")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
+SMTP_AUTH = os.getenv("SMTP_AUTH", "true").lower() == "true"
+FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_USER)
+FROM_NAME = os.getenv("FROM_NAME", "OTP Relay")
 
 # How long the active user has to trigger their OTP before being evicted.
 # Other users wait until this window expires or OTP is delivered.
-CLAIM_EXPIRY_SEC  = int(os.getenv("CLAIM_EXPIRY_SEC", "90"))
+CLAIM_EXPIRY_SEC = int(os.getenv("CLAIM_EXPIRY_SEC", "90"))
 
 # How long the delivered OTP stays visible on-screen before being purged.
-OTP_DISPLAY_SEC   = int(os.getenv("OTP_DISPLAY_SEC", "285"))   # 4 min 45 sec
+OTP_DISPLAY_SEC = int(os.getenv("OTP_DISPLAY_SEC", "285"))  # 4 min 45 sec
 
 # If two claims arrive within this window, log a concurrent_risk event.
 CONCURRENT_RISK_SEC = int(os.getenv("CONCURRENT_RISK_SEC", "30"))
 
 USERS_EXCEL_PATH = str(_resolve_runtime_path(os.getenv("USERS_EXCEL_PATH", "data/users.xlsx")))
-AUDIT_LOG_PATH   = str(_resolve_runtime_path(os.getenv("AUDIT_LOG_PATH", "data/audit.log")))
+AUDIT_LOG_PATH = str(_resolve_runtime_path(os.getenv("AUDIT_LOG_PATH", "data/audit.log")))
 
-# ── State ─────────────────────────────────────────────────────────────────────
-# Queue: max depth 1 enforced at claim time. Others wait and poll.
-users: dict        = {}
+# -- State --------------------------------------------------------------------
+users: Dict[str, Dict[str, str]] = {}
 claim_queue: deque = deque()
 
-# Delivered OTPs held in memory only — never written to disk or logs.
+# Delivered OTPs held in memory only - never written to disk or logs.
 # Structure: { token: { "otp": str, "arrived_at": datetime } }
-pending_otps: dict = {}
+pending_otps: Dict[str, Dict[str, Any]] = {}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,8 +89,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("otp-relay")
 
-
-# ── Server-backed wizard/admin state ─────────────────────────────────────────
+# -- Server-backed wizard/admin state -----------------------------------------
 DATA_DIR = _resolve_runtime_path(os.environ.get("OTP_RELAY_DATA_DIR", "data"))
 WIZARD_FILE = DATA_DIR / "wizard_progress.json"
 AUTH_FILE = DATA_DIR / "admin_auth.json"
@@ -94,50 +98,69 @@ DEFAULT_ADMIN_TOKENS = ["JPR", "AMD", "SCH"]
 ADMIN_TTL_SECONDS = 8 * 60 * 60
 ADMIN_SESSIONS: Dict[str, float] = {}
 
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+
 def _ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def _read_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.warning(f"Could not read {path}: {e}")
+        raw = path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return default
+        return json.loads(raw)
+    except Exception as exc:
+        logger.warning("Could not read %s: %s", path, exc)
         return default
 
+
 def _write_json(path: Path, payload: Any) -> None:
+    """Write JSON atomically so a pod restart cannot leave a half-written file."""
     _ensure_data_dir()
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
 
 def _wizard_db() -> Dict[str, dict]:
     return _read_json(WIZARD_FILE, {})
 
+
 def _save_wizard_db(db: Dict[str, dict]) -> None:
     _write_json(WIZARD_FILE, db)
+
 
 def _auth_db() -> Dict[str, Any]:
     return _read_json(AUTH_FILE, {})
 
+
 def _save_auth_db(db: Dict[str, Any]) -> None:
     _write_json(AUTH_FILE, db)
+
 
 def _config_db() -> Dict[str, Any]:
     env_tokens = os.environ.get("ADMIN_TOKENS", "")
     env_default = [t.strip().upper() for t in env_tokens.split(",") if t.strip()] or DEFAULT_ADMIN_TOKENS
     return _read_json(CONFIG_FILE, {"admin_tokens": env_default})
 
+
 def _save_config_db(db: Dict[str, Any]) -> None:
     _write_json(CONFIG_FILE, db)
 
+
 def _purge_admin_sessions() -> None:
     now_ts = datetime.now(timezone.utc).timestamp()
-    stale = [s for s, ts in ADMIN_SESSIONS.items() if now_ts - ts > ADMIN_TTL_SECONDS]
-    for s in stale:
-        ADMIN_SESSIONS.pop(s, None)
+    stale = [session for session, ts in ADMIN_SESSIONS.items() if now_ts - ts > ADMIN_TTL_SECONDS]
+    for session in stale:
+        ADMIN_SESSIONS.pop(session, None)
+
 
 def _require_admin(session: Optional[str]) -> None:
     _purge_admin_sessions()
@@ -147,6 +170,14 @@ def _require_admin(session: Optional[str]) -> None:
     if not ts:
         raise HTTPException(status_code=401, detail="Invalid admin session")
     ADMIN_SESSIONS[session] = datetime.now(timezone.utc).timestamp()
+
+
+def _model_dump(model: BaseModel) -> Dict[str, Any]:
+    """Support both Pydantic v1 and v2."""
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
+
 
 class WizardRecord(BaseModel):
     token: str
@@ -159,166 +190,176 @@ class WizardRecord(BaseModel):
     adm_pw_date: Optional[str] = None
     vpn_date: Optional[str] = None
 
+
 class CredentialPayload(BaseModel):
     credential: str
     current: Optional[str] = None
+
 
 class ConfigPayload(BaseModel):
     admin_tokens: List[str]
 
 
-# ── User loading ──────────────────────────────────────────────────────────────
+# -- User loading --------------------------------------------------------------
 def load_users_from_excel(path: str) -> int:
     """
     Reads users.xlsx. Expected columns (row 1 = headers):
-      token  — 2 or 3 character unique string, e.g. AH or AHM
-      name   — display name
-      email  — company email address
+      token - 2 or 3 character unique string, e.g. AH or AHM
+      name  - display name
+      email - company email address
     Column names are case-insensitive.
     Skipped rows are written to the audit log so IT can fix them.
     """
     wb = openpyxl.load_workbook(path)
     ws = wb.active
     raw_headers = [
-        str(c.value).strip().lower() if c.value else ""
-        for c in next(ws.iter_rows(min_row=1, max_row=1))
+        str(cell.value).strip().lower() if cell.value else ""
+        for cell in next(ws.iter_rows(min_row=1, max_row=1))
     ]
 
-    loaded   = 0
-    skipped  = 0
-    seen_tokens = {}
+    loaded = 0
+    skipped = 0
+    seen_tokens: Dict[str, int] = {}
 
     for row_num, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-        if all(v is None for v in row):
+        if all(value is None for value in row):
             continue
 
         row_dict = dict(zip(raw_headers, row))
         token = str(row_dict.get("token", "") or "").strip().upper()
-        name  = str(row_dict.get("name",  "") or "").strip()
+        name = str(row_dict.get("name", "") or "").strip()
         email = str(row_dict.get("email", "") or "").strip()
 
         if len(token) == 0:
-            audit("import_skipped", detail=f"Row {row_num}: empty token — name={repr(name)} email={repr(email)}", status="warn")
-            skipped += 1; continue
+            audit("import_skipped", detail=f"Row {row_num}: empty token - name={repr(name)} email={repr(email)}", status="warn")
+            skipped += 1
+            continue
 
         if not (2 <= len(token) <= 3):
             audit("import_skipped", token=token, detail=f"Row {row_num}: token must be 2 or 3 characters, got {len(token)} ({repr(token)})", status="warn")
-            skipped += 1; continue
+            skipped += 1
+            continue
 
-        if not re.match(r'^[A-Z0-9]+$', token):
-            audit("import_skipped", token=token, detail=f"Row {row_num}: token contains invalid characters ({repr(token)}) — only letters and digits allowed", status="warn")
-            skipped += 1; continue
+        if not re.match(r"^[A-Z0-9]+$", token):
+            audit("import_skipped", token=token, detail=f"Row {row_num}: token contains invalid characters ({repr(token)}) - only letters and digits allowed", status="warn")
+            skipped += 1
+            continue
 
         if not email:
             audit("import_skipped", token=token, detail=f"Row {row_num}: missing email address for {repr(name)}", status="warn")
-            skipped += 1; continue
+            skipped += 1
+            continue
 
         if "@" not in email:
             audit("import_skipped", token=token, detail=f"Row {row_num}: invalid email address {repr(email)}", status="warn")
-            skipped += 1; continue
+            skipped += 1
+            continue
 
         if token in seen_tokens:
-            audit("import_skipped", token=token, detail=f"Row {row_num}: duplicate token — already defined at row {seen_tokens[token]}", status="warn")
-            skipped += 1; continue
+            audit("import_skipped", token=token, detail=f"Row {row_num}: duplicate token - already defined at row {seen_tokens[token]}", status="warn")
+            skipped += 1
+            continue
 
         seen_tokens[token] = row_num
         users[token] = {"token": token, "name": name, "email": email}
         loaded += 1
 
-    logger.info(f"Loaded {loaded} users from {path} ({skipped} rows skipped)")
+    logger.info("Loaded %s users from %s (%s rows skipped)", loaded, path, skipped)
     if skipped > 0:
-        audit("import_complete", detail=f"{loaded} users loaded, {skipped} rows skipped — check import_skipped entries above", status="warn")
+        audit("import_complete", detail=f"{loaded} users loaded, {skipped} rows skipped - check import_skipped entries above", status="warn")
     else:
         audit("import_complete", detail=f"{loaded} users loaded, no issues")
     return loaded
 
 
-# ── Audit log ─────────────────────────────────────────────────────────────────
-def audit(event: str, token: Optional[str] = None, detail: str = "", status: str = "info"):
+# -- Audit log ----------------------------------------------------------------
+def audit(event: str, token: Optional[str] = None, detail: str = "", status: str = "info") -> None:
     entry = {
-        "ts":     datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "event":  event,
-        "token":  token or "",
+        "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "event": event,
+        "token": token or "",
         "detail": detail,
         "status": status,
     }
     try:
-        Path(AUDIT_LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
-        with open(AUDIT_LOG_PATH, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-    except Exception as e:
-        logger.warning(f"Could not write audit log: {e}")
+        audit_path = Path(AUDIT_LOG_PATH)
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        with audit_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry) + "\n")
+    except Exception as exc:
+        logger.warning("Could not write audit log: %s", exc)
+
     level = {"info": logging.INFO, "warn": logging.WARNING, "error": logging.ERROR}.get(status, logging.INFO)
-    logger.log(level, f"[{event}] token={token or '—'}  {detail}")
+    logger.log(level, "[%s] token=%s  %s", event, token or "-", detail)
 
 
 def read_audit_log(limit: int = 200) -> list:
     try:
-        lines = Path(AUDIT_LOG_PATH).read_text().strip().splitlines()
-        entries = [json.loads(l) for l in lines if l.strip()]
+        lines = Path(AUDIT_LOG_PATH).read_text(encoding="utf-8").strip().splitlines()
+        entries = [json.loads(line) for line in lines if line.strip()]
         return list(reversed(entries))[:limit]
     except FileNotFoundError:
         return []
-    except Exception as e:
-        logger.warning(f"Could not read audit log: {e}")
+    except Exception as exc:
+        logger.warning("Could not read audit log: %s", exc)
         return []
 
 
-# ── Queue and OTP state helpers ───────────────────────────────────────────────
-def purge_expired():
+# -- Queue and OTP state helpers ----------------------------------------------
+def purge_expired() -> None:
     """Evict the front-of-queue claim if it has exceeded CLAIM_EXPIRY_SEC."""
     now = datetime.utcnow()
     while claim_queue:
         age = (now - claim_queue[0]["claimed_at"]).total_seconds()
         if age > CLAIM_EXPIRY_SEC:
             expired = claim_queue.popleft()
-            audit("claim_expired", expired["token"],
-                  f"No OTP arrived within {CLAIM_EXPIRY_SEC}s — evicted from slot 1", "warn")
+            audit("claim_expired", expired["token"], f"No OTP arrived within {CLAIM_EXPIRY_SEC}s - evicted from slot 1", "warn")
         else:
             break
 
 
-def purge_stale_otps():
+def purge_stale_otps() -> None:
     """Remove delivered OTPs that have exceeded OTP_DISPLAY_SEC."""
     now = datetime.utcnow()
     stale = [
-        tok for tok, v in pending_otps.items()
-        if (now - v["arrived_at"]).total_seconds() > OTP_DISPLAY_SEC
+        token for token, value in pending_otps.items()
+        if (now - value["arrived_at"]).total_seconds() > OTP_DISPLAY_SEC
     ]
-    for tok in stale:
-        del pending_otps[tok]
-        audit("otp_display_expired", tok, f"OTP display window closed after {OTP_DISPLAY_SEC}s")
+    for token in stale:
+        del pending_otps[token]
+        audit("otp_display_expired", token, f"OTP display window closed after {OTP_DISPLAY_SEC}s")
 
 
 def extract_otp(text: str) -> str:
-    match = re.search(r'\b\d{4,8}\b', text)
-    return match.group() if match else "—"
+    match = re.search(r"\b\d{4,8}\b", text)
+    return match.group() if match else "-"
 
 
-# ── Email (diagnostics only — not used for OTP delivery) ─────────────────────
-def send_email(to_email: str, name: str, subject: str, html: str):
+# -- Email diagnostics ---------------------------------------------------------
+def send_email(to_email: str, name: str, subject: str, html: str) -> None:
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"]    = f"{FROM_NAME} <{FROM_EMAIL}>"
-    msg["To"]      = to_email
+    msg["From"] = f"{FROM_NAME} <{FROM_EMAIL}>"
+    msg["To"] = to_email
     msg.attach(MIMEText(html, "html"))
 
     if SMTP_USE_TLS:
-        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20)
         server.ehlo()
         server.starttls()
     else:
-        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20)
 
-    if SMTP_AUTH:
-        server.login(SMTP_USER, SMTP_PASSWORD)
+    try:
+        if SMTP_AUTH:
+            server.login(SMTP_USER, SMTP_PASSWORD)
+        server.sendmail(FROM_EMAIL, to_email, msg.as_string())
+    finally:
+        server.quit()
 
-    server.sendmail(FROM_EMAIL, to_email, msg.as_string())
-    server.quit()
 
-
-# ── Background task ───────────────────────────────────────────────────────────
-async def background_purge():
+# -- Background task -----------------------------------------------------------
+async def background_purge() -> None:
     """Runs every 15 seconds to expire stale queue entries and OTP display windows."""
     while True:
         await asyncio.sleep(15)
@@ -326,22 +367,32 @@ async def background_purge():
         purge_stale_otps()
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
-
+# -- Endpoints ----------------------------------------------------------------
 @app.on_event("startup")
-async def startup():
+async def startup() -> None:
+    _ensure_data_dir()
     if os.path.exists(USERS_EXCEL_PATH):
         count = load_users_from_excel(USERS_EXCEL_PATH)
         audit("server_start", detail=f"{count} users loaded")
     else:
-        logger.warning(f"users.xlsx not found at {USERS_EXCEL_PATH}")
-        audit("server_start", detail="No users.xlsx — POST /admin/reload-users after adding it", status="warn")
+        logger.warning("users.xlsx not found at %s", USERS_EXCEL_PATH)
+        audit("server_start", detail="No users.xlsx - POST /admin/reload-users after adding it", status="warn")
     asyncio.create_task(background_purge())
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
+
+
+@app.get("/readyz")
+async def readyz():
+    return {"status": "ok", "users_loaded": len(users)}
 
 
 @app.post("/claim-otp")
 async def claim_otp(request: Request):
-    data  = await request.json()
+    data = await request.json()
     token = str(data.get("token", "")).strip().upper()
 
     if token not in users:
@@ -351,61 +402,54 @@ async def claim_otp(request: Request):
     purge_expired()
     purge_stale_otps()
 
-    # Already queued — return current status without re-queuing
     for i, claim in enumerate(claim_queue):
         if claim["token"] == token:
             age = (datetime.utcnow() - claim["claimed_at"]).total_seconds()
             remaining = max(0, int(CLAIM_EXPIRY_SEC - age))
-            audit("claim_duplicate", token, f"Already at position {i+1}", "warn")
+            audit("claim_duplicate", token, f"Already at position {i + 1}", "warn")
             return {
-                "status":     "already_queued",
-                "position":   i + 1,
+                "status": "already_queued",
+                "position": i + 1,
                 "expires_in": remaining,
                 "queue_depth": len(claim_queue),
             }
 
-    # Already has a delivered OTP waiting on-screen
     if token in pending_otps:
         age = (datetime.utcnow() - pending_otps[token]["arrived_at"]).total_seconds()
         remaining = max(0, int(OTP_DISPLAY_SEC - age))
         return {"status": "otp_ready", "expires_in": remaining}
 
-    # Queue depth = 1 enforced: only one active user at a time.
-    # Others are allowed to join the queue and wait — they are NOT allowed to
-    # trigger their OTP on the platform until they reach position 1.
     now = datetime.utcnow()
 
-    # Concurrent risk detection: warn if a second claim arrives close behind
-    # the current front-of-queue (they could race to trigger OTPs).
     if claim_queue:
         front_age = (now - claim_queue[0]["claimed_at"]).total_seconds()
         if front_age < CONCURRENT_RISK_SEC:
-            audit("concurrent_risk", token,
-                  f"New claim while {claim_queue[0]['token']} has been active for only {int(front_age)}s",
-                  "warn")
+            audit(
+                "concurrent_risk",
+                token,
+                f"New claim while {claim_queue[0]['token']} has been active for only {int(front_age)}s",
+                "warn",
+            )
 
     claim_queue.append({
-        "token":      token,
-        "name":       users[token]["name"],
-        "email":      users[token]["email"],
+        "token": token,
+        "name": users[token]["name"],
+        "email": users[token]["email"],
         "claimed_at": now,
     })
 
-    position   = len(claim_queue)
+    position = len(claim_queue)
     queue_depth = len(claim_queue)
-
-    # Worst-case wait: each person ahead of them gets the full CLAIM_EXPIRY_SEC.
-    # Position 1 = active now, position 2 = up to 1×90s, etc.
     wait_estimate = max(0, (position - 1) * CLAIM_EXPIRY_SEC)
 
     audit("claim_queued", token, f"Queue position {position} of {queue_depth}")
     return {
-        "status":        "queued",
-        "position":      position,
-        "name":          users[token]["name"],
-        "expires_in":    CLAIM_EXPIRY_SEC,
-        "queue_depth":   queue_depth,
-        "wait_estimate": wait_estimate,   # seconds, worst case
+        "status": "queued",
+        "position": position,
+        "name": users[token]["name"],
+        "expires_in": CLAIM_EXPIRY_SEC,
+        "queue_depth": queue_depth,
+        "wait_estimate": wait_estimate,
     }
 
 
@@ -416,37 +460,29 @@ async def claim_status(token: str):
     purge_expired()
     purge_stale_otps()
 
-    # OTP is ready and waiting on-screen
     if token in pending_otps:
         age = (datetime.utcnow() - pending_otps[token]["arrived_at"]).total_seconds()
         remaining = max(0, int(OTP_DISPLAY_SEC - age))
-        return {
-            "status":     "delivered",
-            "otp":        pending_otps[token]["otp"],
-            "expires_in": remaining,
-        }
+        return {"status": "delivered", "otp": pending_otps[token]["otp"], "expires_in": remaining}
 
-    # Still in the claim queue
     for i, claim in enumerate(claim_queue):
         if claim["token"] == token:
-            age       = (datetime.utcnow() - claim["claimed_at"]).total_seconds()
+            age = (datetime.utcnow() - claim["claimed_at"]).total_seconds()
             remaining = max(0, int(CLAIM_EXPIRY_SEC - age))
-            # Worst-case wait for users behind position 1
             wait_estimate = max(0, i * CLAIM_EXPIRY_SEC)
             return {
-                "status":        "waiting",
-                "position":      i + 1,
-                "expires_in":    remaining,
-                "queue_depth":   len(claim_queue),
+                "status": "waiting",
+                "position": i + 1,
+                "expires_in": remaining,
+                "queue_depth": len(claim_queue),
                 "wait_estimate": wait_estimate,
             }
 
-    # Not in queue, not delivered — check log for recent terminal events
-    for e in read_audit_log(500):
-        if e.get("token") == token:
-            if e["event"] in ("otp_delivered", "otp_display_expired"):
+    for entry in read_audit_log(500):
+        if entry.get("token") == token:
+            if entry["event"] in ("otp_delivered", "otp_display_expired"):
                 return {"status": "done"}
-            if e["event"] == "claim_expired":
+            if entry["event"] == "claim_expired":
                 return {"status": "idle_expired"}
             break
 
@@ -455,20 +491,16 @@ async def claim_status(token: str):
 
 @app.delete("/claim-otp/{token}")
 async def cancel_claim(token: str):
-    """
-    Discard a delivered OTP and re-queue the user (Retry / Send again flow).
-    Also used when user explicitly abandons their slot.
-    """
+    """Discard a delivered OTP and remove/requeue claim state for retry flows."""
     token = token.upper()
 
     if token in pending_otps:
         del pending_otps[token]
-        audit("otp_discarded", token, "User requested retry — OTP discarded from memory")
+        audit("otp_discarded", token, "User requested retry - OTP discarded from memory")
 
-    # Remove from queue if present (e.g. user changed their mind while waiting)
     global claim_queue
     before = len(claim_queue)
-    claim_queue = deque(c for c in claim_queue if c["token"] != token)
+    claim_queue = deque(claim for claim in claim_queue if claim["token"] != token)
     if len(claim_queue) < before:
         audit("claim_cancelled", token, "Removed from queue by user")
 
@@ -481,7 +513,7 @@ async def sms_received(request: Request):
         audit("sms_rejected", detail="Wrong secret token", status="error")
         raise HTTPException(status_code=401)
 
-    data     = await request.json()
+    data = await request.json()
     sms_body = str(data.get("body", "")).strip()
     audit("sms_received", detail=f"SMS arrived ({len(sms_body)} chars)")
 
@@ -489,26 +521,18 @@ async def sms_received(request: Request):
     purge_stale_otps()
 
     if not claim_queue:
-        # Brief wait to absorb a race-condition claim that's in-flight
         await asyncio.sleep(4)
         purge_expired()
         if not claim_queue:
-            audit("sms_unmatched", detail="No claimant in queue — SMS discarded", status="warn")
+            audit("sms_unmatched", detail="No claimant in queue - SMS discarded", status="warn")
             return {"status": "no_claimant"}
 
     recipient = claim_queue.popleft()
-    otp       = extract_otp(sms_body)
+    otp = extract_otp(sms_body)
 
-    # Store OTP in memory only — never logged, never written to disk.
-    pending_otps[recipient["token"]] = {
-        "otp":        otp,
-        "arrived_at": datetime.utcnow(),
-    }
+    pending_otps[recipient["token"]] = {"otp": otp, "arrived_at": datetime.utcnow()}
 
-    # Audit record: token and timestamp only, OTP value deliberately omitted.
-    audit("otp_delivered", recipient["token"],
-          f"OTP ready for display — queue unblocked")
-
+    audit("otp_delivered", recipient["token"], "OTP ready for display - queue unblocked")
     return {"status": "delivered", "recipient": recipient["name"]}
 
 
@@ -521,21 +545,27 @@ async def get_log(limit: int = 200):
 @app.get("/admin/queue")
 async def get_queue():
     now = datetime.utcnow()
-    return {"queue": [{
-        "token":      c["token"],
-        "name":       c["name"],
-        "email":      c["email"],
-        "claimed_at": c["claimed_at"].strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "expires_in": max(0, int(CLAIM_EXPIRY_SEC - (now - c["claimed_at"]).total_seconds())),
-        "position":   i + 1,
-    } for i, c in enumerate(claim_queue)]}
+    return {
+        "queue": [
+            {
+                "token": claim["token"],
+                "name": claim["name"],
+                "email": claim["email"],
+                "claimed_at": claim["claimed_at"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "expires_in": max(0, int(CLAIM_EXPIRY_SEC - (now - claim["claimed_at"]).total_seconds())),
+                "position": i + 1,
+            }
+            for i, claim in enumerate(claim_queue)
+        ]
+    }
 
 
 @app.get("/admin/users")
 async def list_users():
-    return {"count": len(users),
-            "users": [{"token": u["token"], "name": u["name"], "email": u["email"]}
-                      for u in users.values()]}
+    return {
+        "count": len(users),
+        "users": [{"token": user["token"], "name": user["name"], "email": user["email"]} for user in users.values()],
+    }
 
 
 @app.post("/admin/reload-users")
@@ -550,20 +580,18 @@ async def reload_users():
 
 @app.get("/admin/smtp-test")
 async def smtp_test():
-    """Sends a test email to the relay account — use to verify Exchange connectivity."""
+    """Sends a test email to the relay account - use to verify Exchange connectivity."""
     html = """<div style="font-family:Arial,sans-serif;padding:24px">
-      <p>OTP Relay SMTP test — if you can read this, Exchange is working. 🎉</p>
+      <p>OTP Relay SMTP test - if you can read this, Exchange is working.</p>
     </div>"""
     try:
-        send_email(FROM_EMAIL, "OTP Relay", "OTP Relay — SMTP connectivity test", html)
+        send_email(FROM_EMAIL, "OTP Relay", "OTP Relay - SMTP connectivity test", html)
         return {"status": "ok", "sent_to": FROM_EMAIL}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
 
 
-
-
-# ── Wizard/admin server-backed endpoints ─────────────────────────────────────
+# -- Wizard/admin server-backed endpoints -------------------------------------
 @app.get("/admin/auth/status")
 async def admin_auth_status():
     return {"configured": bool(_auth_db().get("password_hash"))}
@@ -619,7 +647,11 @@ async def admin_config(x_admin_session: Optional[str] = Header(default=None)):
 @app.post("/admin/config")
 async def admin_config_save(payload: ConfigPayload, x_admin_session: Optional[str] = Header(default=None)):
     _require_admin(x_admin_session)
-    tokens = [t.strip().upper() for t in payload.admin_tokens if t.strip()]
+    tokens: List[str] = []
+    for token in payload.admin_tokens:
+        clean = str(token or "").strip().upper()
+        if clean and clean not in tokens:
+            tokens.append(clean)
     _save_config_db({"admin_tokens": tokens, "updated_at": _now_iso()})
     audit("admin_config_saved", detail=f"Configured admin tokens: {', '.join(tokens) or 'none'}")
     return {"status": "ok", "admin_tokens": tokens}
@@ -631,7 +663,7 @@ async def wizard_progress_save(payload: WizardRecord):
     if token not in users:
         raise HTTPException(status_code=404, detail="Unknown token")
     db = _wizard_db()
-    row = payload.model_dump()
+    row = _model_dump(payload)
     row["token"] = token
     row["updated_at"] = _now_iso()
     db[token] = row
@@ -664,12 +696,12 @@ async def admin_wizard(x_admin_session: Optional[str] = Header(default=None)):
     _require_admin(x_admin_session)
     db = _wizard_db()
     merged = []
-    for token, u in sorted(users.items()):
+    for token, user in sorted(users.items()):
         rec = db.get(token, {})
         merged.append({
             "token": token,
-            "display_name": rec.get("display_name") or u.get("name", ""),
-            "email": u.get("email", ""),
+            "display_name": rec.get("display_name") or user.get("name", ""),
+            "email": user.get("email", ""),
             "iits_username": rec.get("iits_username", ""),
             "adm_username": rec.get("adm_username", ""),
             "completed": rec.get("completed", []),
@@ -699,5 +731,5 @@ def serve_guide_html():
     return FileResponse(guide_path)
 
 
-# Serve frontend — must be last
+# Serve frontend - must be last
 app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
