@@ -4,3 +4,5 @@ openpyxl
 python-dotenv
 bcrypt
 pydantic
+markdown
+pyyaml
