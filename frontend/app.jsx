@@ -10,13 +10,32 @@ const CONFIG = {
 
 const API = {
   async json(url, options = {}) {
+    const { headers, ...fetchOptions } = options;
     const res = await fetch(url, {
-      headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
-      ...options,
+      ...fetchOptions,
+      headers: { 'Content-Type': 'application/json', ...(headers || {}) },
     });
     let data = null;
     try { data = await res.json(); } catch { data = null; }
-    if (!res.ok) throw new Error((data && (data.detail || data.error)) || `Request failed: ${res.status}`);
+    if (!res.ok) {
+      const raw = data && (data.detail || data.error || data.message);
+      let message = `Request failed: ${res.status}`;
+      if (typeof raw === 'string') {
+        message = raw;
+      } else if (Array.isArray(raw)) {
+        message = raw.map(item => {
+          if (typeof item === 'string') return item;
+          if (item && typeof item === 'object') {
+            const where = Array.isArray(item.loc) ? item.loc.join('.') : '';
+            return [where, item.msg || item.message || JSON.stringify(item)].filter(Boolean).join(': ');
+          }
+          return String(item);
+        }).join('; ');
+      } else if (raw && typeof raw === 'object') {
+        message = raw.msg || raw.message || JSON.stringify(raw);
+      }
+      throw new Error(message);
+    }
     return data;
   },
   claimOtp(token) { return this.json('/claim-otp', { method: 'POST', body: JSON.stringify({ token }) }); },
@@ -33,7 +52,9 @@ const API = {
   adminUsers(session) { return this.json('/admin/users', { headers: session ? { 'X-Admin-Session': session } : {} }); },
   adminLog(session) { return this.json('/admin/log?limit=500', { headers: session ? { 'X-Admin-Session': session } : {} }); },
   adminConfig(session) { return this.json('/admin/config', { headers: session ? { 'X-Admin-Session': session } : {} }); },
-  saveAdminConfig(session, admin_tokens) { return this.json('/admin/config', { method: 'POST', headers: { 'X-Admin-Session': session }, body: JSON.stringify({ admin_tokens }) }); },
+  saveAdminConfig(session, payload) {
+    return this.json('/admin/config', { method: 'POST', headers: { 'X-Admin-Session': session }, body: JSON.stringify({ admin_tokens: payload }) });
+  },
   notifyAdminTask(payload) { return this.json('/api/onboard/notify', { method: 'POST', body: JSON.stringify(payload) }); },
 };
 
@@ -467,7 +488,7 @@ function statusPillStyle(status) {
 
 
 function exportWizardProgressPdf(sourceUsers) {
-  const safeUsers = [...(sourceUsers || [])]
+  const safeUsers = [...(sourceUsers || users || [])]
     .sort((a, b) => (a.token || '').localeCompare(b.token || ''));
 
   const rows = safeUsers.map(user => {
@@ -534,7 +555,7 @@ function App() {
   const [openStep, setOpenStep] = useState(null);
   const [faqOpen, setFaqOpen] = useState({});
   const [otp, setOtp] = useState({ panel: 'claim', message: '', position: 1, waitEstimate: 0, queueDepth: 0, otpValue: '———', activeRemaining: CONFIG.CLAIM_EXPIRY_SEC, otpRemaining: CONFIG.OTP_DISPLAY_SEC, token: '' });
-  const [admin, setAdmin] = useState({ session: sessionStorage.getItem('adminSession') || '', configured: false, mode: 'login', error: '', credential: '', current: '', confirm: '', data: null, loading: false, configTokens: 'JA, AM, CS' });
+  const [admin, setAdmin] = useState({ session: sessionStorage.getItem('adminSession') || '', configured: false, mode: 'login', error: '', credential: '', current: '', confirm: '', data: null, loading: false, configTokens: 'JPR, AMD, SCH' });
 
   useEffect(() => {
     API.adminAuthStatus().then(d => setAdmin(s => ({ ...s, configured: !!d.configured, mode: d.configured ? 'login' : 'setup' }))).catch(() => {});
@@ -734,7 +755,7 @@ function App() {
   }
 
   async function loadAdminData(session = admin.session) {
-    if (!session) return;
+    if (!session) return false;
     setAdmin(s => ({ ...s, loading: true, error: '' }));
     try {
       const [wizard, queue, users, log, config] = await Promise.all([
@@ -742,12 +763,14 @@ function App() {
         API.adminQueue(session).catch(() => ({ queue: [] })),
         API.adminUsers(session).catch(() => ({ count: 0 })),
         API.adminLog(session).catch(() => ({ total: 0, entries: [] })),
-        API.adminConfig(session).catch(() => ({ admin_tokens: ['JA','AM','CS'] })),
+        API.adminConfig(session).catch(() => ({ admin_tokens: ['JPR','AMD','SCH'] })),
       ]);
       const mergedUsers = mergeAdminUsers(wizard.users || [], users.users || []);
       setAdmin(s => ({ ...s, data: { users: mergedUsers, queue: queue.queue || [], log: log.entries || [], logTotal: log.total || 0, userCount: users.count || 0 }, configTokens: (config.admin_tokens || []).join(', '), loading: false }));
+      return true;
     } catch (e) {
       setAdmin(s => ({ ...s, error: e.message, loading: false }));
+      return false;
     }
   }
 
@@ -761,9 +784,31 @@ function App() {
   }
 
   async function saveConfig() {
-    const tokens = admin.configTokens.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
-    await API.saveAdminConfig(admin.session, tokens);
-    await loadAdminData();
+    const tokens = admin.configTokens
+      .split(',')
+      .map(s => s.trim().toUpperCase())
+      .filter(Boolean);
+
+    setAdmin(s => ({ ...s, loading: true, error: '' }));
+
+    try {
+      const saved = await API.saveAdminConfig(admin.session, tokens);
+      await loadAdminData();
+      setAdmin(s => ({
+        ...s,
+        configTokens: (saved.admin_tokens || tokens).join(', '),
+        loading: false,
+        error: '',
+      }));
+      return true;
+    } catch (e) {
+      setAdmin(s => ({
+        ...s,
+        loading: false,
+        error: e.message || 'Admin config save failed',
+      }));
+      return false;
+    }
   }
 
   async function logoutAdmin() {
@@ -799,22 +844,27 @@ function App() {
     setLogin({ tokenChars: ['', '', ''], error: '' });
   }
 
+  const otpSidebarTitleStyle = { fontSize: 14, fontWeight: 800, letterSpacing: '.11em' };
+  const otpSidebarTextStyle = { fontSize: 15, lineHeight: 1.75 };
+  const otpQuickLinkLabelStyle = { fontSize: 14, fontWeight: 800 };
+  const otpQuickLinkHintStyle = { fontSize: 12, fontWeight: 700 };
+
   const sharedSidebar = (
     <div className="side-stack">
       <div className="card side-card">
-        <div className="side-card-title">How this works</div>
+        <div className="side-card-title" style={otpSidebarTitleStyle}>How this works</div>
         <div className="notes-list">
-          <div className="small">Claim the OTP slot first, then trigger the RTA OTP only when the portal tells you to.</div>
-          <div className="small">The wizard is shared and server-backed, so credentials and reminder dates follow the user token across devices.</div>
-          <div className="small">Admins can monitor onboarding progress and complete the admin-owned steps.</div>
+          <div className="small" style={otpSidebarTextStyle}>Claim the OTP slot first, then trigger the RTA OTP only when the portal tells you to.</div>
+          <div className="small" style={otpSidebarTextStyle}>The wizard is shared and server-backed, so credentials and reminder dates follow the user token across devices.</div>
+          <div className="small" style={otpSidebarTextStyle}>Admins can monitor onboarding progress and complete the admin-owned steps.</div>
         </div>
       </div>
       <div className="card side-card">
-        <div className="side-card-title">Quick links</div>
+        <div className="side-card-title" style={otpSidebarTitleStyle}>Quick links</div>
         <div className="quick-links">
-          <a className="quick-link" href="https://direct.rta.ae" target="_blank" rel="noopener noreferrer"><span>RTA Automation Portal</span><small>Portal</small></a>
-          <a className="quick-link" href="https://srvterminal.init-db.lan" target="_blank" rel="noopener noreferrer"><span>Terminal Server</span><small>UAE-only workaround</small></a>
-          <a className="quick-link" href="https://ettisal.rta.ae/vendors" target="_blank" rel="noopener noreferrer"><span>Ivanti VPN</span><small>ettisal.rta.ae</small></a>
+          <a className="quick-link" href="https://direct.rta.ae" target="_blank" rel="noopener noreferrer"><span style={otpQuickLinkLabelStyle}>RTA Automation Portal</span><small style={otpQuickLinkHintStyle}>Portal</small></a>
+          <a className="quick-link" href="https://srvterminal.init-db.lan" target="_blank" rel="noopener noreferrer"><span style={otpQuickLinkLabelStyle}>Terminal Server</span><small style={otpQuickLinkHintStyle}>UAE-only workaround</small></a>
+          <a className="quick-link" href="https://ettisal.rta.ae/vendors" target="_blank" rel="noopener noreferrer"><span style={otpQuickLinkLabelStyle}>Ivanti VPN</span><small style={otpQuickLinkHintStyle}>ettisal.rta.ae</small></a>
         </div>
       </div>
     </div>
@@ -1167,14 +1217,6 @@ function WizardView({ user, saveWizard, wizardStatus, openStep, setOpenStep, don
           <div className="small" style={{ marginTop: 10 }}>VPN, PAM, and SFTP access all expire after 90 days.</div>
         </div>
 
-        <div className="card side-card">
-          <div className="side-card-title">Quick links</div>
-          <div className="quick-links">
-            <a className="quick-link" href="https://direct.rta.ae" target="_blank" rel="noopener noreferrer"><span>RTA Automation Portal</span><small>Main portal</small></a>
-            <a className="quick-link" href="https://srvterminal.init-db.lan" target="_blank" rel="noopener noreferrer"><span>Terminal Server</span><small>Outside UAE</small></a>
-            <a className="quick-link" href="https://ettisal.rta.ae/vendors" target="_blank" rel="noopener noreferrer"><span>Ivanti VPN</span><small>Install/test</small></a>
-          </div>
-        </div>
 
         <div className="card side-card">
           <div className="side-card-title">Good to know</div>
@@ -1317,13 +1359,14 @@ function GuideOverlay({ step, guide, page, setPage, onClose, onPopOut }) {
           )}
         </div>
 
+
         <div className="guide-modal-footer">
           <button className="btn btn-secondary" onClick={() => setPage(page - 1)} disabled={page <= 0}>← Back</button>
           <div className="guide-count">{page + 1} / {pages.length}</div>
           {page < lastPage ? (
             <button className="btn btn-primary" onClick={() => setPage(page + 1)}>Next →</button>
           ) : (
-            <div style={{ width: 86 }} />
+            <span style={{ width: 92 }} />
           )}
         </div>
       </section>
@@ -1484,6 +1527,7 @@ function AdminView({ admin, setAdmin, doAdminAuth, loadAdminData, toggleAdminSte
   const [wizardEnv, setWizardEnv] = useState('all');
   const [wizardProgress, setWizardProgress] = useState('all');
   const [showAdminTokenConfig, setShowAdminTokenConfig] = useState(false);
+  const [refreshStatus, setRefreshStatus] = useState('');
 
   useEffect(() => {
     if (admin.session && !admin.data) loadAdminData();
@@ -1543,6 +1587,15 @@ function AdminView({ admin, setAdmin, doAdminAuth, loadAdminData, toggleAdminSte
     return true;
   });
 
+  async function refreshAdminData() {
+    setRefreshStatus('Refreshing...');
+    const ok = await loadAdminData();
+    setRefreshStatus(ok ? 'Updated just now' : 'Refresh failed');
+    setTimeout(() => {
+      setRefreshStatus(current => (current === 'Updated just now' || current === 'Refresh failed' ? '' : current));
+    }, 2200);
+  }
+
   function renderCompletedSteps(user) {
     const done = completedStepsList(user);
     if (done.length === 0) return <div className="small">No completed steps yet</div>;
@@ -1578,7 +1631,8 @@ function AdminView({ admin, setAdmin, doAdminAuth, loadAdminData, toggleAdminSte
                 <button className="btn" style={{ width: 'auto', whiteSpace: 'nowrap', background: adminTab === 'otp-log' ? RS.primary800 : RS.neutralWhite, color: adminTab === 'otp-log' ? RS.neutralWhite : RS.neutral900, border: adminTab === 'otp-log' ? 'none' : `1px solid ${RS.neutral300}` }} onClick={() => setAdminTab('otp-log')}>OTP Log</button>
               </div>
               {adminTab === 'wizard' && <button className="btn btn-secondary" style={{ width: 'auto', whiteSpace: 'nowrap' }} onClick={() => exportWizardProgressPdf(users)}>Export PDF</button>}
-              <button className="btn btn-secondary" style={{ width: 'auto', whiteSpace: 'nowrap' }} onClick={() => loadAdminData()}>Refresh</button>
+              <button className="btn btn-secondary" style={{ width: 'auto', whiteSpace: 'nowrap' }} disabled={admin.loading} onClick={refreshAdminData}>{admin.loading && refreshStatus === 'Refreshing...' ? 'Refreshing...' : 'Refresh'}</button>
+              {refreshStatus && <span className={refreshStatus === 'Refresh failed' ? 'error-box' : 'success-box'} style={{ padding: '8px 10px', whiteSpace: 'nowrap' }}>{refreshStatus}</span>}
               <button className="btn btn-secondary" style={{ width: 46, minWidth: 46, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 22, lineHeight: 1 }} aria-label="Admin token settings" title="Admin token settings" onClick={() => setShowAdminTokenConfig(true)}>⚙</button>
             </div>
           </div>
@@ -1782,12 +1836,23 @@ function AdminView({ admin, setAdmin, doAdminAuth, loadAdminData, toggleAdminSte
         {showAdminTokenConfig && (
           <div onClick={() => setShowAdminTokenConfig(false)} style={{ position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.35)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20, zIndex: 1000 }}>
             <div className="card side-card" onClick={e => e.stopPropagation()} style={{ width: '100%', maxWidth: 420, margin: 0 }}>
-              <div className="side-card-title">Admin token config</div>
-              <div className="field"><label>Admin tokens</label><input value={admin.configTokens} onChange={e => setAdmin(s => ({ ...s, configTokens: e.target.value }))} /></div>
-              <div className="small" style={{ marginTop: 10 }}>Seeded for Jathin, Amer, and Christian, but editable from the portal.</div>
+              <div className="side-card-title">Allowed admin tokens</div>
+              <div className="field"><input aria-label="Allowed admin tokens" value={admin.configTokens} onChange={e => setAdmin(s => ({ ...s, configTokens: e.target.value, error: '' }))} /></div>
+              <div className="small" style={{ marginTop: 10 }}>Comma-separated admin tokens. Defaults are JPR, AMD, and SCH; add or remove tokens here and save.</div>
+              {admin.error && <div className="error-box" style={{ marginTop: 10 }}>{String(admin.error)}</div>}
               <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 12 }}>
-                <button className="btn btn-secondary" style={{ width: 'auto', whiteSpace: 'nowrap' }} onClick={() => setShowAdminTokenConfig(false)}>Close</button>
-                <button className="btn btn-primary" style={{ width: 'auto', whiteSpace: 'nowrap' }} onClick={() => { saveConfig(); setShowAdminTokenConfig(false); }}>Save config</button>
+                <button className="btn btn-secondary" style={{ width: 'auto', whiteSpace: 'nowrap' }} disabled={admin.loading} onClick={() => setShowAdminTokenConfig(false)}>Close</button>
+                <button
+                  className="btn btn-primary"
+                  style={{ width: 'auto', whiteSpace: 'nowrap' }}
+                  disabled={admin.loading}
+                  onClick={async () => {
+                    const ok = await saveConfig();
+                    if (ok) setShowAdminTokenConfig(false);
+                  }}
+                >
+                  {admin.loading ? 'Saving…' : 'Save config'}
+                </button>
               </div>
             </div>
           </div>
