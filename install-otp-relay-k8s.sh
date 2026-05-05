@@ -2,7 +2,8 @@
 set -Eeuo pipefail
 
 # Safe one-click installer/update script for psi1703/k8s OTP Relay on Debian-family servers.
-# It intentionally avoids touching SSH, CIFS mounts, cron jobs, firewall rules, and unrelated services.
+# Installs/updates the portal app and the required monitor pod without touching SSH,
+# CIFS mounts, cron jobs, firewall rules, or unrelated services.
 #
 # Normal use:
 #   sudo bash install-otp-relay-k8s.sh
@@ -16,7 +17,13 @@ set -Eeuo pipefail
 #   MONITOR_IMAGE=otp-monitor:latest
 #   SERVICE_NODE_PORT=30080
 #   INGRESS_ENABLED=1
-#   INSTALL_MONITOR=0|1
+#   PHONE_IP=172.31.10.161
+#   PHONE_INTERFACE=eth0
+#   PHONE_PING_INTERVAL=150
+#   PHONE_OFFLINE_THRESHOLD=2
+#   BATCH_WINDOW_SEC=10
+#   ALERT_LEVEL=error
+#   PORTAL_URL=http://server-or-dns-name
 #   WHATSAPP_API_KEY=...
 #   WHATSAPP_RECIPIENT=...
 #   RUNTIME_DATA_DIR=/path/with/users.xlsx/admin_auth.json/admin_config.json/wizard_progress.json
@@ -44,12 +51,19 @@ APP_IMAGE="${APP_IMAGE:-otp-relay:latest}"
 MONITOR_IMAGE="${MONITOR_IMAGE:-otp-monitor:latest}"
 SERVICE_NODE_PORT="${SERVICE_NODE_PORT:-30080}"
 INGRESS_ENABLED="${INGRESS_ENABLED:-1}"
-INSTALL_MONITOR="${INSTALL_MONITOR:-0}"
 SERVER_HOSTNAME="${SERVER_HOSTNAME:-$(hostname -f 2>/dev/null || hostname)}"
+SERVER_IP="${SERVER_IP:-$(hostname -I 2>/dev/null | awk '{print $1}') }"
+SERVER_IP="$(printf '%s' "$SERVER_IP" | xargs)"
+SERVER_IP="${SERVER_IP:-127.0.0.1}"
+PORTAL_URL="${PORTAL_URL:-http://$SERVER_IP}"
 PHONE_IP="${PHONE_IP:-172.31.10.161}"
 PHONE_INTERFACE="${PHONE_INTERFACE:-$(ip route show default 2>/dev/null | awk '{print $5; exit}') }"
 PHONE_INTERFACE="$(printf '%s' "$PHONE_INTERFACE" | xargs)"
 PHONE_INTERFACE="${PHONE_INTERFACE:-eth0}"
+PHONE_PING_INTERVAL="${PHONE_PING_INTERVAL:-150}"
+PHONE_OFFLINE_THRESHOLD="${PHONE_OFFLINE_THRESHOLD:-2}"
+BATCH_WINDOW_SEC="${BATCH_WINDOW_SEC:-10}"
+ALERT_LEVEL="${ALERT_LEVEL:-error}"
 WHATSAPP_API_KEY="${WHATSAPP_API_KEY:-}"
 WHATSAPP_RECIPIENT="${WHATSAPP_RECIPIENT:-}"
 RUNTIME_DATA_DIR="${RUNTIME_DATA_DIR:-}"
@@ -128,11 +142,6 @@ if [ -z "$INSTALL_GITHUB_RUNNER" ]; then
   fi
 fi
 
-if [ "$INSTALL_MONITOR" = "1" ]; then
-  [ -n "$WHATSAPP_API_KEY" ] || fatal "INSTALL_MONITOR=1 requires WHATSAPP_API_KEY"
-  [ -n "$WHATSAPP_RECIPIENT" ] || fatal "INSTALL_MONITOR=1 requires WHATSAPP_RECIPIENT"
-fi
-
 log "detected OS/arch: $OS_NAME / $ARCH_RAW"
 [ "$IS_RPI" = "1" ] && log "detected Raspberry Pi hardware"
 is_debian_family || fatal "this installer currently supports Debian-family systems only"
@@ -143,7 +152,6 @@ if ! ss -lnt 2>/dev/null | grep -qE '(^|[[:space:]]|:)22[[:space:]]'; then
 fi
 if grep -qi '[[:space:]]cifs[[:space:]]' /etc/fstab 2>/dev/null; then
   warn "CIFS entries detected in /etc/fstab. This installer will not mount, unmount, or edit them."
-  warn "For scheduled-only CIFS jobs, prefer noauto,nofail,_netdev,x-systemd.automount or mount inside that job."
 fi
 if mount | grep -qi ' type cifs '; then
   warn "An active CIFS mount is present. It will be left untouched."
@@ -171,7 +179,7 @@ fi
 log "installing missing OS packages with apt-get"
 apt-get update
 apt-get install -y --no-install-recommends \
-  ca-certificates curl git iproute2 iptables nftables python3 python3-venv python3-openpyxl jq tar gzip docker.io
+  ca-certificates curl git iproute2 iptables nftables python3 python3-venv jq tar gzip docker.io
 
 if ! systemctl is-active --quiet docker; then
   log "starting Docker because it is required to build the local app image"
@@ -204,7 +212,11 @@ if [ -d "$INSTALL_DIR/.git" ]; then
   git -C "$INSTALL_DIR" reset --hard "origin/$REPO_REF"
   if [ "$GIT_CLEAN" = "1" ]; then
     log "cleaning untracked files in repo working tree, preserving common local data/secret files"
-    git -C "$INSTALL_DIR" clean -ffd       -e data/       -e .env       -e k8s/manifests/secret.env       -e '*.log'
+    git -C "$INSTALL_DIR" clean -ffd \
+      -e data/ \
+      -e .env \
+      -e k8s/manifests/secret.env \
+      -e '*.log'
   fi
 elif [ -e "$INSTALL_DIR" ]; then
   fatal "$INSTALL_DIR exists but is not a git repo. Move it away or set INSTALL_DIR to another path."
@@ -214,49 +226,48 @@ fi
 cd "$INSTALL_DIR"
 log "repo synced to $(git rev-parse --short HEAD): $(git log -1 --pretty=%s)"
 
-ensure_required_files() {
-  [ -f main.py ] || fatal "main.py is missing in repo root"
-  [ -f requirements.txt ] || fatal "requirements.txt is missing in repo root"
-  [ -f monitor.py ] || warn "monitor.py is missing; monitor deployment will be unavailable"
-  [ -d frontend ] || fatal "frontend/ directory is missing"
-  [ -f frontend/index.html ] || fatal "frontend/index.html is missing"
-  [ -f frontend/app.jsx ] || fatal "frontend/app.jsx is missing"
-  [ -f frontend/style.css ] || fatal "frontend/style.css is missing"
-}
+log "checking required source files"
+[ -f main.py ] || fatal "main.py is missing in repo root"
+[ -f monitor.py ] || fatal "monitor.py is required and missing in repo root"
+[ -f requirements.txt ] || fatal "requirements.txt is missing in repo root"
+[ -d frontend ] || fatal "frontend/ directory is missing"
+[ -f frontend/index.html ] || fatal "frontend/index.html is missing"
+[ -f frontend/app.jsx ] || fatal "frontend/app.jsx is missing"
+[ -f frontend/style.css ] || fatal "frontend/style.css is missing"
+[ -f scripts/build_help_docs.py ] || fatal "required help-doc builder is missing: scripts/build_help_docs.py"
+[ -d docs/help ] || fatal "required help-doc input directory is missing: docs/help"
 
-prepare_python_build_env() {
-  log "preparing Python build environment from requirements.txt"
-  python3 -m venv .installer-venv
-  .installer-venv/bin/python -m pip install --upgrade pip setuptools wheel
-  .installer-venv/bin/python -m pip install -r requirements.txt
-}
+if [ -z "$PHONE_IP" ]; then
+  fatal "PHONE_IP is required because monitor.py is a core component"
+fi
+if [ -z "$WHATSAPP_API_KEY" ] || [ -z "$WHATSAPP_RECIPIENT" ]; then
+  warn "WhatsApp alert credentials are not set. monitor.py will still run, but WhatsApp alerts will be skipped."
+fi
 
-build_help_docs() {
-  if [ "$SKIP_HELP_DOCS_BUILD" = "1" ]; then
-    log "skipping help docs build because SKIP_HELP_DOCS_BUILD=1"
-    return 0
-  fi
-  [ -f scripts/build_help_docs.py ] || fatal "required help-doc builder is missing: scripts/build_help_docs.py"
-  prepare_python_build_env
+log "preparing installer Python environment"
+python3 -m venv .installer-venv
+.installer-venv/bin/python -m pip install --upgrade pip setuptools wheel
+.installer-venv/bin/python -m pip install -r requirements.txt
+
+if [ "$SKIP_HELP_DOCS_BUILD" = "1" ]; then
+  log "skipping help docs build because SKIP_HELP_DOCS_BUILD=1"
+else
   log "building help docs with scripts/build_help_docs.py"
   .installer-venv/bin/python scripts/build_help_docs.py
-}
+fi
 
-ensure_required_files
-build_help_docs
-
-log "writing Debian/K3s deployment assets"
+log "writing Debian/K3s Docker and Kubernetes assets"
 mkdir -p k8s/manifests
 cat > k8s/Dockerfile <<'DOCKER'
 FROM python:3.12-slim AS runtime
 WORKDIR /app
+COPY requirements.txt .
 RUN useradd --system --uid 999 --no-create-home --shell /usr/sbin/nologin otprelay \
   && python -m venv /app/venv \
+  && /app/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
+  && /app/venv/bin/pip install --no-cache-dir -r requirements.txt \
   && mkdir -p /app/data \
   && chown -R otprelay:otprelay /app
-COPY requirements.txt .
-RUN /app/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
-  && /app/venv/bin/pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY frontend/ ./frontend/
 COPY docs/ ./docs/
@@ -266,30 +277,28 @@ ENV OTP_RELAY_DATA_DIR=/app/data \
     AUDIT_LOG_PATH=/app/data/audit.log
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD /app/venv/bin/python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/admin/queue')"
+  CMD /app/venv/bin/python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz')"
 CMD ["/app/venv/bin/python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
 DOCKER
 
-if [ -f monitor.py ]; then
 cat > k8s/Dockerfile.monitor <<'DOCKER'
 FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
 RUN apt-get update \
   && apt-get install -y --no-install-recommends iputils-arping \
   && rm -rf /var/lib/apt/lists/* \
   && useradd --system --uid 999 --no-create-home --shell /usr/sbin/nologin otprelay \
   && python -m venv /app/venv \
+  && /app/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
+  && /app/venv/bin/pip install --no-cache-dir -r requirements.txt \
   && mkdir -p /app/data \
   && chown -R otprelay:otprelay /app
-WORKDIR /app
-COPY requirements.txt .
-RUN /app/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
-  && /app/venv/bin/pip install --no-cache-dir -r requirements.txt
 COPY monitor.py .
 USER otprelay
 ENV OTP_RELAY_DATA_DIR=/app/data
 CMD ["/app/venv/bin/python", "monitor.py"]
 DOCKER
-fi
 
 cat > k8s/manifests/namespace.yaml <<EOF_NS
 apiVersion: v1
@@ -305,19 +314,24 @@ metadata:
   name: otp-relay-config
   namespace: $NAMESPACE
 data:
+  # App runtime
   CLAIM_EXPIRY_SEC: "90"
   OTP_DISPLAY_SEC: "285"
   CONCURRENT_RISK_SEC: "30"
   OTP_RELAY_DATA_DIR: "/app/data"
   USERS_EXCEL_PATH: "/app/data/users.xlsx"
   AUDIT_LOG_PATH: "/app/data/audit.log"
+
+  # Monitor runtime. monitor.py is a required component.
   PHONE_IP: "$PHONE_IP"
   PHONE_INTERFACE: "$PHONE_INTERFACE"
-  PHONE_PING_INTERVAL: "150"
-  PHONE_OFFLINE_THRESHOLD: "2"
-  BATCH_WINDOW_SEC: "10"
-  ALERT_LEVEL: "error"
+  PHONE_PING_INTERVAL: "$PHONE_PING_INTERVAL"
+  PHONE_OFFLINE_THRESHOLD: "$PHONE_OFFLINE_THRESHOLD"
+  BATCH_WINDOW_SEC: "$BATCH_WINDOW_SEC"
+  ALERT_LEVEL: "$ALERT_LEVEL"
   SERVER_HOSTNAME: "$SERVER_HOSTNAME"
+  SERVER_IP: "$SERVER_IP"
+  PORTAL_URL: "$PORTAL_URL"
 EOF_CM
 
 cat > k8s/manifests/pvc.yaml <<EOF_PVC
@@ -384,13 +398,13 @@ spec:
               memory: 256Mi
           readinessProbe:
             httpGet:
-              path: /admin/queue
+              path: /readyz
               port: 8000
             initialDelaySeconds: 10
             periodSeconds: 10
           livenessProbe:
             httpGet:
-              path: /admin/queue
+              path: /healthz
               port: 8000
             initialDelaySeconds: 20
             periodSeconds: 30
@@ -447,8 +461,6 @@ else
   rm -f k8s/manifests/ingress.yaml
 fi
 
-if [ "$INSTALL_MONITOR" = "1" ]; then
-  [ -f monitor.py ] || fatal "INSTALL_MONITOR=1 requested but monitor.py is missing"
 cat > k8s/manifests/deployment-monitor.yaml <<EOF_MON
 apiVersion: apps/v1
 kind: Deployment
@@ -515,18 +527,17 @@ spec:
           persistentVolumeClaim:
             claimName: otp-relay-data
 EOF_MON
-fi
 
 log "validating Python syntax and Kubernetes manifests"
-python3 -m py_compile main.py
-[ ! -f monitor.py ] || python3 -m py_compile monitor.py
+.installer-venv/bin/python -m py_compile main.py monitor.py
 k3s kubectl apply --dry-run=client -f k8s/manifests/namespace.yaml >/dev/null
 k3s kubectl apply -f k8s/manifests/namespace.yaml
 k3s kubectl apply --dry-run=client \
   -f k8s/manifests/configmap.yaml \
   -f k8s/manifests/pvc.yaml \
   -f k8s/manifests/deployment.yaml \
-  -f k8s/manifests/service.yaml >/dev/null
+  -f k8s/manifests/service.yaml \
+  -f k8s/manifests/deployment-monitor.yaml >/dev/null
 if [ "$INGRESS_ENABLED" = "1" ]; then
   k3s kubectl apply --dry-run=client -f k8s/manifests/ingress.yaml >/dev/null
 fi
@@ -547,15 +558,13 @@ docker save "$APP_IMAGE" -o "$tmp_app_tar"
 k3s ctr images import "$tmp_app_tar"
 rm -f "$tmp_app_tar"
 
-if [ "$INSTALL_MONITOR" = "1" ]; then
-  log "building monitor image with Docker"
-  docker build -t "$MONITOR_IMAGE" -f k8s/Dockerfile.monitor .
-  log "importing monitor image into K3s containerd"
-  tmp_monitor_tar="$(mktemp --suffix=.tar)"
-  docker save "$MONITOR_IMAGE" -o "$tmp_monitor_tar"
-  k3s ctr images import "$tmp_monitor_tar"
-  rm -f "$tmp_monitor_tar"
-fi
+log "building required monitor image with Docker"
+docker build -t "$MONITOR_IMAGE" -f k8s/Dockerfile.monitor .
+log "importing required monitor image into K3s containerd"
+tmp_monitor_tar="$(mktemp --suffix=.tar)"
+docker save "$MONITOR_IMAGE" -o "$tmp_monitor_tar"
+k3s ctr images import "$tmp_monitor_tar"
+rm -f "$tmp_monitor_tar"
 
 log "applying Kubernetes resources"
 k3s kubectl apply -f k8s/manifests/configmap.yaml
@@ -567,14 +576,15 @@ if [ "$INGRESS_ENABLED" = "1" ]; then
 else
   k3s kubectl delete ingress otp-relay -n "$NAMESPACE" --ignore-not-found=true
 fi
-if [ "$INSTALL_MONITOR" = "1" ]; then
-  k3s kubectl apply -f k8s/manifests/deployment-monitor.yaml
-fi
+k3s kubectl apply -f k8s/manifests/deployment-monitor.yaml
 
-log "restarting app deployment to pick up freshly imported local image"
+log "restarting deployments to pick up freshly imported local images"
 k3s kubectl rollout restart deployment/otp-relay -n "$NAMESPACE"
+k3s kubectl rollout restart deployment/otp-monitor -n "$NAMESPACE"
 log "waiting for app rollout"
 k3s kubectl rollout status deployment/otp-relay -n "$NAMESPACE" --timeout=180s
+log "waiting for monitor rollout"
+k3s kubectl rollout status deployment/otp-monitor -n "$NAMESPACE" --timeout=180s
 
 if [ -n "$RUNTIME_DATA_DIR" ]; then
   [ -d "$RUNTIME_DATA_DIR" ] || fatal "RUNTIME_DATA_DIR does not exist: $RUNTIME_DATA_DIR"
@@ -586,7 +596,9 @@ if [ -n "$RUNTIME_DATA_DIR" ]; then
     fi
   done
   k3s kubectl rollout restart deployment/otp-relay -n "$NAMESPACE"
+  k3s kubectl rollout restart deployment/otp-monitor -n "$NAMESPACE"
   k3s kubectl rollout status deployment/otp-relay -n "$NAMESPACE" --timeout=180s
+  k3s kubectl rollout status deployment/otp-monitor -n "$NAMESPACE" --timeout=180s
 fi
 
 install_github_runner() {
@@ -605,7 +617,7 @@ install_github_runner() {
   mkdir -p "$GITHUB_RUNNER_DIR"
   chown -R "$GITHUB_RUNNER_USER:$GITHUB_RUNNER_USER" "$GITHUB_RUNNER_DIR"
 
-  runner_version="2.328.0"
+  runner_version="${GITHUB_RUNNER_VERSION:-2.328.0}"
   runner_tar="actions-runner-linux-${RUNNER_ARCH}-${runner_version}.tar.gz"
   runner_url="https://github.com/actions/runner/releases/download/v${runner_version}/${runner_tar}"
   curl -fL "$runner_url" -o "/tmp/$runner_tar"
@@ -618,29 +630,33 @@ install_github_runner() {
 }
 install_github_runner
 
-node_ip="$(hostname -I | awk '{print $1}')"
 cat <<EOF_DONE
 
 OTP Relay Kubernetes deployment complete.
 
-Portal URL:   http://$node_ip/
-NodePort URL: http://$node_ip:$SERVICE_NODE_PORT/
+Portal URL:   http://$SERVER_IP/
+NodePort URL: http://$SERVER_IP:$SERVICE_NODE_PORT/
 Namespace:    $NAMESPACE
 Repo path:    $INSTALL_DIR
 OS/arch:      $OS_NAME / $ARCH_RAW
+Monitor:      installed as required component
 Runner:       $INSTALL_GITHUB_RUNNER
 
 Useful commands:
   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
   k3s kubectl get pods -n $NAMESPACE
   k3s kubectl logs -n $NAMESPACE deployment/otp-relay
+  k3s kubectl logs -n $NAMESPACE deployment/otp-monitor
   k3s kubectl get svc,ingress -n $NAMESPACE
   curl -i http://127.0.0.1/
   curl -i http://127.0.0.1:$SERVICE_NODE_PORT/
 
-Help docs:
-  scripts/build_help_docs.py was run before the Docker image build.
-  To skip it: SKIP_HELP_DOCS_BUILD=1 sudo bash install-otp-relay-k8s.sh
+Monitor config is in ConfigMap otp-relay-config:
+  PHONE_IP=$PHONE_IP
+  PHONE_INTERFACE=$PHONE_INTERFACE
+  PHONE_PING_INTERVAL=$PHONE_PING_INTERVAL
+  PHONE_OFFLINE_THRESHOLD=$PHONE_OFFLINE_THRESHOLD
+  PORTAL_URL=$PORTAL_URL
 
 SMS webhook secret token was generated/stored in Kubernetes secret otp-relay-secrets.
 To print it on this server:
