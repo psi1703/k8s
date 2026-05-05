@@ -1,0 +1,648 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Safe one-click installer/update script for psi1703/k8s OTP Relay on Debian-family servers.
+# It intentionally avoids touching SSH, CIFS mounts, cron jobs, firewall rules, and unrelated services.
+#
+# Normal use:
+#   sudo bash install-otp-relay-k8s.sh
+#
+# Useful env vars:
+#   REPO_URL=https://github.com/psi1703/k8s.git
+#   REPO_REF=main
+#   INSTALL_DIR=/opt/otp-relay-k8s
+#   NAMESPACE=otp-relay
+#   APP_IMAGE=otp-relay:latest
+#   MONITOR_IMAGE=otp-monitor:latest
+#   SERVICE_NODE_PORT=30080
+#   INGRESS_ENABLED=1
+#   INSTALL_MONITOR=0|1
+#   WHATSAPP_API_KEY=...
+#   WHATSAPP_RECIPIENT=...
+#   RUNTIME_DATA_DIR=/path/with/users.xlsx/admin_auth.json/admin_config.json/wizard_progress.json
+#   SKIP_HELP_DOCS_BUILD=0|1
+#   GIT_CLEAN=1|0
+#   INSTALL_GITHUB_RUNNER=0|1
+#   GITHUB_RUNNER_URL=https://github.com/psi1703/k8s
+#   GITHUB_RUNNER_TOKEN=...
+#   NONINTERACTIVE=0|1
+
+log() { printf '[otp-relay-k8s] %s\n' "$*"; }
+warn() { printf '[otp-relay-k8s] WARNING: %s\n' "$*" >&2; }
+fatal() { printf '[otp-relay-k8s] ERROR: %s\n' "$*" >&2; exit 1; }
+cmd_exists() { command -v "$1" >/dev/null 2>&1; }
+need_root() { [ "$(id -u)" -eq 0 ] || fatal "run as root: sudo bash $0"; }
+
+need_root
+export DEBIAN_FRONTEND=noninteractive
+
+REPO_URL="${REPO_URL:-https://github.com/psi1703/k8s.git}"
+REPO_REF="${REPO_REF:-main}"
+INSTALL_DIR="${INSTALL_DIR:-/opt/otp-relay-k8s}"
+NAMESPACE="${NAMESPACE:-otp-relay}"
+APP_IMAGE="${APP_IMAGE:-otp-relay:latest}"
+MONITOR_IMAGE="${MONITOR_IMAGE:-otp-monitor:latest}"
+SERVICE_NODE_PORT="${SERVICE_NODE_PORT:-30080}"
+INGRESS_ENABLED="${INGRESS_ENABLED:-1}"
+INSTALL_MONITOR="${INSTALL_MONITOR:-0}"
+SERVER_HOSTNAME="${SERVER_HOSTNAME:-$(hostname -f 2>/dev/null || hostname)}"
+PHONE_IP="${PHONE_IP:-172.31.10.161}"
+PHONE_INTERFACE="${PHONE_INTERFACE:-$(ip route show default 2>/dev/null | awk '{print $5; exit}') }"
+PHONE_INTERFACE="$(printf '%s' "$PHONE_INTERFACE" | xargs)"
+PHONE_INTERFACE="${PHONE_INTERFACE:-eth0}"
+WHATSAPP_API_KEY="${WHATSAPP_API_KEY:-}"
+WHATSAPP_RECIPIENT="${WHATSAPP_RECIPIENT:-}"
+RUNTIME_DATA_DIR="${RUNTIME_DATA_DIR:-}"
+SKIP_HELP_DOCS_BUILD="${SKIP_HELP_DOCS_BUILD:-0}"
+GIT_CLEAN="${GIT_CLEAN:-1}"
+NONINTERACTIVE="${NONINTERACTIVE:-0}"
+INSTALL_GITHUB_RUNNER="${INSTALL_GITHUB_RUNNER:-}"
+GITHUB_RUNNER_URL="${GITHUB_RUNNER_URL:-${REPO_URL%.git}}"
+GITHUB_RUNNER_TOKEN="${GITHUB_RUNNER_TOKEN:-}"
+GITHUB_RUNNER_DIR="${GITHUB_RUNNER_DIR:-/opt/actions-runner-otp-relay}"
+GITHUB_RUNNER_NAME="${GITHUB_RUNNER_NAME:-$(hostname)-otp-relay}"
+GITHUB_RUNNER_USER="${GITHUB_RUNNER_USER:-actions-runner}"
+
+OS_ID="unknown"
+OS_NAME="unknown"
+OS_VERSION_ID="unknown"
+OS_LIKE=""
+if [ -r /etc/os-release ]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  OS_ID="${ID:-unknown}"
+  OS_NAME="${PRETTY_NAME:-${NAME:-unknown}}"
+  OS_VERSION_ID="${VERSION_ID:-unknown}"
+  OS_LIKE="${ID_LIKE:-}"
+fi
+
+ARCH_RAW="$(uname -m)"
+case "$ARCH_RAW" in
+  x86_64|amd64) RUNNER_ARCH="x64" ;;
+  aarch64|arm64) RUNNER_ARCH="arm64" ;;
+  armv7l|armv6l|armhf) RUNNER_ARCH="arm" ;;
+  *) RUNNER_ARCH="" ;;
+esac
+
+IS_RPI=0
+if grep -qi 'raspberry pi' /proc/cpuinfo 2>/dev/null || grep -qi 'raspberry pi' /proc/device-tree/model 2>/dev/null; then
+  IS_RPI=1
+fi
+
+is_debian_family() {
+  case "$OS_ID $OS_LIKE" in
+    *debian*|*ubuntu*|*raspbian*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+prompt_yes_no() {
+  prompt="$1"
+  default="${2:-N}"
+  if [ "$NONINTERACTIVE" = "1" ]; then
+    [ "$default" = "Y" ]
+    return $?
+  fi
+  printf '%s ' "$prompt"
+  read -r answer || answer=""
+  answer="${answer:-$default}"
+  case "$answer" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+make_secret() {
+  python3 - <<'PY' 2>/dev/null || tr -dc 'A-Fa-f0-9' </dev/urandom | head -c 64
+import secrets
+print(secrets.token_hex(32))
+PY
+}
+SMS_SECRET_TOKEN="${SMS_SECRET_TOKEN:-$(make_secret)}"
+
+if [ -z "$INSTALL_GITHUB_RUNNER" ]; then
+  if prompt_yes_no "Install a GitHub Actions self-hosted runner for CI/CD deployments from GitHub? [y/N]" "N"; then
+    INSTALL_GITHUB_RUNNER=1
+  else
+    INSTALL_GITHUB_RUNNER=0
+  fi
+fi
+
+if [ "$INSTALL_MONITOR" = "1" ]; then
+  [ -n "$WHATSAPP_API_KEY" ] || fatal "INSTALL_MONITOR=1 requires WHATSAPP_API_KEY"
+  [ -n "$WHATSAPP_RECIPIENT" ] || fatal "INSTALL_MONITOR=1 requires WHATSAPP_RECIPIENT"
+fi
+
+log "detected OS/arch: $OS_NAME / $ARCH_RAW"
+[ "$IS_RPI" = "1" ] && log "detected Raspberry Pi hardware"
+is_debian_family || fatal "this installer currently supports Debian-family systems only"
+
+log "running non-invasive preflight checks"
+if ! ss -lnt 2>/dev/null | grep -qE '(^|[[:space:]]|:)22[[:space:]]'; then
+  warn "SSH does not appear to be listening on TCP/22. I will not change SSH, but confirm console access before continuing."
+fi
+if grep -qi '[[:space:]]cifs[[:space:]]' /etc/fstab 2>/dev/null; then
+  warn "CIFS entries detected in /etc/fstab. This installer will not mount, unmount, or edit them."
+  warn "For scheduled-only CIFS jobs, prefer noauto,nofail,_netdev,x-systemd.automount or mount inside that job."
+fi
+if mount | grep -qi ' type cifs '; then
+  warn "An active CIFS mount is present. It will be left untouched."
+fi
+if systemctl is-active --quiet docker 2>/dev/null; then
+  log "Docker is already running; installer will not restart it"
+fi
+if systemctl is-active --quiet k3s 2>/dev/null; then
+  log "K3s is already running; installer will not restart it"
+fi
+
+mkdir -p /var/backups/otp-relay-k8s
+ip route > /var/backups/otp-relay-k8s/ip-route.before 2>/dev/null || true
+ip addr > /var/backups/otp-relay-k8s/ip-addr.before 2>/dev/null || true
+iptables-save > /var/backups/otp-relay-k8s/iptables.before 2>/dev/null || true
+nft list ruleset > /var/backups/otp-relay-k8s/nft.before 2>/dev/null || true
+
+if [ "$IS_RPI" = "1" ]; then
+  if ! grep -qw cgroup_memory /proc/cmdline 2>/dev/null || ! grep -qw cgroup_enable=memory /proc/cmdline 2>/dev/null; then
+    warn "Raspberry Pi memory cgroup flags are not active. K3s may fail without them."
+    warn "This installer will not edit boot files automatically. Add cgroup_memory=1 cgroup_enable=memory and reboot if K3s fails."
+  fi
+fi
+
+log "installing missing OS packages with apt-get"
+apt-get update
+apt-get install -y --no-install-recommends \
+  ca-certificates curl git iproute2 iptables nftables python3 python3-venv python3-openpyxl jq tar gzip docker.io
+
+if ! systemctl is-active --quiet docker; then
+  log "starting Docker because it is required to build the local app image"
+  systemctl enable --now docker
+else
+  log "Docker already active; no restart performed"
+fi
+
+if ! cmd_exists k3s; then
+  log "installing K3s server. This installs Kubernetes networking, but does not stop unrelated services."
+  curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='server --write-kubeconfig-mode 644' sh -
+else
+  log "K3s already installed; no reinstall performed"
+fi
+
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+log "waiting for Kubernetes node readiness"
+for i in $(seq 1 60); do
+  if k3s kubectl get nodes >/dev/null 2>&1 && k3s kubectl wait --for=condition=Ready node --all --timeout=10s >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+  [ "$i" -lt 60 ] || fatal "K3s node did not become Ready"
+done
+
+log "syncing repository into $INSTALL_DIR"
+if [ -d "$INSTALL_DIR/.git" ]; then
+  git -C "$INSTALL_DIR" remote set-url origin "$REPO_URL" || true
+  git -C "$INSTALL_DIR" fetch --prune origin "$REPO_REF"
+  git -C "$INSTALL_DIR" reset --hard "origin/$REPO_REF"
+  if [ "$GIT_CLEAN" = "1" ]; then
+    log "cleaning untracked files in repo working tree, preserving common local data/secret files"
+    git -C "$INSTALL_DIR" clean -ffd       -e data/       -e .env       -e k8s/manifests/secret.env       -e '*.log'
+  fi
+elif [ -e "$INSTALL_DIR" ]; then
+  fatal "$INSTALL_DIR exists but is not a git repo. Move it away or set INSTALL_DIR to another path."
+else
+  git clone --branch "$REPO_REF" "$REPO_URL" "$INSTALL_DIR"
+fi
+cd "$INSTALL_DIR"
+log "repo synced to $(git rev-parse --short HEAD): $(git log -1 --pretty=%s)"
+
+ensure_required_files() {
+  [ -f main.py ] || fatal "main.py is missing in repo root"
+  [ -f requirements.txt ] || fatal "requirements.txt is missing in repo root"
+  [ -f monitor.py ] || warn "monitor.py is missing; monitor deployment will be unavailable"
+  [ -d frontend ] || fatal "frontend/ directory is missing"
+  [ -f frontend/index.html ] || fatal "frontend/index.html is missing"
+  [ -f frontend/app.jsx ] || fatal "frontend/app.jsx is missing"
+  [ -f frontend/style.css ] || fatal "frontend/style.css is missing"
+}
+
+prepare_python_build_env() {
+  log "preparing Python build environment from requirements.txt"
+  python3 -m venv .installer-venv
+  .installer-venv/bin/python -m pip install --upgrade pip setuptools wheel
+  .installer-venv/bin/python -m pip install -r requirements.txt
+}
+
+build_help_docs() {
+  if [ "$SKIP_HELP_DOCS_BUILD" = "1" ]; then
+    log "skipping help docs build because SKIP_HELP_DOCS_BUILD=1"
+    return 0
+  fi
+  [ -f scripts/build_help_docs.py ] || fatal "required help-doc builder is missing: scripts/build_help_docs.py"
+  prepare_python_build_env
+  log "building help docs with scripts/build_help_docs.py"
+  .installer-venv/bin/python scripts/build_help_docs.py
+}
+
+ensure_required_files
+build_help_docs
+
+log "writing Debian/K3s deployment assets"
+mkdir -p k8s/manifests
+cat > k8s/Dockerfile <<'DOCKER'
+FROM python:3.12-slim AS runtime
+WORKDIR /app
+RUN useradd --system --uid 999 --no-create-home --shell /usr/sbin/nologin otprelay \
+  && python -m venv /app/venv \
+  && mkdir -p /app/data \
+  && chown -R otprelay:otprelay /app
+COPY requirements.txt .
+RUN /app/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
+  && /app/venv/bin/pip install --no-cache-dir -r requirements.txt
+COPY main.py .
+COPY frontend/ ./frontend/
+COPY docs/ ./docs/
+USER otprelay
+ENV OTP_RELAY_DATA_DIR=/app/data \
+    USERS_EXCEL_PATH=/app/data/users.xlsx \
+    AUDIT_LOG_PATH=/app/data/audit.log
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD /app/venv/bin/python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/admin/queue')"
+CMD ["/app/venv/bin/python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+DOCKER
+
+if [ -f monitor.py ]; then
+cat > k8s/Dockerfile.monitor <<'DOCKER'
+FROM python:3.12-slim
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends iputils-arping \
+  && rm -rf /var/lib/apt/lists/* \
+  && useradd --system --uid 999 --no-create-home --shell /usr/sbin/nologin otprelay \
+  && python -m venv /app/venv \
+  && mkdir -p /app/data \
+  && chown -R otprelay:otprelay /app
+WORKDIR /app
+COPY requirements.txt .
+RUN /app/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
+  && /app/venv/bin/pip install --no-cache-dir -r requirements.txt
+COPY monitor.py .
+USER otprelay
+ENV OTP_RELAY_DATA_DIR=/app/data
+CMD ["/app/venv/bin/python", "monitor.py"]
+DOCKER
+fi
+
+cat > k8s/manifests/namespace.yaml <<EOF_NS
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: $NAMESPACE
+EOF_NS
+
+cat > k8s/manifests/configmap.yaml <<EOF_CM
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otp-relay-config
+  namespace: $NAMESPACE
+data:
+  CLAIM_EXPIRY_SEC: "90"
+  OTP_DISPLAY_SEC: "285"
+  CONCURRENT_RISK_SEC: "30"
+  OTP_RELAY_DATA_DIR: "/app/data"
+  USERS_EXCEL_PATH: "/app/data/users.xlsx"
+  AUDIT_LOG_PATH: "/app/data/audit.log"
+  PHONE_IP: "$PHONE_IP"
+  PHONE_INTERFACE: "$PHONE_INTERFACE"
+  PHONE_PING_INTERVAL: "150"
+  PHONE_OFFLINE_THRESHOLD: "2"
+  BATCH_WINDOW_SEC: "10"
+  ALERT_LEVEL: "error"
+  SERVER_HOSTNAME: "$SERVER_HOSTNAME"
+EOF_CM
+
+cat > k8s/manifests/pvc.yaml <<EOF_PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: otp-relay-data
+  namespace: $NAMESPACE
+  labels:
+    app: otp-relay
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+EOF_PVC
+
+cat > k8s/manifests/deployment.yaml <<EOF_DEPLOY
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otp-relay
+  namespace: $NAMESPACE
+  labels:
+    app: otp-relay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otp-relay
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: otp-relay
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+        - name: app
+          image: $APP_IMAGE
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: otp-relay-config
+          env:
+            - name: SMS_SECRET_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: otp-relay-secrets
+                  key: SMS_SECRET_TOKEN
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /admin/queue
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /admin/queue
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 30
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: otp-relay-data
+EOF_DEPLOY
+
+cat > k8s/manifests/service.yaml <<EOF_SVC
+apiVersion: v1
+kind: Service
+metadata:
+  name: otp-relay
+  namespace: $NAMESPACE
+  labels:
+    app: otp-relay
+spec:
+  type: NodePort
+  selector:
+    app: otp-relay
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+      nodePort: $SERVICE_NODE_PORT
+      protocol: TCP
+EOF_SVC
+
+if [ "$INGRESS_ENABLED" = "1" ]; then
+cat > k8s/manifests/ingress.yaml <<EOF_ING
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: otp-relay
+  namespace: $NAMESPACE
+spec:
+  ingressClassName: traefik
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: otp-relay
+                port:
+                  number: 80
+EOF_ING
+else
+  rm -f k8s/manifests/ingress.yaml
+fi
+
+if [ "$INSTALL_MONITOR" = "1" ]; then
+  [ -f monitor.py ] || fatal "INSTALL_MONITOR=1 requested but monitor.py is missing"
+cat > k8s/manifests/deployment-monitor.yaml <<EOF_MON
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otp-monitor
+  namespace: $NAMESPACE
+  labels:
+    app: otp-monitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otp-monitor
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: otp-monitor
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+        - name: monitor
+          image: $MONITOR_IMAGE
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: otp-relay-config
+          env:
+            - name: WHATSAPP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: otp-relay-secrets
+                  key: WHATSAPP_API_KEY
+            - name: WHATSAPP_RECIPIENT
+              valueFrom:
+                secretKeyRef:
+                  name: otp-relay-secrets
+                  key: WHATSAPP_RECIPIENT
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - NET_RAW
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: otp-relay-data
+EOF_MON
+fi
+
+log "validating Python syntax and Kubernetes manifests"
+python3 -m py_compile main.py
+[ ! -f monitor.py ] || python3 -m py_compile monitor.py
+k3s kubectl apply --dry-run=client -f k8s/manifests/namespace.yaml >/dev/null
+k3s kubectl apply -f k8s/manifests/namespace.yaml
+k3s kubectl apply --dry-run=client \
+  -f k8s/manifests/configmap.yaml \
+  -f k8s/manifests/pvc.yaml \
+  -f k8s/manifests/deployment.yaml \
+  -f k8s/manifests/service.yaml >/dev/null
+if [ "$INGRESS_ENABLED" = "1" ]; then
+  k3s kubectl apply --dry-run=client -f k8s/manifests/ingress.yaml >/dev/null
+fi
+
+log "creating/updating Kubernetes secret"
+k3s kubectl create secret generic otp-relay-secrets \
+  --namespace "$NAMESPACE" \
+  --from-literal=SMS_SECRET_TOKEN="$SMS_SECRET_TOKEN" \
+  --from-literal=WHATSAPP_API_KEY="$WHATSAPP_API_KEY" \
+  --from-literal=WHATSAPP_RECIPIENT="$WHATSAPP_RECIPIENT" \
+  --dry-run=client -o yaml | k3s kubectl apply -f -
+
+log "building app image with Docker"
+docker build -t "$APP_IMAGE" -f k8s/Dockerfile .
+log "importing app image into K3s containerd"
+tmp_app_tar="$(mktemp --suffix=.tar)"
+docker save "$APP_IMAGE" -o "$tmp_app_tar"
+k3s ctr images import "$tmp_app_tar"
+rm -f "$tmp_app_tar"
+
+if [ "$INSTALL_MONITOR" = "1" ]; then
+  log "building monitor image with Docker"
+  docker build -t "$MONITOR_IMAGE" -f k8s/Dockerfile.monitor .
+  log "importing monitor image into K3s containerd"
+  tmp_monitor_tar="$(mktemp --suffix=.tar)"
+  docker save "$MONITOR_IMAGE" -o "$tmp_monitor_tar"
+  k3s ctr images import "$tmp_monitor_tar"
+  rm -f "$tmp_monitor_tar"
+fi
+
+log "applying Kubernetes resources"
+k3s kubectl apply -f k8s/manifests/configmap.yaml
+k3s kubectl apply -f k8s/manifests/pvc.yaml
+k3s kubectl apply -f k8s/manifests/deployment.yaml
+k3s kubectl apply -f k8s/manifests/service.yaml
+if [ "$INGRESS_ENABLED" = "1" ]; then
+  k3s kubectl apply -f k8s/manifests/ingress.yaml
+else
+  k3s kubectl delete ingress otp-relay -n "$NAMESPACE" --ignore-not-found=true
+fi
+if [ "$INSTALL_MONITOR" = "1" ]; then
+  k3s kubectl apply -f k8s/manifests/deployment-monitor.yaml
+fi
+
+log "restarting app deployment to pick up freshly imported local image"
+k3s kubectl rollout restart deployment/otp-relay -n "$NAMESPACE"
+log "waiting for app rollout"
+k3s kubectl rollout status deployment/otp-relay -n "$NAMESPACE" --timeout=180s
+
+if [ -n "$RUNTIME_DATA_DIR" ]; then
+  [ -d "$RUNTIME_DATA_DIR" ] || fatal "RUNTIME_DATA_DIR does not exist: $RUNTIME_DATA_DIR"
+  pod="$(k3s kubectl get pod -n "$NAMESPACE" -l app=otp-relay -o jsonpath='{.items[0].metadata.name}')"
+  for f in users.xlsx admin_auth.json admin_config.json wizard_progress.json audit.log; do
+    if [ -f "$RUNTIME_DATA_DIR/$f" ]; then
+      log "copying $f into PVC"
+      k3s kubectl cp "$RUNTIME_DATA_DIR/$f" "$NAMESPACE/$pod:/app/data/$f" -n "$NAMESPACE"
+    fi
+  done
+  k3s kubectl rollout restart deployment/otp-relay -n "$NAMESPACE"
+  k3s kubectl rollout status deployment/otp-relay -n "$NAMESPACE" --timeout=180s
+fi
+
+install_github_runner() {
+  [ "$INSTALL_GITHUB_RUNNER" = "1" ] || return 0
+  [ -n "$RUNNER_ARCH" ] || fatal "unsupported architecture for GitHub runner: $ARCH_RAW"
+  [ -n "$GITHUB_RUNNER_URL" ] || fatal "INSTALL_GITHUB_RUNNER=1 requires GITHUB_RUNNER_URL"
+  [ -n "$GITHUB_RUNNER_TOKEN" ] || fatal "INSTALL_GITHUB_RUNNER=1 requires GITHUB_RUNNER_TOKEN"
+
+  if systemctl list-unit-files | grep -q 'actions.runner'; then
+    warn "an actions.runner systemd unit already exists; leaving existing runner untouched"
+    return 0
+  fi
+
+  log "installing GitHub Actions self-hosted runner"
+  id -u "$GITHUB_RUNNER_USER" >/dev/null 2>&1 || useradd --system --create-home --shell /bin/bash "$GITHUB_RUNNER_USER"
+  mkdir -p "$GITHUB_RUNNER_DIR"
+  chown -R "$GITHUB_RUNNER_USER:$GITHUB_RUNNER_USER" "$GITHUB_RUNNER_DIR"
+
+  runner_version="2.328.0"
+  runner_tar="actions-runner-linux-${RUNNER_ARCH}-${runner_version}.tar.gz"
+  runner_url="https://github.com/actions/runner/releases/download/v${runner_version}/${runner_tar}"
+  curl -fL "$runner_url" -o "/tmp/$runner_tar"
+  tar -xzf "/tmp/$runner_tar" -C "$GITHUB_RUNNER_DIR"
+  rm -f "/tmp/$runner_tar"
+  chown -R "$GITHUB_RUNNER_USER:$GITHUB_RUNNER_USER" "$GITHUB_RUNNER_DIR"
+
+  sudo -u "$GITHUB_RUNNER_USER" bash -lc "cd '$GITHUB_RUNNER_DIR' && ./config.sh --unattended --url '$GITHUB_RUNNER_URL' --token '$GITHUB_RUNNER_TOKEN' --name '$GITHUB_RUNNER_NAME' --labels 'otp-relay,k3s,$OS_ID,$RUNNER_ARCH' --work _work"
+  bash -lc "cd '$GITHUB_RUNNER_DIR' && ./svc.sh install '$GITHUB_RUNNER_USER' && ./svc.sh start"
+}
+install_github_runner
+
+node_ip="$(hostname -I | awk '{print $1}')"
+cat <<EOF_DONE
+
+OTP Relay Kubernetes deployment complete.
+
+Portal URL:   http://$node_ip/
+NodePort URL: http://$node_ip:$SERVICE_NODE_PORT/
+Namespace:    $NAMESPACE
+Repo path:    $INSTALL_DIR
+OS/arch:      $OS_NAME / $ARCH_RAW
+Runner:       $INSTALL_GITHUB_RUNNER
+
+Useful commands:
+  export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+  k3s kubectl get pods -n $NAMESPACE
+  k3s kubectl logs -n $NAMESPACE deployment/otp-relay
+  k3s kubectl get svc,ingress -n $NAMESPACE
+  curl -i http://127.0.0.1/
+  curl -i http://127.0.0.1:$SERVICE_NODE_PORT/
+
+Help docs:
+  scripts/build_help_docs.py was run before the Docker image build.
+  To skip it: SKIP_HELP_DOCS_BUILD=1 sudo bash install-otp-relay-k8s.sh
+
+SMS webhook secret token was generated/stored in Kubernetes secret otp-relay-secrets.
+To print it on this server:
+  k3s kubectl get secret otp-relay-secrets -n $NAMESPACE -o jsonpath='{.data.SMS_SECRET_TOKEN}' | base64 -d; echo
+EOF_DONE
