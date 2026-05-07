@@ -33,6 +33,7 @@ set -Eeuo pipefail
 #   GITHUB_RUNNER_URL=https://github.com/psi1703/k8s
 #   GITHUB_RUNNER_TOKEN=...
 #   GITHUB_RUNNER_DIR=/opt/actions-runner
+#   RUNNER_ONLY=0|1
 #   NONINTERACTIVE=0|1
 
 log() { printf '[otp-relay-k8s] %s\n' "$*"; }
@@ -76,6 +77,7 @@ GITHUB_RUNNER_URL="${GITHUB_RUNNER_URL:-${REPO_URL%.git}}"
 GITHUB_RUNNER_TOKEN="${GITHUB_RUNNER_TOKEN:-}"
 GITHUB_RUNNER_DIR="${GITHUB_RUNNER_DIR:-/opt/actions-runner}"
 GITHUB_RUNNER_USER="${GITHUB_RUNNER_USER:-actions-runner}"
+RUNNER_ONLY="${RUNNER_ONLY:-0}"
 
 OS_ID="unknown"
 OS_NAME="unknown"
@@ -134,12 +136,7 @@ PY
 }
 SMS_SECRET_TOKEN="${SMS_SECRET_TOKEN:-$(make_secret)}"
 
-install_github_runner() {
-  [ "$INSTALL_GITHUB_RUNNER" = "1" ] || return 0
-  [ -n "$RUNNER_ARCH" ] || fatal "unsupported architecture for GitHub runner: $ARCH_RAW"
-  [ -n "$GITHUB_RUNNER_URL" ] || fatal "INSTALL_GITHUB_RUNNER=1 requires GITHUB_RUNNER_URL"
-  [ -n "$GITHUB_RUNNER_TOKEN" ] || fatal "INSTALL_GITHUB_RUNNER=1 requires GITHUB_RUNNER_TOKEN"
-
+write_runner_sudoers() {
   id -u "$GITHUB_RUNNER_USER" >/dev/null 2>&1 || useradd --system --create-home --shell /bin/bash "$GITHUB_RUNNER_USER"
 
   sudoers_file="/etc/sudoers.d/otp-relay-actions-runner"
@@ -147,14 +144,26 @@ install_github_runner() {
   cat > "$sudoers_file" <<EOF_SUDOERS
 $GITHUB_RUNNER_USER ALL=(root) NOPASSWD:SETENV: /bin/bash $INSTALL_DIR/install-otp-relay-k8s.sh
 $GITHUB_RUNNER_USER ALL=(root) NOPASSWD:SETENV: /usr/bin/bash $INSTALL_DIR/install-otp-relay-k8s.sh
+$GITHUB_RUNNER_USER ALL=(root) NOPASSWD:SETENV: /bin/bash $GITHUB_RUNNER_DIR/_work/*/*/install-otp-relay-k8s.sh
+$GITHUB_RUNNER_USER ALL=(root) NOPASSWD:SETENV: /usr/bin/bash $GITHUB_RUNNER_DIR/_work/*/*/install-otp-relay-k8s.sh
 EOF_SUDOERS
   chmod 0440 "$sudoers_file"
   visudo -cf "$sudoers_file" >/dev/null
+}
+
+install_github_runner() {
+  [ "$INSTALL_GITHUB_RUNNER" = "1" ] || return 0
+
+  write_runner_sudoers
 
   if systemctl list-unit-files | grep -q 'actions.runner'; then
     warn "an actions.runner systemd unit already exists; leaving existing runner registration untouched"
     return 0
   fi
+
+  [ -n "$RUNNER_ARCH" ] || fatal "unsupported architecture for GitHub runner: $ARCH_RAW"
+  [ -n "$GITHUB_RUNNER_URL" ] || fatal "INSTALL_GITHUB_RUNNER=1 requires GITHUB_RUNNER_URL"
+  [ -n "$GITHUB_RUNNER_TOKEN" ] || fatal "INSTALL_GITHUB_RUNNER=1 requires GITHUB_RUNNER_TOKEN"
 
   log "installing GitHub Actions self-hosted runner before Docker/K3s deployment work"
   mkdir -p "$GITHUB_RUNNER_DIR"
@@ -170,6 +179,24 @@ EOF_SUDOERS
 
   sudo -u "$GITHUB_RUNNER_USER" bash -lc "cd '$GITHUB_RUNNER_DIR' && ./config.sh --unattended --url '$GITHUB_RUNNER_URL' --token '$GITHUB_RUNNER_TOKEN' --work _work"
   bash -lc "cd '$GITHUB_RUNNER_DIR' && ./svc.sh install '$GITHUB_RUNNER_USER' && ./svc.sh start"
+}
+
+ensure_docker() {
+  if ! cmd_exists docker; then
+    log "installing Docker because it is required to build and import local images"
+    apt-get install -y --no-install-recommends docker.io
+  fi
+
+  if ! cmd_exists docker; then
+    fatal "docker command is still not available after installing docker.io"
+  fi
+
+  if ! systemctl is-active --quiet docker; then
+    log "starting Docker because it is required to build the local app image"
+    systemctl enable --now docker
+  else
+    log "Docker already active; no restart performed"
+  fi
 }
 
 if [ -z "$INSTALL_GITHUB_RUNNER" ]; then
@@ -221,16 +248,16 @@ apt-get install -y --no-install-recommends \
 
 install_github_runner
 
+if [ "$RUNNER_ONLY" = "1" ]; then
+  log "RUNNER_ONLY=1 set; GitHub runner setup complete. Skipping Docker, K3s, image build, and deployment."
+  exit 0
+fi
+
 log "installing Kubernetes/deployment OS packages with apt-get"
 apt-get install -y --no-install-recommends \
-  iproute2 iptables nftables python3-venv jq docker.io
+  iproute2 iptables nftables python3-venv jq
 
-if ! systemctl is-active --quiet docker; then
-  log "starting Docker because it is required to build the local app image"
-  systemctl enable --now docker
-else
-  log "Docker already active; no restart performed"
-fi
+ensure_docker
 
 if ! cmd_exists k3s; then
   log "installing K3s server. This installs Kubernetes networking, but does not stop unrelated services."
@@ -657,6 +684,7 @@ Repo path:    $INSTALL_DIR
 OS/arch:      $OS_NAME / $ARCH_RAW
 Monitor:      installed as required component
 Runner:       $INSTALL_GITHUB_RUNNER
+Runner only:  $RUNNER_ONLY
 
 Useful commands:
   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
