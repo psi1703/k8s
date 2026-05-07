@@ -34,6 +34,7 @@ set -Eeuo pipefail
 #   GITHUB_RUNNER_TOKEN=...
 #   GITHUB_RUNNER_DIR=/opt/actions-runner
 #   RUNNER_ONLY=0|1
+#   DEPLOY_MODE=full|app|monitor|manifests|none
 #   NONINTERACTIVE=0|1
 
 log() { printf '[otp-relay-k8s] %s\n' "$*"; }
@@ -79,6 +80,8 @@ GITHUB_RUNNER_TOKEN="${GITHUB_RUNNER_TOKEN:-}"
 GITHUB_RUNNER_DIR="${GITHUB_RUNNER_DIR:-/opt/actions-runner}"
 GITHUB_RUNNER_USER="${GITHUB_RUNNER_USER:-actions-runner}"
 RUNNER_ONLY="${RUNNER_ONLY:-0}"
+DEPLOY_MODE="${DEPLOY_MODE:-full}"
+DOCKER_BIN="${DOCKER_BIN:-}"
 
 OS_ID="unknown"
 OS_NAME="unknown"
@@ -182,48 +185,77 @@ install_github_runner() {
   bash -lc "cd '$GITHUB_RUNNER_DIR' && ./svc.sh install '$GITHUB_RUNNER_USER' && ./svc.sh start"
 }
 
-find_docker_bin() {
-  if command -v docker >/dev/null 2>&1; then
-    command -v docker
+resolve_docker_bin() {
+  if [ -n "$DOCKER_BIN" ] && [ -x "$DOCKER_BIN" ]; then
     return 0
   fi
-  for candidate in /usr/bin/docker /usr/local/bin/docker /bin/docker; do
+  if cmd_exists docker; then
+    DOCKER_BIN="$(command -v docker)"
+    return 0
+  fi
+  for candidate in /usr/bin/docker /usr/local/bin/docker /snap/bin/docker; do
     if [ -x "$candidate" ]; then
-      printf '%s\n' "$candidate"
+      DOCKER_BIN="$candidate"
       return 0
     fi
   done
   return 1
 }
 
+install_package_if_available() {
+  pkg="$1"
+  if apt-cache show "$pkg" >/dev/null 2>&1; then
+    apt-get install -y --no-install-recommends "$pkg"
+  fi
+}
+
 ensure_docker() {
-  DOCKER_BIN="${DOCKER_BIN:-}"
-  if [ -z "$DOCKER_BIN" ]; then
-    DOCKER_BIN="$(find_docker_bin 2>/dev/null || true)"
+  if ! resolve_docker_bin; then
+    log "installing Docker because it is required to build and import local images"
+    apt-get install -y --no-install-recommends docker.io
+    install_package_if_available docker-cli
   fi
 
-  if [ -z "$DOCKER_BIN" ]; then
-    log "installing Docker CLI/engine because local image builds are required"
-    if apt-cache show docker-cli >/dev/null 2>&1; then
-      apt-get install -y --no-install-recommends docker.io docker-cli
-    else
-      apt-get install -y --no-install-recommends docker.io
-    fi
-    DOCKER_BIN="$(find_docker_bin 2>/dev/null || true)"
+  if ! resolve_docker_bin; then
+    fatal "Docker CLI is still not available after installing docker.io/docker-cli. On Debian 13, confirm the package provides /usr/bin/docker or install Docker CE CLI."
   fi
-
-  if [ -z "$DOCKER_BIN" ]; then
-    fatal "docker CLI is still not available after package install. On Debian 13, install docker-cli or docker-ce-cli, then rerun."
-  fi
-  export DOCKER_BIN
-  log "using Docker CLI at $DOCKER_BIN"
 
   if ! systemctl is-active --quiet docker; then
-    log "starting Docker because it is required to build the local app image"
+    log "starting Docker because it is required to build local images"
     systemctl enable --now docker
   else
     log "Docker already active; no restart performed"
   fi
+
+  log "using Docker CLI: $DOCKER_BIN"
+}
+
+requires_docker() {
+  case "$DEPLOY_MODE" in
+    full|app|monitor) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+requires_app_image() {
+  case "$DEPLOY_MODE" in
+    full|app) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+requires_monitor_image() {
+  case "$DEPLOY_MODE" in
+    full|monitor) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+requires_manifests_apply() {
+  case "$DEPLOY_MODE" in
+    full|app|monitor|manifests) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 if [ -z "$INSTALL_GITHUB_RUNNER" ]; then
@@ -280,11 +312,26 @@ if [ "$RUNNER_ONLY" = "1" ]; then
   exit 0
 fi
 
+case "$DEPLOY_MODE" in
+  full|app|monitor|manifests|none) ;;
+  *) fatal "unsupported DEPLOY_MODE=$DEPLOY_MODE. Use full, app, monitor, manifests, or none." ;;
+esac
+log "deployment mode: $DEPLOY_MODE"
+
+if [ "$DEPLOY_MODE" = "none" ]; then
+  log "DEPLOY_MODE=none; no deployment changes required. Exiting before Docker/K3s work."
+  exit 0
+fi
+
 log "installing Kubernetes/deployment OS packages with apt-get"
 apt-get install -y --no-install-recommends \
   iproute2 iptables nftables python3-venv jq
 
-ensure_docker
+if requires_docker; then
+  ensure_docker
+else
+  log "DEPLOY_MODE=$DEPLOY_MODE does not require Docker image build; skipping Docker check/install"
+fi
 
 if ! cmd_exists k3s; then
   log "installing K3s server. This installs Kubernetes networking, but does not stop unrelated services."
@@ -342,16 +389,20 @@ if [ -z "$WHATSAPP_API_KEY" ] || [ -z "$WHATSAPP_RECIPIENT" ]; then
   warn "WhatsApp alert credentials are not set. monitor.py will still run, but WhatsApp alerts will be skipped."
 fi
 
-log "preparing installer Python environment"
-python3 -m venv .installer-venv
-.installer-venv/bin/python -m pip install --upgrade pip setuptools wheel
-.installer-venv/bin/python -m pip install -r requirements.txt
+if requires_app_image; then
+  log "preparing installer Python environment for app validation/help docs"
+  python3 -m venv .installer-venv
+  .installer-venv/bin/python -m pip install --upgrade pip setuptools wheel
+  .installer-venv/bin/python -m pip install -r requirements.txt
 
-if [ "$SKIP_HELP_DOCS_BUILD" = "1" ]; then
-  log "skipping help docs build because SKIP_HELP_DOCS_BUILD=1"
+  if [ "$SKIP_HELP_DOCS_BUILD" = "1" ]; then
+    log "skipping help docs build because SKIP_HELP_DOCS_BUILD=1"
+  else
+    log "building help docs with scripts/build_help_docs.py"
+    .installer-venv/bin/python scripts/build_help_docs.py
+  fi
 else
-  log "building help docs with scripts/build_help_docs.py"
-  .installer-venv/bin/python scripts/build_help_docs.py
+  log "DEPLOY_MODE=$DEPLOY_MODE does not require app help-doc build; skipping installer venv"
 fi
 
 log "writing Debian/K3s Docker and Kubernetes assets"
@@ -627,7 +678,12 @@ spec:
 EOF_MON
 
 log "validating Python syntax and Kubernetes manifests"
-.installer-venv/bin/python -m py_compile main.py monitor.py
+if requires_app_image; then
+  python3 -m py_compile main.py
+fi
+if requires_monitor_image; then
+  python3 -m py_compile monitor.py
+fi
 k3s kubectl apply --dry-run=client -f k8s/manifests/namespace.yaml >/dev/null
 k3s kubectl apply -f k8s/manifests/namespace.yaml
 k3s kubectl apply --dry-run=client \
@@ -640,51 +696,81 @@ if [ "$INGRESS_ENABLED" = "1" ]; then
   k3s kubectl apply --dry-run=client -f k8s/manifests/ingress.yaml >/dev/null
 fi
 
-log "creating/updating Kubernetes secret"
-k3s kubectl create secret generic otp-relay-secrets \
-  --namespace "$NAMESPACE" \
-  --from-literal=SMS_SECRET_TOKEN="$SMS_SECRET_TOKEN" \
-  --from-literal=WHATSAPP_API_KEY="$WHATSAPP_API_KEY" \
-  --from-literal=WHATSAPP_RECIPIENT="$WHATSAPP_RECIPIENT" \
-  --dry-run=client -o yaml | k3s kubectl apply -f -
-
-log "building app image with Docker"
-"$DOCKER_BIN" build -t "$APP_IMAGE" -f k8s/Dockerfile .
-log "importing app image into K3s containerd"
-tmp_app_tar="$(mktemp --suffix=.tar)"
-"$DOCKER_BIN" save "$APP_IMAGE" -o "$tmp_app_tar"
-k3s ctr images import "$tmp_app_tar"
-rm -f "$tmp_app_tar"
-
-log "building required monitor image with Docker"
-"$DOCKER_BIN" build -t "$MONITOR_IMAGE" -f k8s/Dockerfile.monitor .
-log "importing required monitor image into K3s containerd"
-tmp_monitor_tar="$(mktemp --suffix=.tar)"
-"$DOCKER_BIN" save "$MONITOR_IMAGE" -o "$tmp_monitor_tar"
-k3s ctr images import "$tmp_monitor_tar"
-rm -f "$tmp_monitor_tar"
-
-log "applying Kubernetes resources"
-k3s kubectl apply -f k8s/manifests/configmap.yaml
-k3s kubectl apply -f k8s/manifests/pvc.yaml
-k3s kubectl apply -f k8s/manifests/deployment.yaml
-k3s kubectl apply -f k8s/manifests/service.yaml
-if [ "$INGRESS_ENABLED" = "1" ]; then
-  k3s kubectl apply -f k8s/manifests/ingress.yaml
-else
-  k3s kubectl delete ingress otp-relay -n "$NAMESPACE" --ignore-not-found=true
+if requires_manifests_apply; then
+  log "creating/updating Kubernetes secret"
+  k3s kubectl create secret generic otp-relay-secrets \
+    --namespace "$NAMESPACE" \
+    --from-literal=SMS_SECRET_TOKEN="$SMS_SECRET_TOKEN" \
+    --from-literal=WHATSAPP_API_KEY="$WHATSAPP_API_KEY" \
+    --from-literal=WHATSAPP_RECIPIENT="$WHATSAPP_RECIPIENT" \
+    --dry-run=client -o yaml | k3s kubectl apply -f -
 fi
-k3s kubectl apply -f k8s/manifests/deployment-monitor.yaml
 
-log "restarting deployments to pick up freshly imported local images"
-k3s kubectl rollout restart deployment/otp-relay -n "$NAMESPACE"
-k3s kubectl rollout restart deployment/otp-monitor -n "$NAMESPACE"
-log "waiting for app rollout"
-k3s kubectl rollout status deployment/otp-relay -n "$NAMESPACE" --timeout=180s
-log "waiting for monitor rollout"
-k3s kubectl rollout status deployment/otp-monitor -n "$NAMESPACE" --timeout=180s
+if requires_app_image; then
+  log "building app image with Docker"
+  "$DOCKER_BIN" build -t "$APP_IMAGE" -f k8s/Dockerfile .
+  log "importing app image into K3s containerd"
+  tmp_app_tar="$(mktemp --suffix=.tar)"
+  "$DOCKER_BIN" save "$APP_IMAGE" -o "$tmp_app_tar"
+  k3s ctr images import "$tmp_app_tar"
+  rm -f "$tmp_app_tar"
+else
+  log "DEPLOY_MODE=$DEPLOY_MODE skips app image build/import"
+fi
 
-if [ -n "$RUNTIME_DATA_DIR" ]; then
+if requires_monitor_image; then
+  log "building required monitor image with Docker"
+  "$DOCKER_BIN" build -t "$MONITOR_IMAGE" -f k8s/Dockerfile.monitor .
+  log "importing required monitor image into K3s containerd"
+  tmp_monitor_tar="$(mktemp --suffix=.tar)"
+  "$DOCKER_BIN" save "$MONITOR_IMAGE" -o "$tmp_monitor_tar"
+  k3s ctr images import "$tmp_monitor_tar"
+  rm -f "$tmp_monitor_tar"
+else
+  log "DEPLOY_MODE=$DEPLOY_MODE skips monitor image build/import"
+fi
+
+if requires_manifests_apply; then
+  log "applying Kubernetes resources"
+  k3s kubectl apply -f k8s/manifests/configmap.yaml
+  k3s kubectl apply -f k8s/manifests/pvc.yaml
+
+  if [ "$DEPLOY_MODE" = "full" ] || [ "$DEPLOY_MODE" = "app" ] || [ "$DEPLOY_MODE" = "manifests" ]; then
+    k3s kubectl apply -f k8s/manifests/deployment.yaml
+    k3s kubectl apply -f k8s/manifests/service.yaml
+    if [ "$INGRESS_ENABLED" = "1" ]; then
+      k3s kubectl apply -f k8s/manifests/ingress.yaml
+    else
+      k3s kubectl delete ingress otp-relay -n "$NAMESPACE" --ignore-not-found=true
+    fi
+  fi
+
+  if [ "$DEPLOY_MODE" = "full" ] || [ "$DEPLOY_MODE" = "monitor" ] || [ "$DEPLOY_MODE" = "manifests" ]; then
+    k3s kubectl apply -f k8s/manifests/deployment-monitor.yaml
+  fi
+fi
+
+if requires_app_image; then
+  log "restarting app deployment to pick up freshly imported local app image"
+  k3s kubectl rollout restart deployment/otp-relay -n "$NAMESPACE"
+  log "waiting for app rollout"
+  k3s kubectl rollout status deployment/otp-relay -n "$NAMESPACE" --timeout=180s
+fi
+
+if requires_monitor_image; then
+  log "restarting monitor deployment to pick up freshly imported local monitor image"
+  k3s kubectl rollout restart deployment/otp-monitor -n "$NAMESPACE"
+  log "waiting for monitor rollout"
+  k3s kubectl rollout status deployment/otp-monitor -n "$NAMESPACE" --timeout=180s
+fi
+
+if [ "$DEPLOY_MODE" = "manifests" ]; then
+  log "manifest-only apply complete; checking rollout status for existing deployments"
+  k3s kubectl rollout status deployment/otp-relay -n "$NAMESPACE" --timeout=180s || true
+  k3s kubectl rollout status deployment/otp-monitor -n "$NAMESPACE" --timeout=180s || true
+fi
+
+if [ -n "$RUNTIME_DATA_DIR" ] && { [ "$DEPLOY_MODE" = "full" ] || [ "$DEPLOY_MODE" = "app" ]; }; then
   [ -d "$RUNTIME_DATA_DIR" ] || fatal "RUNTIME_DATA_DIR does not exist: $RUNTIME_DATA_DIR"
   pod="$(k3s kubectl get pod -n "$NAMESPACE" -l app=otp-relay -o jsonpath='{.items[0].metadata.name}')"
   for f in users.xlsx admin_auth.json admin_config.json wizard_progress.json audit.log; do
@@ -712,6 +798,7 @@ OS/arch:      $OS_NAME / $ARCH_RAW
 Monitor:      installed as required component
 Runner:       $INSTALL_GITHUB_RUNNER
 Runner only:  $RUNNER_ONLY
+Deploy mode:  $DEPLOY_MODE
 
 Useful commands:
   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
