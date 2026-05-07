@@ -1,6 +1,6 @@
 name: Deploy OTP Relay to K3s
 
-"on":
+on:
   workflow_dispatch:
   push:
     branches:
@@ -12,32 +12,34 @@ concurrency:
 
 jobs:
   deploy:
-    name: Build and deploy on K3s runner
+    name: Build and deploy on K3s server
     runs-on:
       - self-hosted
       - Linux
       - X64
 
+    env:
+      REPO_URL: https://github.com/psi1703/k8s.git
+      REPO_REF: main
+      INSTALL_DIR: /opt/otp-relay-k8s
+      NAMESPACE: otp-relay
+      APP_IMAGE: otp-relay:latest
+      MONITOR_IMAGE: otp-monitor:latest
+      SERVICE_NODE_PORT: "30080"
+      INGRESS_ENABLED: "1"
+      NONINTERACTIVE: "1"
+      GIT_CLEAN: "1"
+      PHONE_IP: ${{ secrets.PHONE_IP }}
+      PHONE_INTERFACE: ${{ secrets.PHONE_INTERFACE }}
+      WHATSAPP_API_KEY: ${{ secrets.WHATSAPP_API_KEY }}
+      WHATSAPP_RECIPIENT: ${{ secrets.WHATSAPP_RECIPIENT }}
+      PORTAL_URL: ${{ secrets.PORTAL_URL }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Deploy with local K3s installer
-        env:
-          REPO_URL: https://github.com/psi1703/k8s.git
-          REPO_REF: main
-          INSTALL_DIR: /opt/otp-relay-k8s
-          NAMESPACE: otp-relay
-          APP_IMAGE: otp-relay:latest
-          MONITOR_IMAGE: otp-monitor:latest
-          SERVICE_NODE_PORT: "30080"
-          INGRESS_ENABLED: "1"
-          PHONE_IP: ${{ secrets.PHONE_IP }}
-          PHONE_INTERFACE: ${{ secrets.PHONE_INTERFACE }}
-          WHATSAPP_API_KEY: ${{ secrets.WHATSAPP_API_KEY }}
-          WHATSAPP_RECIPIENT: ${{ secrets.WHATSAPP_RECIPIENT }}
-          PORTAL_URL: ${{ secrets.PORTAL_URL }}
-          NONINTERACTIVE: "1"
-          GIT_CLEAN: "1"
+      - name: Deploy with checked-out installer
         run: |
-          sudo -E /usr/bin/bash /opt/otp-relay-k8s/install-otp-relay-k8s.sh
+          chmod +x "$GITHUB_WORKSPACE/install-otp-relay-k8s.sh"
+          sudo -E /usr/bin/bash "$GITHUB_WORKSPACE/install-otp-relay-k8s.sh"
