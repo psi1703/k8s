@@ -1,120 +1,152 @@
-# Building and exporting the OTP Relay image
+# Building and deploying OTP Relay images
 
-This is your side of the deployment workflow. You build the container image on
-your Windows laptop and hand it to Jathin as a file. No registry, no dev tools
-on the server.
+The recommended build path is now GitHub Actions with a self-hosted runner on the K3s server.
 
----
-
-## What you need on your laptop
-
-- **Docker Desktop for Windows** — download from https://www.docker.com/products/docker-desktop
-- **Git Bash** — you already have this
-- The repo checked out on the `k8s` branch
-
-Install Docker Desktop, start it, and make sure it is running (whale icon in
-the system tray). You do not need to log in to Docker Hub.
+The previous laptop build/export workflow is kept below as a manual fallback only.
 
 ---
 
-## The workflow every time you update the app
+## Recommended path: GitHub Actions self-hosted runner
 
-### Step 1 — make sure you are on the k8s branch and up to date
+Use this path for normal deployments.
 
-```bash
-git checkout k8s
-git pull origin k8s
+```text
+git push to main
+  -> GitHub Actions job runs on the K3s server
+  -> app and monitor images build locally
+  -> images are imported into K3s containerd
+  -> Kubernetes manifests are applied
+  -> app and monitor deployments are restarted
 ```
 
-### Step 2 — build the image
+The workflow is stored at:
 
-Run this from the repo root (the folder that contains `Dockerfile` and `main.py`):
+```text
+.github/workflows/deploy-k3s.yml
+```
+
+The full setup guide is stored at:
+
+```text
+docs/operations/github-actions-deploy.md
+```
+
+This path avoids Docker Hub, a private registry, SCP, and manual image tar transfer.
+
+---
+
+## Manual fallback: build and export from your laptop
+
+Use this only if the self-hosted GitHub runner is unavailable.
+
+### What you need on your laptop
+
+- Docker Desktop for Windows
+- Git Bash
+- The repo checked out on the deployment branch
+
+Install Docker Desktop, start it, and make sure it is running. You do not need to log in to Docker Hub.
+
+---
+
+## Laptop fallback workflow
+
+### Step 1 - update your checkout
+
+```bash
+git checkout main
+git pull origin main
+```
+
+### Step 2 - build the app image
+
+Run this from the repo root:
 
 ```bash
 docker build -t otp-relay:latest -f k8s/Dockerfile .
 ```
 
-The first build takes a few minutes — Docker is downloading the base image and
-installing Python packages. Subsequent builds are much faster because Docker
-caches the layers that have not changed.
+### Step 3 - build the monitor image
 
-You will see output like:
-```
-[+] Building 42.3s (12/12) FINISHED
+```bash
+docker build -t otp-monitor:latest -f k8s/Dockerfile.monitor .
 ```
 
-If it says `FINISHED`, the image is built. If it fails, paste the error here
-and we will fix it.
-
-### Step 3 — verify the image exists
+### Step 4 - verify the images exist
 
 ```bash
 docker images otp-relay
+docker images otp-monitor
 ```
 
-You should see something like:
-```
-REPOSITORY    TAG       IMAGE ID       CREATED         SIZE
-otp-relay     latest    a1b2c3d4e5f6   2 minutes ago   210MB
-```
-
-### Step 4 — export the image to a file
+### Step 5 - export the images
 
 ```bash
 docker save otp-relay:latest -o otp-relay-latest.tar
+docker save otp-monitor:latest -o otp-monitor-latest.tar
 ```
 
-This creates a file called `otp-relay-latest.tar` in your current folder.
-It will be around 200MB. This is the file you hand to Jathin.
-
-### Step 5 — copy the file to the K3s node
+### Step 6 - copy the files to the K3s node
 
 ```bash
-scp otp-relay-latest.tar jathin@srvk3s01.init-db.lan:/tmp/
+scp otp-relay-latest.tar otp-monitor-latest.tar jathin@srvk3s01.init-db.lan:/tmp/
 ```
 
-Replace `jathin` with whatever username Jathin uses on the server. The file
-lands in `/tmp/` on the server — Jathin imports it from there.
+Replace `jathin` and the host name with the correct server login details.
 
-Tell Jathin the file is ready. He takes it from here.
-
----
-
-## Quick reference — the four commands
+### Step 7 - import images on the server
 
 ```bash
-docker build -t otp-relay:latest -f k8s/Dockerfile .
-docker images otp-relay
-docker save otp-relay:latest -o otp-relay-latest.tar
-scp otp-relay-latest.tar jathin@srvk3s01.init-db.lan:/tmp/
+sudo k3s ctr images import /tmp/otp-relay-latest.tar
+sudo k3s ctr images import /tmp/otp-monitor-latest.tar
+sudo k3s kubectl rollout restart deployment/otp-relay -n otp-relay
+sudo k3s kubectl rollout restart deployment/otp-monitor -n otp-relay
+sudo k3s kubectl rollout status deployment/otp-relay -n otp-relay --timeout=180s
+sudo k3s kubectl rollout status deployment/otp-monitor -n otp-relay --timeout=180s
 ```
 
 ---
 
-## When only main.py or frontend changed
+## Quick reference: preferred deployment
 
-Docker layer caching means only the changed layers rebuild. The pip install
-step is cached and skipped. A code-only rebuild typically takes under 10
-seconds.
+```bash
+git add .
+git commit -m "Update OTP Relay Kubernetes deployment"
+git push origin main
+```
 
-## When you add a new Python package to the app
+Then watch:
 
-The pip install layer is invalidated and rebuilds from scratch. This is normal
-and expected. It takes the same time as the first build.
+```text
+GitHub -> Actions -> Deploy OTP Relay to K3s
+```
 
 ---
 
 ## Troubleshooting
 
-**Docker Desktop is not running**
-The `docker` command will fail with "Cannot connect to the Docker daemon".
-Start Docker Desktop from the Start menu and wait for the whale icon to stop
-animating before retrying.
+**GitHub job says no runner is available**
 
-**`scp` asks for a password every time**
-Set up SSH key authentication to the server. Ask Jathin to add your public key
-to his `~/.ssh/authorized_keys`.
+Check that the self-hosted runner service is running on the K3s server:
 
-**The image is missing after a Docker Desktop restart**
-Docker Desktop on Windows stores images on disk — they survive restarts. If an
-image is missing, just rebuild it with Step 2.
+```bash
+sudo systemctl status actions.runner* --no-pager
+```
+
+**GitHub job fails at sudo**
+
+Re-run the installer once with `INSTALL_GITHUB_RUNNER=1` so it creates the restricted sudoers rule for the runner user.
+
+**Docker build fails**
+
+Open the failed GitHub Actions run and inspect the build step output. For local fallback builds, confirm Docker Desktop is running.
+
+**Kubernetes rollout fails**
+
+Check pod status and logs:
+
+```bash
+sudo k3s kubectl get pods -n otp-relay
+sudo k3s kubectl logs -n otp-relay deployment/otp-relay --tail=100
+sudo k3s kubectl logs -n otp-relay deployment/otp-monitor --tail=100
+```
