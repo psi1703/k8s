@@ -55,6 +55,22 @@ const API = {
   saveAdminConfig(session, payload) {
     return this.json('/admin/config', { method: 'POST', headers: { 'X-Admin-Session': session }, body: JSON.stringify({ admin_tokens: payload }) });
   },
+  async uploadUsersExcel(session, file) {
+    const form = new FormData();
+    form.append('file', file);
+    const res = await fetch('/admin/users/upload', {
+      method: 'POST',
+      headers: { 'X-Admin-Session': session },
+      body: form,
+    });
+    let data = null;
+    try { data = await res.json(); } catch { data = null; }
+    if (!res.ok) {
+      const detail = data && (data.detail || data.error || data.message);
+      throw new Error(typeof detail === 'string' ? detail : `Upload failed: ${res.status}`);
+    }
+    return data;
+  },
   notifyAdminTask(payload) { return this.json('/api/onboard/notify', { method: 'POST', body: JSON.stringify(payload) }); },
 };
 
@@ -1528,6 +1544,7 @@ function AdminView({ admin, setAdmin, doAdminAuth, loadAdminData, toggleAdminSte
   const [wizardProgress, setWizardProgress] = useState('all');
   const [showAdminTokenConfig, setShowAdminTokenConfig] = useState(false);
   const [refreshStatus, setRefreshStatus] = useState('');
+  const [usersUpload, setUsersUpload] = useState({ busy: false, message: '', error: '' });
 
   useEffect(() => {
     if (admin.session && !admin.data) loadAdminData();
@@ -1596,6 +1613,28 @@ function AdminView({ admin, setAdmin, doAdminAuth, loadAdminData, toggleAdminSte
     }, 2200);
   }
 
+  async function uploadUsersFile(event) {
+    const file = event.target.files && event.target.files[0];
+    event.target.value = '';
+    if (!file) return;
+
+    setUsersUpload({ busy: true, message: '', error: '' });
+    try {
+      const result = await API.uploadUsersExcel(admin.session, file);
+      await loadAdminData();
+      setUsersUpload({
+        busy: false,
+        message: `Uploaded ${result.filename || 'users.xlsx'} - ${result.users_loaded || 0} users loaded`,
+        error: '',
+      });
+      setTimeout(() => {
+        setUsersUpload(current => current.error ? current : { ...current, message: '' });
+      }, 3500);
+    } catch (e) {
+      setUsersUpload({ busy: false, message: '', error: e.message || 'Upload failed' });
+    }
+  }
+
   function renderCompletedSteps(user) {
     const done = completedStepsList(user);
     if (done.length === 0) return <div className="small">No completed steps yet</div>;
@@ -1631,8 +1670,14 @@ function AdminView({ admin, setAdmin, doAdminAuth, loadAdminData, toggleAdminSte
                 <button className="btn" style={{ width: 'auto', whiteSpace: 'nowrap', background: adminTab === 'otp-log' ? RS.primary800 : RS.neutralWhite, color: adminTab === 'otp-log' ? RS.neutralWhite : RS.neutral900, border: adminTab === 'otp-log' ? 'none' : `1px solid ${RS.neutral300}` }} onClick={() => setAdminTab('otp-log')}>OTP Log</button>
               </div>
               {adminTab === 'wizard' && <button className="btn btn-secondary" style={{ width: 'auto', whiteSpace: 'nowrap' }} onClick={() => exportWizardProgressPdf(users)}>Export PDF</button>}
+              <label className="btn btn-secondary" style={{ width: 'auto', whiteSpace: 'nowrap', cursor: usersUpload.busy ? 'not-allowed' : 'pointer', opacity: usersUpload.busy ? 0.65 : 1 }}>
+                {usersUpload.busy ? 'Uploading...' : 'Upload users.xlsx'}
+                <input type="file" accept=".xlsx" disabled={usersUpload.busy} onChange={uploadUsersFile} style={{ display: 'none' }} />
+              </label>
               <button className="btn btn-secondary" style={{ width: 'auto', whiteSpace: 'nowrap' }} disabled={admin.loading} onClick={refreshAdminData}>{admin.loading && refreshStatus === 'Refreshing...' ? 'Refreshing...' : 'Refresh'}</button>
               {refreshStatus && <span className={refreshStatus === 'Refresh failed' ? 'error-box' : 'success-box'} style={{ padding: '8px 10px', whiteSpace: 'nowrap' }}>{refreshStatus}</span>}
+              {usersUpload.message && <span className="success-box" style={{ padding: '8px 10px', whiteSpace: 'nowrap' }}>{usersUpload.message}</span>}
+              {usersUpload.error && <span className="error-box" style={{ padding: '8px 10px', whiteSpace: 'nowrap' }}>{usersUpload.error}</span>}
               <button className="btn btn-secondary" style={{ width: 46, minWidth: 46, padding: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 22, lineHeight: 1 }} aria-label="Admin token settings" title="Admin token settings" onClick={() => setShowAdminTokenConfig(true)}>⚙</button>
             </div>
           </div>
