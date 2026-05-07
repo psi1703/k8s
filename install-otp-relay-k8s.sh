@@ -44,6 +44,7 @@ need_root() { [ "$(id -u)" -eq 0 ] || fatal "run as root: sudo bash $0"; }
 
 need_root
 export DEBIAN_FRONTEND=noninteractive
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 
 REPO_URL="${REPO_URL:-https://github.com/psi1703/k8s.git}"
 REPO_REF="${REPO_REF:-main}"
@@ -181,15 +182,41 @@ install_github_runner() {
   bash -lc "cd '$GITHUB_RUNNER_DIR' && ./svc.sh install '$GITHUB_RUNNER_USER' && ./svc.sh start"
 }
 
+find_docker_bin() {
+  if command -v docker >/dev/null 2>&1; then
+    command -v docker
+    return 0
+  fi
+  for candidate in /usr/bin/docker /usr/local/bin/docker /bin/docker; do
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 ensure_docker() {
-  if ! cmd_exists docker; then
-    log "installing Docker because it is required to build and import local images"
-    apt-get install -y --no-install-recommends docker.io
+  DOCKER_BIN="${DOCKER_BIN:-}"
+  if [ -z "$DOCKER_BIN" ]; then
+    DOCKER_BIN="$(find_docker_bin 2>/dev/null || true)"
   fi
 
-  if ! cmd_exists docker; then
-    fatal "docker command is still not available after installing docker.io"
+  if [ -z "$DOCKER_BIN" ]; then
+    log "installing Docker CLI/engine because local image builds are required"
+    if apt-cache show docker-cli >/dev/null 2>&1; then
+      apt-get install -y --no-install-recommends docker.io docker-cli
+    else
+      apt-get install -y --no-install-recommends docker.io
+    fi
+    DOCKER_BIN="$(find_docker_bin 2>/dev/null || true)"
   fi
+
+  if [ -z "$DOCKER_BIN" ]; then
+    fatal "docker CLI is still not available after package install. On Debian 13, install docker-cli or docker-ce-cli, then rerun."
+  fi
+  export DOCKER_BIN
+  log "using Docker CLI at $DOCKER_BIN"
 
   if ! systemctl is-active --quiet docker; then
     log "starting Docker because it is required to build the local app image"
@@ -622,18 +649,18 @@ k3s kubectl create secret generic otp-relay-secrets \
   --dry-run=client -o yaml | k3s kubectl apply -f -
 
 log "building app image with Docker"
-docker build -t "$APP_IMAGE" -f k8s/Dockerfile .
+"$DOCKER_BIN" build -t "$APP_IMAGE" -f k8s/Dockerfile .
 log "importing app image into K3s containerd"
 tmp_app_tar="$(mktemp --suffix=.tar)"
-docker save "$APP_IMAGE" -o "$tmp_app_tar"
+"$DOCKER_BIN" save "$APP_IMAGE" -o "$tmp_app_tar"
 k3s ctr images import "$tmp_app_tar"
 rm -f "$tmp_app_tar"
 
 log "building required monitor image with Docker"
-docker build -t "$MONITOR_IMAGE" -f k8s/Dockerfile.monitor .
+"$DOCKER_BIN" build -t "$MONITOR_IMAGE" -f k8s/Dockerfile.monitor .
 log "importing required monitor image into K3s containerd"
 tmp_monitor_tar="$(mktemp --suffix=.tar)"
-docker save "$MONITOR_IMAGE" -o "$tmp_monitor_tar"
+"$DOCKER_BIN" save "$MONITOR_IMAGE" -o "$tmp_monitor_tar"
 k3s ctr images import "$tmp_monitor_tar"
 rm -f "$tmp_monitor_tar"
 
