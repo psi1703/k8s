@@ -42,4 +42,4 @@ jobs:
       - name: Deploy with checked-out installer
         run: |
           chmod +x "$GITHUB_WORKSPACE/install-otp-relay-k8s.sh"
-          sudo -E /usr/bin/bash "$GITHUB_WORKSPACE/install-otp-relay-k8s.sh"
+          sudo -n -E /usr/bin/bash "$GITHUB_WORKSPACE/install-otp-relay-k8s.sh"
