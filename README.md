@@ -121,6 +121,63 @@ sudo GIT_CLEAN=0 bash install-otp-relay-k8s.sh
 
 ---
 
+## GitHub Actions deployment
+
+The preferred deployment path is a GitHub Actions workflow running on a self-hosted runner installed on the K3s server.
+
+The workflow is stored at:
+
+```text
+.github/workflows/deploy-k3s.yml
+```
+
+It runs on:
+
+- push to `main`
+- manual `workflow_dispatch` from the GitHub Actions tab
+
+The workflow calls the installer on the server:
+
+```bash
+sudo -E /usr/bin/bash /opt/otp-relay-k8s/install-otp-relay-k8s.sh
+```
+
+The installer remains the source of truth. It builds the app image and the required monitor image locally, imports both images into K3s containerd, applies manifests, and waits for rollout completion.
+
+One-time runner bootstrap:
+
+```bash
+sudo INSTALL_GITHUB_RUNNER=1 \
+  GITHUB_RUNNER_URL="https://github.com/psi1703/k8s" \
+  GITHUB_RUNNER_TOKEN="PASTE_RUNNER_TOKEN_HERE" \
+  PHONE_IP="172.31.10.161" \
+  PHONE_INTERFACE="eth0" \
+  WHATSAPP_API_KEY="PASTE_WHATSAPP_API_KEY_HERE" \
+  WHATSAPP_RECIPIENT="PASTE_WHATSAPP_RECIPIENT_HERE" \
+  PORTAL_URL="http://SERVER_IP_OR_DNS" \
+  NONINTERACTIVE=1 \
+  bash install-otp-relay-k8s.sh
+```
+
+Create these GitHub Actions repository secrets before using the workflow:
+
+```text
+PHONE_IP
+PHONE_INTERFACE
+WHATSAPP_API_KEY
+WHATSAPP_RECIPIENT
+PORTAL_URL
+```
+
+Detailed instructions are in:
+
+```text
+docs/operations/github-actions-deploy.md
+k8s/docs/operations/build-guide.md
+```
+
+---
+
 ## Repository structure
 
 ```text
@@ -129,6 +186,9 @@ otp-relay-k8s/
 ├── monitor.py
 ├── requirements.txt
 ├── install-otp-relay-k8s.sh
+├── .github/
+│   └── workflows/
+│       └── deploy-k3s.yml
 ├── frontend/
 │   ├── index.html
 │   ├── app.jsx
@@ -140,6 +200,8 @@ otp-relay-k8s/
 │       ├── rendered/
 │       └── assets/
 ├── docs/
+│   ├── operations/
+│   │   └── github-actions-deploy.md
 │   └── help/
 │       ├── *.md
 │       └── assets/
