@@ -15,8 +15,8 @@ jobs:
     name: Build and deploy on K3s runner
     runs-on:
       - self-hosted
-      - otp-relay
-      - k3s
+      - Linux
+      - X64
 
     steps:
       - name: Checkout repository
