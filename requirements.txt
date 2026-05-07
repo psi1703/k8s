@@ -6,3 +6,4 @@ bcrypt
 pydantic
 markdown
 pyyaml
+python-multipart
