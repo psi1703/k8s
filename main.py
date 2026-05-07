@@ -18,12 +18,13 @@ from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from io import BytesIO
 from typing import Any, Dict, List, Optional
 
 import bcrypt
 import openpyxl
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -72,6 +73,7 @@ OTP_DISPLAY_SEC = int(os.getenv("OTP_DISPLAY_SEC", "285"))  # 4 min 45 sec
 CONCURRENT_RISK_SEC = int(os.getenv("CONCURRENT_RISK_SEC", "30"))
 
 USERS_EXCEL_PATH = str(_resolve_runtime_path(os.getenv("USERS_EXCEL_PATH", "data/users.xlsx")))
+USERS_EXCEL_MAX_BYTES = int(os.getenv("USERS_EXCEL_MAX_BYTES", str(5 * 1024 * 1024)))
 AUDIT_LOG_PATH = str(_resolve_runtime_path(os.getenv("AUDIT_LOG_PATH", "data/audit.log")))
 
 # -- State --------------------------------------------------------------------
@@ -201,7 +203,7 @@ class ConfigPayload(BaseModel):
 
 
 # -- User loading --------------------------------------------------------------
-def load_users_from_excel(path: str) -> int:
+def load_users_from_excel(path: str, replace_existing: bool = True) -> int:
     """
     Reads users.xlsx. Expected columns (row 1 = headers):
       token - 2 or 3 character unique string, e.g. AH or AHM
@@ -217,9 +219,15 @@ def load_users_from_excel(path: str) -> int:
         for cell in next(ws.iter_rows(min_row=1, max_row=1))
     ]
 
+    required_headers = {"token", "name", "email"}
+    missing_headers = sorted(required_headers - set(raw_headers))
+    if missing_headers:
+        raise ValueError(f"users.xlsx missing required column(s): {', '.join(missing_headers)}")
+
     loaded = 0
     skipped = 0
     seen_tokens: Dict[str, int] = {}
+    imported_users: Dict[str, Dict[str, str]] = {}
 
     for row_num, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
         if all(value is None for value in row):
@@ -261,8 +269,12 @@ def load_users_from_excel(path: str) -> int:
             continue
 
         seen_tokens[token] = row_num
-        users[token] = {"token": token, "name": name, "email": email}
+        imported_users[token] = {"token": token, "name": name, "email": email}
         loaded += 1
+
+    if replace_existing:
+        users.clear()
+        users.update(imported_users)
 
     logger.info("Loaded %s users from %s (%s rows skipped)", loaded, path, skipped)
     if skipped > 0:
@@ -568,12 +580,75 @@ async def list_users():
     }
 
 
+
+
+@app.get("/admin/users/status")
+async def users_file_status(x_admin_session: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_session)
+    path = Path(USERS_EXCEL_PATH)
+    exists = path.exists()
+    stat = path.stat() if exists else None
+    return {
+        "exists": exists,
+        "path": str(path),
+        "users_loaded": len(users),
+        "size_bytes": stat.st_size if stat else 0,
+        "updated_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat() if stat else None,
+        "max_size_bytes": USERS_EXCEL_MAX_BYTES,
+    }
+
+
+@app.post("/admin/users/upload")
+async def upload_users_excel(file: UploadFile = File(...), x_admin_session: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_session)
+
+    filename = file.filename or "users.xlsx"
+    if not filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Upload must be an .xlsx file")
+
+    content = await file.read(USERS_EXCEL_MAX_BYTES + 1)
+    if len(content) > USERS_EXCEL_MAX_BYTES:
+        raise HTTPException(status_code=413, detail=f"users.xlsx is too large. Maximum size is {USERS_EXCEL_MAX_BYTES} bytes")
+
+    target = Path(USERS_EXCEL_PATH)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_name(target.stem + ".upload.tmp.xlsx")
+
+    try:
+        # Fail fast if the file is not a valid workbook before touching the live users.xlsx.
+        openpyxl.load_workbook(BytesIO(content), read_only=True).close()
+        tmp_path.write_bytes(content)
+        parsed_count = load_users_from_excel(str(tmp_path), replace_existing=False)
+        if parsed_count <= 0:
+            raise ValueError("users.xlsx did not contain any valid users")
+
+        tmp_path.replace(target)
+        count = load_users_from_excel(str(target), replace_existing=True)
+        audit("users_excel_uploaded", detail=f"{filename} uploaded by admin; {count} users loaded")
+        return {
+            "status": "ok",
+            "filename": filename,
+            "users_loaded": count,
+            "size_bytes": len(content),
+            "path": str(target),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        audit("users_excel_upload_failed", detail=str(exc), status="error")
+        raise HTTPException(status_code=400, detail=f"Could not import users.xlsx: {exc}")
+
+
 @app.post("/admin/reload-users")
-async def reload_users():
+async def reload_users(x_admin_session: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_session)
     if not os.path.exists(USERS_EXCEL_PATH):
         raise HTTPException(status_code=404, detail=f"Not found: {USERS_EXCEL_PATH}")
-    users.clear()
-    count = load_users_from_excel(USERS_EXCEL_PATH)
+    count = load_users_from_excel(USERS_EXCEL_PATH, replace_existing=True)
     audit("users_reloaded", detail=f"{count} users loaded")
     return {"status": "ok", "users_loaded": count}
 
