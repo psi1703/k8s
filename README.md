@@ -2,9 +2,23 @@
 
 Kubernetes/K3s deployment for the OTP Relay Portal.
 
-FastAPI backend + React frontend + persistent runtime data on a Kubernetes PVC.
+This repository contains the containerized OTP Relay Portal, the required monitor service, Kubernetes manifests, and the installer used by GitHub Actions to deploy to the K3s server.
 
-This repository contains the Kubernetes version of the OTP Relay Portal. It is intended to match the current portal application behavior while replacing the older VM/systemd deployment with containers and Kubernetes resources.
+The current deployment model is:
+
+```text
+GitHub main branch
+  ↓
+GitHub Actions workflow
+  ↓
+Self-hosted runner on the K3s server
+  ↓
+install-otp-relay-k8s.sh
+  ↓
+Docker local build → K3s image import → kubectl apply
+```
+
+The GitHub repository is the source of truth. After the self-hosted runner is installed, edit files in GitHub/local Git and push to `main`; do not manually edit deployment files under `/opt/otp-relay-k8s` except for emergency recovery.
 
 ---
 
@@ -16,165 +30,35 @@ OTP values are kept in memory only. They are never written to disk or audit logs
 
 The portal includes:
 
-- User token login from `users.xlsx`
-- RTA onboarding wizard
-- Admin dashboard
-- Admin credential setup/login
-- Admin token configuration saved in `admin_config.json`
-- Wizard progress saved in `wizard_progress.json`
-- Audit log at `audit.log`
-- Help documentation served from the frontend
-- Optional monitor container for phone presence and WhatsApp alerts
+- user token login from `users.xlsx`
+- admin dashboard
+- admin credential setup/login
+- admin upload for `users.xlsx`
+- admin token configuration saved in `admin_config.json`
+- wizard progress saved in `wizard_progress.json`
+- audit log at `audit.log`
+- generated help documentation served from the frontend
+- required monitor deployment for phone presence and WhatsApp alerts
 
 ---
 
-## One-click installation
+## Important runtime design constraints
 
-For Debian, Ubuntu, and Raspberry Pi OS servers, use the installer:
-
-```bash
-sudo bash install-otp-relay-k8s.sh
-```
-
-The installer will:
-
-- detect OS, CPU architecture, and Raspberry Pi hardware
-- install required system packages with `apt-get`
-- install K3s if missing
-- clone or sync this repository to `/opt/otp-relay-k8s`
-- create a local Python virtual environment for build-time tools
-- install Python dependencies from `requirements.txt`
-- build help documentation using `scripts/build_help_docs.py`
-- build the OTP Relay container image
-- import the image into K3s containerd
-- apply Kubernetes resources
-- expose the portal through Traefik Ingress
-- expose a NodePort fallback on port `30080`
-- optionally configure a GitHub Actions self-hosted runner
-
-After installation, the portal should be available at:
+Keep the portal deployment at one replica for now:
 
 ```text
-http://<server-ip>/
-http://<server-ip>:30080/
+replicas: 1
 ```
 
-Example:
+The OTP queue and admin sessions are currently stored in process memory. Multiple replicas of the same portal would create separate in-memory queues and sessions, so OTP verification could fail if different requests are routed to different pods.
+
+Safe current model:
 
 ```text
-http://172.31.11.107/
-http://172.31.11.107:30080/
+one portal instance → one app pod → one PVC → one in-memory OTP state
 ```
 
----
-
-## Installer safety behavior
-
-The installer is designed to be safe for mixed-use servers.
-
-It does not intentionally:
-
-- modify SSH configuration
-- stop or restart unrelated services
-- edit firewall rules
-- modify cron jobs
-- delete existing non-repository directories
-
-Before making deployment changes, it performs preflight checks for:
-
-- SSH listener
-- existing K3s installation
-- existing repository checkout
-- required frontend files
-- required help-doc build script
-- required Python dependency file
-
-Network and firewall snapshots are saved under:
-
-```text
-/var/backups/otp-relay-k8s/
-```
-
----
-
-## Git sync behavior
-
-On every run, the installer syncs `/opt/otp-relay-k8s` to `origin/main`.
-
-For an existing checkout, it runs:
-
-```bash
-git fetch --prune origin main
-git reset --hard origin/main
-git clean -ffd
-```
-
-This means all deployment files must be committed and pushed to GitHub before running the installer.
-
-Do not manually place deployment files only on the server unless you intentionally disable cleanup.
-
-To disable cleanup temporarily:
-
-```bash
-sudo GIT_CLEAN=0 bash install-otp-relay-k8s.sh
-```
-
----
-
-## GitHub Actions deployment
-
-The preferred deployment path is a GitHub Actions workflow running on a self-hosted runner installed on the K3s server. The installer registers the runner first, before Docker/K3s deployment work, and uses GitHub default runner naming and labels.
-
-The workflow is stored at:
-
-```text
-.github/workflows/deploy-k3s.yml
-```
-
-It runs on:
-
-- push to `main`
-- manual `workflow_dispatch` from the GitHub Actions tab
-
-The workflow calls the installer on the server:
-
-```bash
-sudo -E /usr/bin/bash /opt/otp-relay-k8s/install-otp-relay-k8s.sh
-```
-
-The installer remains the source of truth. It builds the app image and the required monitor image locally, imports both images into K3s containerd, applies manifests, and waits for rollout completion.
-
-One-time runner bootstrap:
-
-```bash
-sudo INSTALL_GITHUB_RUNNER=1 \
-  GITHUB_RUNNER_URL="https://github.com/psi1703/k8s" \
-  GITHUB_RUNNER_TOKEN="PASTE_RUNNER_TOKEN_HERE" \
-  PHONE_IP="172.31.10.161" \
-  PHONE_INTERFACE="eth0" \
-  WHATSAPP_API_KEY="PASTE_WHATSAPP_API_KEY_HERE" \
-  WHATSAPP_RECIPIENT="PASTE_WHATSAPP_RECIPIENT_HERE" \
-  PORTAL_URL="http://SERVER_IP_OR_DNS" \
-  NONINTERACTIVE=1 \
-  bash install-otp-relay-k8s.sh
-```
-
-Create these GitHub Actions repository secrets before using the workflow:
-
-```text
-PHONE_IP
-PHONE_INTERFACE
-WHATSAPP_API_KEY
-WHATSAPP_RECIPIENT
-PORTAL_URL
-```
-
-Detailed instructions are in:
-
-```text
-docs/operations/github-actions-deploy.md
-k8s/docs/operations/build-guide.md
-```
+Multiple separate portals are possible later by deploying isolated namespaces/PVCs/Ingress hosts, but each portal should still run one app replica until OTP state is moved to Redis, a database, or another shared backend.
 
 ---
 
@@ -195,216 +79,324 @@ otp-relay-k8s/
 │   ├── guide.html
 │   ├── style.css
 │   └── help/
-│       ├── manifest.json
-│       ├── wizard-guide.json
-│       ├── rendered/
-│       └── assets/
 ├── docs/
 │   ├── operations/
 │   │   └── github-actions-deploy.md
 │   └── help/
-│       ├── *.md
-│       └── assets/
 ├── scripts/
-│   └── build_help_docs.py
+│   ├── build_help_docs.py
+│   └── generate_sample_users.py
 ├── k8s/
 │   ├── Dockerfile
 │   ├── Dockerfile.monitor
+│   ├── docs/
 │   └── manifests/
 │       ├── namespace.yaml
 │       ├── configmap.yaml
-│       ├── secret-example.env
 │       ├── pvc.yaml
 │       ├── deployment.yaml
 │       ├── deployment-monitor.yaml
 │       ├── service.yaml
-│       └── ingress.yaml
+│       ├── ingress.yaml
+│       └── secret-example.env
 └── README.md
 ```
 
 ---
 
-## Frontend files
+## Deployment method
 
-The portal frontend lives in:
+The preferred deployment method is GitHub Actions with a self-hosted runner installed on the same server that runs K3s.
 
-```text
-frontend/
-```
-
-Required frontend files:
+The workflow file is:
 
 ```text
-frontend/index.html
-frontend/app.jsx
-frontend/style.css
+.github/workflows/deploy-k3s.yml
 ```
 
-Optional/additional frontend files:
-
-```text
-frontend/guide.html
-frontend/help/
-```
-
-The installer verifies the required frontend files before building the Docker image.
-
-If frontend files are changed, commit and push them to GitHub, then rerun:
+The workflow should run the checked-out installer from the GitHub workspace, not an old server-side copy:
 
 ```bash
-sudo bash install-otp-relay-k8s.sh
+chmod +x "$GITHUB_WORKSPACE/install-otp-relay-k8s.sh"
+sudo -n -E /usr/bin/bash "$GITHUB_WORKSPACE/install-otp-relay-k8s.sh"
 ```
 
-After deployment, hard-refresh the browser:
-
-```text
-Ctrl + F5
-```
-
-or open the portal in an incognito window to avoid cached CSS/JavaScript.
+This ensures every deployment uses the installer version from the commit that triggered the workflow.
 
 ---
 
-## Help docs build
+## One-time server bootstrap
 
-Help documentation source files live in:
+The self-hosted runner must be installed once before GitHub Actions can deploy to the server.
+
+In GitHub, create a runner token from:
 
 ```text
-docs/help/
+Repository → Settings → Actions → Runners → New self-hosted runner → Linux → x64
 ```
 
-The installer runs this before building the container image:
+Then run the installer once on the server with runner setup enabled:
 
 ```bash
-python3 scripts/build_help_docs.py
+sudo INSTALL_GITHUB_RUNNER=1 \
+  RUNNER_ONLY=1 \
+  GITHUB_RUNNER_URL="https://github.com/psi1703/k8s" \
+  GITHUB_RUNNER_TOKEN="PASTE_RUNNER_TOKEN_HERE" \
+  NONINTERACTIVE=1 \
+  bash install-otp-relay-k8s.sh
 ```
 
-The help-doc builder reads from:
+`RUNNER_ONLY=1` registers the GitHub Actions runner and exits before Docker, K3s, image builds, or Kubernetes deployment work.
+
+After this step, confirm the runner is online in GitHub:
 
 ```text
-docs/help/
+Repository → Settings → Actions → Runners
 ```
 
-and generates frontend output under:
+The runner should show as online/idle.
+
+---
+
+## Runner sudo requirement
+
+GitHub Actions runs as the runner service user, usually:
 
 ```text
-frontend/help/
+actions-runner
 ```
 
-Expected generated output includes:
+That user must be allowed to run the installer without a password. The installer attempts to create a narrow sudoers rule during runner setup.
+
+If sudo fails in GitHub Actions with:
 
 ```text
-frontend/help/manifest.json
-frontend/help/wizard-guide.json
-frontend/help/rendered/
-frontend/help/assets/
+sudo: a terminal is required to read the password
 ```
 
-The generated help files are baked into the container image during installation.
-
-To skip help-doc generation in an emergency:
+validate the runner user:
 
 ```bash
-sudo SKIP_HELP_DOCS_BUILD=1 bash install-otp-relay-k8s.sh
+ps -ef | grep '[R]unner.Listener'
+ps -o user= -p <Runner.Listener PID>
+```
+
+Then add or correct the sudoers rule with `visudo`:
+
+```sudoers
+actions-runner ALL=(root) NOPASSWD:SETENV: /usr/bin/bash /opt/actions-runner/_work/k8s/k8s/install-otp-relay-k8s.sh
+```
+
+Validate before closing the terminal:
+
+```bash
+sudo visudo -c
+```
+
+The workflow uses `sudo -n` so it fails immediately if sudoers is wrong instead of waiting for a password prompt.
+
+---
+
+## GitHub Actions secrets
+
+Create these repository secrets before running the deployment workflow:
+
+```text
+PHONE_IP
+PHONE_INTERFACE
+WHATSAPP_API_KEY
+WHATSAPP_RECIPIENT
+PORTAL_URL
+```
+
+Path:
+
+```text
+Repository → Settings → Secrets and variables → Actions → New repository secret
+```
+
+Example non-secret values:
+
+```text
+PHONE_IP=172.31.10.161
+PHONE_INTERFACE=eth0
+PORTAL_URL=http://server-ip-or-dns
+```
+
+Do not commit WhatsApp credentials to Git.
+
+---
+
+## GitHub Actions workflow environment
+
+The deploy workflow should pass the standard deployment environment to the installer:
+
+```yaml
+env:
+  REPO_URL: https://github.com/psi1703/k8s.git
+  REPO_REF: main
+  INSTALL_DIR: /opt/otp-relay-k8s
+  NAMESPACE: otp-relay
+  APP_IMAGE: otp-relay:latest
+  MONITOR_IMAGE: otp-monitor:latest
+  SERVICE_NODE_PORT: "30080"
+  INGRESS_ENABLED: "1"
+  NONINTERACTIVE: "1"
+  GIT_CLEAN: "1"
+  PHONE_IP: ${{ secrets.PHONE_IP }}
+  PHONE_INTERFACE: ${{ secrets.PHONE_INTERFACE }}
+  WHATSAPP_API_KEY: ${{ secrets.WHATSAPP_API_KEY }}
+  WHATSAPP_RECIPIENT: ${{ secrets.WHATSAPP_RECIPIENT }}
+  PORTAL_URL: ${{ secrets.PORTAL_URL }}
+```
+
+Recommended runner target:
+
+```yaml
+runs-on:
+  - self-hosted
+  - Linux
+  - X64
 ```
 
 ---
 
-## Runtime data
+## Installer behavior
 
-Do not commit runtime data to Git.
+The installer is the deployment source of truth. It performs the following work:
 
-In Kubernetes, runtime data is stored on the PVC mounted at:
+1. Runs non-invasive preflight checks.
+2. Installs base packages with `apt-get`.
+3. Installs or validates the GitHub Actions runner if requested.
+4. Exits early if `RUNNER_ONLY=1`.
+5. Installs deployment packages.
+6. Ensures Docker is available for local image builds.
+7. Installs K3s if missing.
+8. Syncs `/opt/otp-relay-k8s` to `origin/main`.
+9. Builds help docs from `docs/help` into `frontend/help`.
+10. Builds the app image locally with Docker.
+11. Imports the app image into K3s containerd.
+12. Builds the monitor image locally with Docker.
+13. Imports the monitor image into K3s containerd.
+14. Applies Kubernetes resources.
+15. Restarts and waits for the app and monitor rollouts.
 
-```text
-/app/data
-```
+The installer is designed to avoid unrelated host changes. It does not intentionally:
 
-The PVC stores:
+- modify SSH configuration
+- stop unrelated services
+- edit firewall rules
+- modify cron jobs
+- delete non-repository directories
+- change CIFS mounts
 
-```text
-users.xlsx
-admin_auth.json
-admin_config.json
-wizard_progress.json
-audit.log
-```
-
-The equivalent older VM/systemd path was:
-
-```text
-/opt/otp-relay/data
-```
-
-If migrating data from an older install, copy those files into the PVC-backed `/app/data` location.
-
----
-
-## Required secrets
-
-Copy the example file and fill in real values:
-
-```bash
-cp k8s/manifests/secret-example.env k8s/manifests/secret.env
-```
-
-Generate the SMS secret:
-
-```bash
-python3 - <<'PY'
-import secrets
-print(secrets.token_hex(32))
-PY
-```
-
-Create or update the Kubernetes secret:
-
-```bash
-kubectl create secret generic otp-relay-secrets \
-  --from-env-file=k8s/manifests/secret.env \
-  --namespace=otp-relay \
-  --dry-run=client -o yaml | kubectl apply -f -
-```
-
-Never commit:
+Network and firewall snapshots are saved under:
 
 ```text
-k8s/manifests/secret.env
+/var/backups/otp-relay-k8s/
 ```
 
 ---
 
-## Network exposure
+## Git sync behavior
 
-The app is exposed in two ways.
+On every full deployment, the installer syncs the server checkout to GitHub:
 
-Primary route through Traefik Ingress:
+```bash
+git fetch --prune origin main
+git reset --hard origin/main
+git clean -ffd
+```
+
+This means:
+
+```text
+commit + push first, then deploy
+```
+
+Do not manually place application changes only on the server. They will be removed by the next clean deployment.
+
+To temporarily disable cleanup during emergency debugging:
+
+```bash
+sudo GIT_CLEAN=0 bash install-otp-relay-k8s.sh
+```
+
+---
+
+## Docker and K3s image flow
+
+This repo does not require Docker Hub or an external container registry.
+
+Images are built locally on the server:
+
+```text
+Docker build on server
+  ↓
+docker save
+  ↓
+k3s ctr images import
+  ↓
+Kubernetes rollout restart
+```
+
+Images:
+
+```text
+otp-relay:latest
+otp-monitor:latest
+```
+
+Docker is required on the server for this build/import flow.
+
+---
+
+## Kubernetes resources
+
+Default namespace:
+
+```text
+otp-relay
+```
+
+Default deployments:
+
+```text
+deployment/otp-relay
+deployment/otp-monitor
+```
+
+Default PVC:
+
+```text
+otp-relay-data
+```
+
+Default service shape:
+
+```text
+service/otp-relay   NodePort   80:30080/TCP
+```
+
+Default ingress:
+
+```text
+ingress/otp-relay   Traefik   port 80
+```
+
+Primary route:
 
 ```text
 http://<server-ip>/
 ```
 
-Fallback route through NodePort:
+Fallback route:
 
 ```text
 http://<server-ip>:30080/
 ```
 
-The OTP Relay app container listens internally on:
-
-```text
-0.0.0.0:8000
-```
-
-The Kubernetes Service maps:
-
-```text
-service port 80 -> container port 8000
-```
-
-The default K3s Traefik controller owns normal HTTP port `80`. For that reason, the main app service should not depend on a direct `LoadBalancer` service for port `80`.
-
-Correct traffic flow:
+Traffic flow:
 
 ```text
 Browser
@@ -430,37 +422,143 @@ Pod otp-relay:8000
 
 ---
 
-## Verify installation
+## Runtime data
 
-Check K3s:
+Runtime data is stored on the Kubernetes PVC mounted at:
 
-```bash
-sudo systemctl status k3s --no-pager
-sudo k3s kubectl get nodes
+```text
+/app/data
 ```
 
-Check all pods:
+The PVC stores:
 
-```bash
-sudo k3s kubectl get pods -A
+```text
+users.xlsx
+admin_auth.json
+admin_config.json
+wizard_progress.json
+audit.log
 ```
 
-Check OTP Relay resources:
+Runtime data must not be committed to Git.
+
+---
+
+## Loading users.xlsx
+
+Preferred method: upload from the portal admin UI.
+
+Flow:
+
+```text
+Admin dashboard → Upload users.xlsx → file saved to /app/data/users.xlsx → users reload immediately
+```
+
+The upload feature validates that:
+
+- the uploaded file is `.xlsx`
+- the workbook can be opened
+- required columns exist
+- upload activity is recorded in `audit.log`
+
+Manual fallback if the portal is not usable yet:
+
+```bash
+POD=$(sudo k3s kubectl get pod -n otp-relay -l app=otp-relay -o jsonpath='{.items[0].metadata.name}')
+sudo k3s kubectl cp ./users.xlsx otp-relay/$POD:/app/data/users.xlsx -n otp-relay
+sudo k3s kubectl rollout restart deployment/otp-relay -n otp-relay
+```
+
+After the upload feature is deployed, manual `kubectl cp` should only be needed for recovery or first-time emergency setup.
+
+---
+
+## Required monitor deployment
+
+The monitor is a required deployment in this Kubernetes version.
+
+It:
+
+- checks phone presence using `arping`
+- reads the shared `audit.log` from the PVC
+- sends WhatsApp alerts using `WHATSAPP_API_KEY` and `WHATSAPP_RECIPIENT`
+
+The monitor requires:
+
+```yaml
+hostNetwork: true
+dnsPolicy: ClusterFirstWithHostNet
+securityContext:
+  capabilities:
+    add:
+      - NET_RAW
+```
+
+The monitor must not be exposed through a Kubernetes Service or Ingress.
+
+---
+
+## Help docs build
+
+Help documentation source files live in:
+
+```text
+docs/help/
+```
+
+The installer runs:
+
+```bash
+python3 scripts/build_help_docs.py
+```
+
+Generated frontend output is written to:
+
+```text
+frontend/help/
+```
+
+To skip help-doc generation in an emergency:
+
+```bash
+sudo SKIP_HELP_DOCS_BUILD=1 bash install-otp-relay-k8s.sh
+```
+
+---
+
+## Verify deployment
+
+Check all OTP Relay resources:
 
 ```bash
 sudo k3s kubectl get pods,svc,ingress -n otp-relay
 ```
 
-Expected service shape:
+Expected pods:
 
 ```text
-service/otp-relay   NodePort   ...   80:30080/TCP
+otp-relay
+otp-monitor
 ```
 
-Expected ingress shape:
+Expected service:
 
 ```text
-ingress.networking.k8s.io/otp-relay   traefik   *   <server-ip>   80
+otp-relay   NodePort   80:30080/TCP
+```
+
+Check rollout status:
+
+```bash
+sudo k3s kubectl rollout status deployment/otp-relay -n otp-relay
+sudo k3s kubectl rollout status deployment/otp-monitor -n otp-relay
+```
+
+Check logs:
+
+```bash
+sudo k3s kubectl logs -n otp-relay deployment/otp-relay --tail=100
+sudo k3s kubectl logs -n otp-relay deployment/otp-monitor --tail=100
 ```
 
 Test locally on the server:
@@ -476,192 +574,6 @@ Expected result:
 HTTP/1.1 200 OK
 ```
 
-Test using the server IP:
-
-```bash
-curl -i http://<server-ip>/
-curl -i http://<server-ip>:30080/
-```
-
-Check application logs:
-
-```bash
-sudo k3s kubectl logs -n otp-relay deployment/otp-relay --tail=100
-```
-
-A healthy startup should show something similar to:
-
-```text
-Application startup complete.
-Uvicorn running on http://0.0.0.0:8000
-```
-
----
-
-## Troubleshooting
-
-### `http://<server-ip>/` returns 404
-
-Check the ingress:
-
-```bash
-sudo k3s kubectl get ingress -n otp-relay
-sudo k3s kubectl describe ingress otp-relay -n otp-relay
-```
-
-Check Traefik:
-
-```bash
-sudo k3s kubectl get pods -n kube-system | grep -i traefik
-sudo k3s kubectl get svc -n kube-system traefik
-```
-
-Expected:
-
-```text
-ingress/otp-relay   traefik   *   <server-ip>   80
-```
-
-If Traefik is working but the ingress is missing, rerun the installer:
-
-```bash
-sudo bash install-otp-relay-k8s.sh
-```
-
----
-
-### NodePort times out
-
-Check the service:
-
-```bash
-sudo k3s kubectl get svc -n otp-relay
-```
-
-Expected:
-
-```text
-otp-relay   NodePort   ...   80:30080/TCP
-```
-
-Test from the server:
-
-```bash
-curl -i http://127.0.0.1:30080/
-```
-
-If local curl works but browser access fails, check host firewall or cloud firewall rules for TCP port `30080`.
-
----
-
-### Pod is not ready
-
-Check pod status:
-
-```bash
-sudo k3s kubectl get pods -n otp-relay -o wide
-```
-
-Check logs:
-
-```bash
-sudo k3s kubectl logs -n otp-relay deployment/otp-relay --tail=100
-```
-
-Check rollout:
-
-```bash
-sudo k3s kubectl rollout status deployment/otp-relay -n otp-relay
-```
-
-Restart the deployment:
-
-```bash
-sudo k3s kubectl rollout restart deployment/otp-relay -n otp-relay
-```
-
----
-
-### Help docs build fails
-
-Run the builder manually:
-
-```bash
-cd /opt/otp-relay-k8s
-.installer-venv/bin/python scripts/build_help_docs.py
-```
-
-If input files are missing, confirm this directory exists and was committed to GitHub:
-
-```text
-docs/help/
-```
-
-If Python modules are missing, reinstall requirements in the installer venv:
-
-```bash
-cd /opt/otp-relay-k8s
-.installer-venv/bin/python -m pip install -r requirements.txt
-.installer-venv/bin/python scripts/build_help_docs.py
-```
-
----
-
-### Frontend did not update
-
-Confirm the latest repo commit is present on the server:
-
-```bash
-cd /opt/otp-relay-k8s
-git log -1 --oneline
-```
-
-Check frontend files:
-
-```bash
-ls -la frontend/
-```
-
-Rerun installer:
-
-```bash
-sudo bash install-otp-relay-k8s.sh
-```
-
-Then hard-refresh the browser:
-
-```text
-Ctrl + F5
-```
-
-or open in incognito mode.
-
----
-
-## Upload runtime files into the PVC
-
-After the pod is running, copy the user list into `/app/data`:
-
-```bash
-POD=$(kubectl get pod -n otp-relay -l app=otp-relay -o jsonpath='{.items[0].metadata.name}')
-
-kubectl cp ./users.xlsx otp-relay/$POD:/app/data/users.xlsx -n otp-relay
-```
-
-If migrating from the older VM/systemd deployment, also copy:
-
-```bash
-kubectl cp ./admin_auth.json otp-relay/$POD:/app/data/admin_auth.json -n otp-relay
-kubectl cp ./admin_config.json otp-relay/$POD:/app/data/admin_config.json -n otp-relay
-kubectl cp ./wizard_progress.json otp-relay/$POD:/app/data/wizard_progress.json -n otp-relay
-```
-
-Restart the deployment after data migration:
-
-```bash
-kubectl rollout restart deployment/otp-relay -n otp-relay
-```
-
 ---
 
 ## Health checks
@@ -673,8 +585,6 @@ The app exposes:
 /readyz
 ```
 
-Use these for Kubernetes liveness and readiness probes.
-
 Example:
 
 ```bash
@@ -684,96 +594,109 @@ curl -i http://127.0.0.1/readyz
 
 ---
 
-## Important design constraints
+## Troubleshooting
 
-Keep the main app at one replica for now:
+### GitHub Actions is using an old installer
+
+If the workflow logs show:
 
 ```text
-replicas: 1
+/opt/otp-relay-k8s/install-otp-relay-k8s.sh
 ```
 
-The OTP queue and admin sessions are currently in process memory.
+then the workflow is running an old server-side script. Change the workflow to run:
 
-Multiple replicas would create separate queues and separate sessions unless state is moved to Redis, a database, or another shared state backend.
+```bash
+sudo -n -E /usr/bin/bash "$GITHUB_WORKSPACE/install-otp-relay-k8s.sh"
+```
 
-The PVC uses `ReadWriteOnce`, which is correct for the current single-node/single-replica design.
+### GitHub Actions secrets are null
 
-Do not scale to multiple pods for production until shared state and file-write safety are handled.
+If workflow debug logs show values like:
+
+```text
+secrets.PHONE_IP => null
+```
+
+create the missing repository secrets under:
+
+```text
+Repository → Settings → Secrets and variables → Actions
+```
+
+### sudo asks for a password in GitHub Actions
+
+Fix the runner sudoers rule. The workflow should use `sudo -n` so this fails clearly.
+
+### Docker command is missing
+
+Docker is required for local image builds. On Debian-family systems, make sure the Docker CLI is installed and visible to root:
+
+```bash
+sudo command -v docker
+sudo docker version
+```
+
+Then rerun the workflow.
+
+### Pod is not ready
+
+```bash
+sudo k3s kubectl get pods -n otp-relay -o wide
+sudo k3s kubectl logs -n otp-relay deployment/otp-relay --tail=100
+sudo k3s kubectl describe pod -n otp-relay -l app=otp-relay
+```
+
+### Frontend did not update
+
+Confirm the latest commit is present on the server checkout:
+
+```bash
+cd /opt/otp-relay-k8s
+git log -1 --oneline
+```
+
+Then hard-refresh the browser:
+
+```text
+Ctrl + F5
+```
+
+or open the portal in an incognito window.
 
 ---
 
-## Optional monitor
+## Manual full deployment
 
-The optional `otp-monitor` container is used for phone presence and WhatsApp alerts.
-
-The monitor uses `arping`, which requires:
-
-```yaml
-hostNetwork: true
-capabilities:
-  add:
-    - NET_RAW
-```
-
-Without host networking, the pod may not see the real LAN interface used to ARP the phone.
-
-To deploy the monitor manually:
+Manual deployment is still supported, but GitHub Actions is preferred after the runner is online.
 
 ```bash
-kubectl apply -f k8s/manifests/deployment-monitor.yaml
+sudo NONINTERACTIVE=1 bash install-otp-relay-k8s.sh
 ```
 
-To enable monitor deployment through the installer:
+Useful overrides:
 
 ```bash
-sudo INSTALL_MONITOR=1 \
-  WHATSAPP_API_KEY="<api-key>" \
-  WHATSAPP_RECIPIENT="<recipient>" \
+sudo NAMESPACE=otp-relay \
+  SERVICE_NODE_PORT=30080 \
+  PHONE_IP=172.31.10.161 \
+  PHONE_INTERFACE=eth0 \
+  WHATSAPP_API_KEY="..." \
+  WHATSAPP_RECIPIENT="..." \
+  NONINTERACTIVE=1 \
   bash install-otp-relay-k8s.sh
 ```
 
 ---
 
-## Optional GitHub Actions runner
+## Manual image build for debugging
 
-The GitHub Actions self-hosted runner is not required to run OTP Relay.
-
-Install it only if this server should receive deployments from GitHub Actions.
-
-The installer can configure it when enabled:
-
-```bash
-sudo INSTALL_GITHUB_RUNNER=1 \
-  GITHUB_RUNNER_URL="https://github.com/psi1703/k8s" \
-  GITHUB_RUNNER_TOKEN="<token>" \
-  bash install-otp-relay-k8s.sh
-```
-
-The runner token must be generated from GitHub when adding a self-hosted runner.
-
----
-
-## Manual build
-
-The installer is the preferred deployment method.
-
-Manual build commands are useful for debugging.
-
-Build the main portal image:
+The installer is preferred. Manual build commands are for troubleshooting only.
 
 ```bash
 docker build -t otp-relay:latest -f k8s/Dockerfile .
-```
-
-Build the optional monitor image:
-
-```bash
 docker build -t otp-monitor:latest -f k8s/Dockerfile.monitor .
-```
 
-For K3s without a registry, export and import the images:
-
-```bash
 docker save otp-relay:latest -o otp-relay-latest.tar
 docker save otp-monitor:latest -o otp-monitor-latest.tar
 
@@ -783,49 +706,7 @@ sudo k3s ctr images import otp-monitor-latest.tar
 
 ---
 
-## Manual Kubernetes deployment
-
-The installer is preferred, but the app can also be deployed manually.
-
-Apply namespace:
-
-```bash
-kubectl apply -f k8s/manifests/namespace.yaml
-```
-
-Create the secret:
-
-```bash
-kubectl create secret generic otp-relay-secrets \
-  --from-env-file=k8s/manifests/secret.env \
-  --namespace=otp-relay \
-  --dry-run=client -o yaml | kubectl apply -f -
-```
-
-Apply app resources:
-
-```bash
-kubectl apply -f k8s/manifests/configmap.yaml
-kubectl apply -f k8s/manifests/pvc.yaml
-kubectl apply -f k8s/manifests/deployment.yaml
-kubectl apply -f k8s/manifests/service.yaml
-kubectl apply -f k8s/manifests/ingress.yaml
-```
-
-Check rollout:
-
-```bash
-kubectl get pods -n otp-relay
-kubectl rollout status deployment/otp-relay -n otp-relay
-kubectl logs -n otp-relay deployment/otp-relay
-kubectl get svc,ingress -n otp-relay
-```
-
----
-
-## Local validation
-
-Run these checks before deploying:
+## Local validation before deploy
 
 ```bash
 python3 -m py_compile main.py monitor.py
@@ -835,28 +716,11 @@ docker build -t otp-monitor:latest -f k8s/Dockerfile.monitor .
 kubectl apply --dry-run=client -f k8s/manifests/
 ```
 
-Run the app container locally with a data mount:
-
-```bash
-mkdir -p data
-
-docker run --rm -p 8000:8000 \
-  -e OTP_RELAY_DATA_DIR=/app/data \
-  -v "$PWD/data:/app/data" \
-  otp-relay:latest
-```
-
-Open:
-
-```text
-http://localhost:8000
-```
-
 ---
 
 ## Git hygiene
 
-These files must not be committed:
+Do not commit:
 
 ```text
 .env
@@ -870,11 +734,7 @@ __pycache__/
 
 Runtime data belongs in the Kubernetes PVC, not in Git.
 
-Generated frontend help files may be committed only if the project chooses to track generated docs. Otherwise, they should be generated during installation by:
-
-```bash
-python3 scripts/build_help_docs.py
-```
+Generated frontend help files may be committed only if the project chooses to track generated docs. Otherwise, they are generated during deployment.
 
 ---
 
