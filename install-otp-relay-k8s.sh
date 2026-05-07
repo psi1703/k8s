@@ -179,7 +179,7 @@ fi
 log "installing missing OS packages with apt-get"
 apt-get update
 apt-get install -y --no-install-recommends \
-  ca-certificates curl git iproute2 iptables nftables python3 python3-venv jq tar gzip docker.io
+  ca-certificates curl git iproute2 iptables nftables python3 python3-venv jq tar gzip sudo docker.io
 
 if ! systemctl is-active --quiet docker; then
   log "starting Docker because it is required to build the local app image"
@@ -607,13 +607,23 @@ install_github_runner() {
   [ -n "$GITHUB_RUNNER_URL" ] || fatal "INSTALL_GITHUB_RUNNER=1 requires GITHUB_RUNNER_URL"
   [ -n "$GITHUB_RUNNER_TOKEN" ] || fatal "INSTALL_GITHUB_RUNNER=1 requires GITHUB_RUNNER_TOKEN"
 
+  id -u "$GITHUB_RUNNER_USER" >/dev/null 2>&1 || useradd --system --create-home --shell /bin/bash "$GITHUB_RUNNER_USER"
+
+  sudoers_file="/etc/sudoers.d/otp-relay-actions-runner"
+  log "granting $GITHUB_RUNNER_USER narrow passwordless sudo for the OTP Relay installer"
+  cat > "$sudoers_file" <<EOF_SUDOERS
+$GITHUB_RUNNER_USER ALL=(root) NOPASSWD:SETENV: /bin/bash $INSTALL_DIR/install-otp-relay-k8s.sh
+$GITHUB_RUNNER_USER ALL=(root) NOPASSWD:SETENV: /usr/bin/bash $INSTALL_DIR/install-otp-relay-k8s.sh
+EOF_SUDOERS
+  chmod 0440 "$sudoers_file"
+  visudo -cf "$sudoers_file" >/dev/null
+
   if systemctl list-unit-files | grep -q 'actions.runner'; then
-    warn "an actions.runner systemd unit already exists; leaving existing runner untouched"
+    warn "an actions.runner systemd unit already exists; leaving existing runner registration untouched"
     return 0
   fi
 
   log "installing GitHub Actions self-hosted runner"
-  id -u "$GITHUB_RUNNER_USER" >/dev/null 2>&1 || useradd --system --create-home --shell /bin/bash "$GITHUB_RUNNER_USER"
   mkdir -p "$GITHUB_RUNNER_DIR"
   chown -R "$GITHUB_RUNNER_USER:$GITHUB_RUNNER_USER" "$GITHUB_RUNNER_DIR"
 
