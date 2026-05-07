@@ -1,6 +1,6 @@
 # Building and deploying OTP Relay images
 
-The recommended build path is now GitHub Actions with a self-hosted runner on the K3s server.
+The recommended build path is now GitHub Actions with a self-hosted runner on the K3s server. Runner setup is performed first in the installer, before Docker/K3s deployment work.
 
 The previous laptop build/export workflow is kept below as a manual fallback only.
 
@@ -127,7 +127,7 @@ GitHub -> Actions -> Deploy OTP Relay to K3s
 
 **GitHub job says no runner is available**
 
-Check that the self-hosted runner service is running on the K3s server:
+Check that the self-hosted runner service is running on the K3s server. The workflow uses GitHub default labels `self-hosted`, `Linux`, and `X64`:
 
 ```bash
 sudo systemctl status actions.runner* --no-pager

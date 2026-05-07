@@ -32,6 +32,7 @@ set -Eeuo pipefail
 #   INSTALL_GITHUB_RUNNER=0|1
 #   GITHUB_RUNNER_URL=https://github.com/psi1703/k8s
 #   GITHUB_RUNNER_TOKEN=...
+#   GITHUB_RUNNER_DIR=/opt/actions-runner
 #   NONINTERACTIVE=0|1
 
 log() { printf '[otp-relay-k8s] %s\n' "$*"; }
@@ -73,8 +74,7 @@ NONINTERACTIVE="${NONINTERACTIVE:-0}"
 INSTALL_GITHUB_RUNNER="${INSTALL_GITHUB_RUNNER:-}"
 GITHUB_RUNNER_URL="${GITHUB_RUNNER_URL:-${REPO_URL%.git}}"
 GITHUB_RUNNER_TOKEN="${GITHUB_RUNNER_TOKEN:-}"
-GITHUB_RUNNER_DIR="${GITHUB_RUNNER_DIR:-/opt/actions-runner-otp-relay}"
-GITHUB_RUNNER_NAME="${GITHUB_RUNNER_NAME:-$(hostname)-otp-relay}"
+GITHUB_RUNNER_DIR="${GITHUB_RUNNER_DIR:-/opt/actions-runner}"
 GITHUB_RUNNER_USER="${GITHUB_RUNNER_USER:-actions-runner}"
 
 OS_ID="unknown"
@@ -134,6 +134,44 @@ PY
 }
 SMS_SECRET_TOKEN="${SMS_SECRET_TOKEN:-$(make_secret)}"
 
+install_github_runner() {
+  [ "$INSTALL_GITHUB_RUNNER" = "1" ] || return 0
+  [ -n "$RUNNER_ARCH" ] || fatal "unsupported architecture for GitHub runner: $ARCH_RAW"
+  [ -n "$GITHUB_RUNNER_URL" ] || fatal "INSTALL_GITHUB_RUNNER=1 requires GITHUB_RUNNER_URL"
+  [ -n "$GITHUB_RUNNER_TOKEN" ] || fatal "INSTALL_GITHUB_RUNNER=1 requires GITHUB_RUNNER_TOKEN"
+
+  id -u "$GITHUB_RUNNER_USER" >/dev/null 2>&1 || useradd --system --create-home --shell /bin/bash "$GITHUB_RUNNER_USER"
+
+  sudoers_file="/etc/sudoers.d/otp-relay-actions-runner"
+  log "granting $GITHUB_RUNNER_USER narrow passwordless sudo for the OTP Relay installer"
+  cat > "$sudoers_file" <<EOF_SUDOERS
+$GITHUB_RUNNER_USER ALL=(root) NOPASSWD:SETENV: /bin/bash $INSTALL_DIR/install-otp-relay-k8s.sh
+$GITHUB_RUNNER_USER ALL=(root) NOPASSWD:SETENV: /usr/bin/bash $INSTALL_DIR/install-otp-relay-k8s.sh
+EOF_SUDOERS
+  chmod 0440 "$sudoers_file"
+  visudo -cf "$sudoers_file" >/dev/null
+
+  if systemctl list-unit-files | grep -q 'actions.runner'; then
+    warn "an actions.runner systemd unit already exists; leaving existing runner registration untouched"
+    return 0
+  fi
+
+  log "installing GitHub Actions self-hosted runner before Docker/K3s deployment work"
+  mkdir -p "$GITHUB_RUNNER_DIR"
+  chown -R "$GITHUB_RUNNER_USER:$GITHUB_RUNNER_USER" "$GITHUB_RUNNER_DIR"
+
+  runner_version="${GITHUB_RUNNER_VERSION:-2.328.0}"
+  runner_tar="actions-runner-linux-${RUNNER_ARCH}-${runner_version}.tar.gz"
+  runner_url="https://github.com/actions/runner/releases/download/v${runner_version}/${runner_tar}"
+  curl -fL "$runner_url" -o "/tmp/$runner_tar"
+  tar -xzf "/tmp/$runner_tar" -C "$GITHUB_RUNNER_DIR"
+  rm -f "/tmp/$runner_tar"
+  chown -R "$GITHUB_RUNNER_USER:$GITHUB_RUNNER_USER" "$GITHUB_RUNNER_DIR"
+
+  sudo -u "$GITHUB_RUNNER_USER" bash -lc "cd '$GITHUB_RUNNER_DIR' && ./config.sh --unattended --url '$GITHUB_RUNNER_URL' --token '$GITHUB_RUNNER_TOKEN' --work _work"
+  bash -lc "cd '$GITHUB_RUNNER_DIR' && ./svc.sh install '$GITHUB_RUNNER_USER' && ./svc.sh start"
+}
+
 if [ -z "$INSTALL_GITHUB_RUNNER" ]; then
   if prompt_yes_no "Install a GitHub Actions self-hosted runner for CI/CD deployments from GitHub? [y/N]" "N"; then
     INSTALL_GITHUB_RUNNER=1
@@ -176,10 +214,16 @@ if [ "$IS_RPI" = "1" ]; then
   fi
 fi
 
-log "installing missing OS packages with apt-get"
+log "installing base OS packages required for repository sync and optional runner setup with apt-get"
 apt-get update
 apt-get install -y --no-install-recommends \
-  ca-certificates curl git iproute2 iptables nftables python3 python3-venv jq tar gzip sudo docker.io
+  ca-certificates curl git tar gzip sudo python3
+
+install_github_runner
+
+log "installing Kubernetes/deployment OS packages with apt-get"
+apt-get install -y --no-install-recommends \
+  iproute2 iptables nftables python3-venv jq docker.io
 
 if ! systemctl is-active --quiet docker; then
   log "starting Docker because it is required to build the local app image"
@@ -601,44 +645,6 @@ if [ -n "$RUNTIME_DATA_DIR" ]; then
   k3s kubectl rollout status deployment/otp-monitor -n "$NAMESPACE" --timeout=180s
 fi
 
-install_github_runner() {
-  [ "$INSTALL_GITHUB_RUNNER" = "1" ] || return 0
-  [ -n "$RUNNER_ARCH" ] || fatal "unsupported architecture for GitHub runner: $ARCH_RAW"
-  [ -n "$GITHUB_RUNNER_URL" ] || fatal "INSTALL_GITHUB_RUNNER=1 requires GITHUB_RUNNER_URL"
-  [ -n "$GITHUB_RUNNER_TOKEN" ] || fatal "INSTALL_GITHUB_RUNNER=1 requires GITHUB_RUNNER_TOKEN"
-
-  id -u "$GITHUB_RUNNER_USER" >/dev/null 2>&1 || useradd --system --create-home --shell /bin/bash "$GITHUB_RUNNER_USER"
-
-  sudoers_file="/etc/sudoers.d/otp-relay-actions-runner"
-  log "granting $GITHUB_RUNNER_USER narrow passwordless sudo for the OTP Relay installer"
-  cat > "$sudoers_file" <<EOF_SUDOERS
-$GITHUB_RUNNER_USER ALL=(root) NOPASSWD:SETENV: /bin/bash $INSTALL_DIR/install-otp-relay-k8s.sh
-$GITHUB_RUNNER_USER ALL=(root) NOPASSWD:SETENV: /usr/bin/bash $INSTALL_DIR/install-otp-relay-k8s.sh
-EOF_SUDOERS
-  chmod 0440 "$sudoers_file"
-  visudo -cf "$sudoers_file" >/dev/null
-
-  if systemctl list-unit-files | grep -q 'actions.runner'; then
-    warn "an actions.runner systemd unit already exists; leaving existing runner registration untouched"
-    return 0
-  fi
-
-  log "installing GitHub Actions self-hosted runner"
-  mkdir -p "$GITHUB_RUNNER_DIR"
-  chown -R "$GITHUB_RUNNER_USER:$GITHUB_RUNNER_USER" "$GITHUB_RUNNER_DIR"
-
-  runner_version="${GITHUB_RUNNER_VERSION:-2.328.0}"
-  runner_tar="actions-runner-linux-${RUNNER_ARCH}-${runner_version}.tar.gz"
-  runner_url="https://github.com/actions/runner/releases/download/v${runner_version}/${runner_tar}"
-  curl -fL "$runner_url" -o "/tmp/$runner_tar"
-  tar -xzf "/tmp/$runner_tar" -C "$GITHUB_RUNNER_DIR"
-  rm -f "/tmp/$runner_tar"
-  chown -R "$GITHUB_RUNNER_USER:$GITHUB_RUNNER_USER" "$GITHUB_RUNNER_DIR"
-
-  sudo -u "$GITHUB_RUNNER_USER" bash -lc "cd '$GITHUB_RUNNER_DIR' && ./config.sh --unattended --url '$GITHUB_RUNNER_URL' --token '$GITHUB_RUNNER_TOKEN' --name '$GITHUB_RUNNER_NAME' --labels 'otp-relay,k3s,$OS_ID,$RUNNER_ARCH' --work _work"
-  bash -lc "cd '$GITHUB_RUNNER_DIR' && ./svc.sh install '$GITHUB_RUNNER_USER' && ./svc.sh start"
-}
-install_github_runner
 
 cat <<EOF_DONE
 

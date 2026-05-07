@@ -2,7 +2,7 @@
 
 This is the recommended deployment path for the OTP Relay Kubernetes repository.
 
-The GitHub Actions workflow runs on a self-hosted runner installed on the K3s server. The runner builds the app and monitor images locally, imports them into K3s containerd, applies the Kubernetes manifests, and restarts the deployments.
+The GitHub Actions workflow runs on a self-hosted runner installed on the K3s server. The installer registers the runner before Docker/K3s deployment work starts. The runner builds the app and monitor images locally, imports them into K3s containerd, applies the Kubernetes manifests, and restarts the deployments.
 
 This avoids Docker Hub, a private registry, SSH file copy, and manual image tar handoff.
 
@@ -32,7 +32,7 @@ Create a self-hosted runner token in GitHub:
 Repository -> Settings -> Actions -> Runners -> New self-hosted runner
 ```
 
-Then run this once on the K3s server:
+Then run this once on the K3s server. Runner setup happens first, before Docker and K3s deployment packages are installed:
 
 ```bash
 sudo INSTALL_GITHUB_RUNNER=1 \
@@ -47,13 +47,13 @@ sudo INSTALL_GITHUB_RUNNER=1 \
   bash install-otp-relay-k8s.sh
 ```
 
-The installer registers the runner with these labels:
+The installer does not assign a custom runner name or custom labels. GitHub's default runner name and default labels are used.
+
+The workflow targets the default labels:
 
 ```text
-otp-relay,k3s,<os>,<arch>
+self-hosted, Linux, X64
 ```
-
-The workflow targets the `otp-relay` and `k3s` labels.
 
 ---
 

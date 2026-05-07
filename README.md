@@ -123,7 +123,7 @@ sudo GIT_CLEAN=0 bash install-otp-relay-k8s.sh
 
 ## GitHub Actions deployment
 
-The preferred deployment path is a GitHub Actions workflow running on a self-hosted runner installed on the K3s server.
+The preferred deployment path is a GitHub Actions workflow running on a self-hosted runner installed on the K3s server. The installer registers the runner first, before Docker/K3s deployment work, and uses GitHub default runner naming and labels.
 
 The workflow is stored at:
 
