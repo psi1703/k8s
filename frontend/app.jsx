@@ -71,6 +71,7 @@ const API = {
   claimOtp(token) { return this.json('/claim-otp', { method: 'POST', body: JSON.stringify({ token }) }); },
   claimStatus(token) { return this.json(`/claim-status/${encodeURIComponent(token)}`); },
   deleteClaim(token) { return this.json(`/claim-otp/${encodeURIComponent(token)}`, { method: 'DELETE' }); },
+  userLogin(token) { return this.json('/user/login', { method: 'POST', body: JSON.stringify({ token }) }); },
   saveWizard(payload, options = {}) {
     const headers = { 'X-Wizard-Client': wizardClientSecret(), ...(options.headers || {}) };
     return this.json('/wizard/progress', { method: 'POST', headers, body: JSON.stringify(payload) });
@@ -575,7 +576,6 @@ function exportWizardProgressPdf(sourceUsers) {
 
 function App() {
   const [view, setView] = useState('otp');
-  const [directoryUsers, setDirectoryUsers] = useState([]);
   const [currentUser, setCurrentUser] = useState(null);
   const [login, setLogin] = useState({ tokenChars: ['', '', ''], error: '' });
   const [wizardUser, setWizardUser] = useState(emptyWizardUser());
@@ -587,16 +587,25 @@ function App() {
   const [admin, setAdmin] = useState({ session: sessionStorage.getItem('adminSession') || '', configured: false, mode: 'login', error: '', credential: '', current: '', confirm: '', data: null, loading: false, configTokens: 'JPR, AMD, SCH' });
 
   useEffect(() => {
-    API.adminAuthStatus().then(d => setAdmin(s => ({ ...s, configured: !!d.configured, mode: d.configured ? 'login' : 'setup' }))).catch(() => {});
-    API.adminUsers().then(d => {
-      const list = d.users || [];
-      setDirectoryUsers(list);
-      const remembered = normalizeToken(sessionStorage.getItem('portalUserToken') || '');
-      if (remembered) {
-        const found = list.find(u => normalizeToken(u.token) === remembered);
-        if (found) setCurrentUser({ token: normalizeToken(found.token), name: found.name || '', email: found.email || '' });
-      }
-    }).catch(() => {});
+    API.adminAuthStatus()
+      .then(d => setAdmin(s => ({ ...s, configured: !!d.configured, mode: d.configured ? 'login' : 'setup' })))
+      .catch(() => {});
+
+    const remembered = normalizeToken(sessionStorage.getItem('portalUserToken') || '');
+    if (remembered) {
+      API.userLogin(remembered)
+        .then(found => {
+          setCurrentUser({
+            token: normalizeToken(found.token),
+            name: found.name || '',
+            email: found.email || '',
+          });
+          setOtp(s => ({ ...s, token: normalizeToken(found.token) }));
+        })
+        .catch(() => {
+          sessionStorage.removeItem('portalUserToken');
+        });
+    }
   }, []);
 
   useEffect(() => {
@@ -869,20 +878,26 @@ function App() {
   }
 
 
-  function submitLogin() {
+  async function submitLogin() {
     const token = normalizeToken(login.tokenChars.join(''));
-    const found = directoryUsers.find(u => normalizeToken(u.token) === token);
     if (!token || token.length < 2) {
       setLogin(s => ({ ...s, error: 'Enter a valid 2–3 character token.' }));
       return;
     }
-    if (!found) {
-      setLogin(s => ({ ...s, error: 'Token not recognised. Check with IT.' }));
-      return;
+
+    try {
+      const found = await API.userLogin(token);
+      const cleanToken = normalizeToken(found.token);
+      sessionStorage.setItem('portalUserToken', cleanToken);
+      setCurrentUser({
+        token: cleanToken,
+        name: found.name || '',
+        email: found.email || '',
+      });
+      setOtp(s => ({ ...s, token: cleanToken }));
+    } catch (e) {
+      setLogin(s => ({ ...s, error: e.message || 'Token not recognised. Check with IT.' }));
     }
-    sessionStorage.setItem('portalUserToken', token);
-    setCurrentUser({ token, name: found.name || '', email: found.email || '' });
-    setOtp(s => ({ ...s, token }));
   }
 
   function logoutUser() {
