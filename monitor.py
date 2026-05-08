@@ -256,7 +256,7 @@ def watch_phone():
             if not phone_online:
                 phone_online = True
                 consecutive_failures = 0
-                audit("phone_online", f"iPhone {PHONE_IP} is reachable again", "error")
+                audit("phone_online", f"iPhone {PHONE_IP} is reachable again", "info")
                 logger.info(f"Phone {PHONE_IP} back online")
             else:
                 consecutive_failures = 0
