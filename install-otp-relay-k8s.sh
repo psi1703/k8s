@@ -8,34 +8,22 @@ set -Eeuo pipefail
 # Normal use:
 #   sudo bash install-otp-relay-k8s.sh
 #
-# Useful env vars:
-#   REPO_URL=https://github.com/psi1703/k8s.git
-#   REPO_REF=main
-#   INSTALL_DIR=/opt/otp-relay-k8s
-#   NAMESPACE=otp-relay
-#   APP_IMAGE=otp-relay:latest
-#   MONITOR_IMAGE=otp-monitor:latest
-#   SERVICE_NODE_PORT=30080
-#   INGRESS_ENABLED=1
-#   PHONE_IP=172.31.10.161
-#   PHONE_INTERFACE=eth0
-#   PHONE_PING_INTERVAL=150
-#   PHONE_OFFLINE_THRESHOLD=2
-#   BATCH_WINDOW_SEC=10
-#   ALERT_LEVEL=error
-#   PORTAL_URL=http://server-or-dns-name
-#   WHATSAPP_API_KEY=...
-#   WHATSAPP_RECIPIENT=...
-#   RUNTIME_DATA_DIR=/path/with/users.xlsx/admin_auth.json/admin_config.json/wizard_progress.json
-#   SKIP_HELP_DOCS_BUILD=0|1
-#   GIT_CLEAN=1|0
-#   INSTALL_GITHUB_RUNNER=0|1
-#   GITHUB_RUNNER_URL=https://github.com/psi1703/k8s
-#   GITHUB_RUNNER_TOKEN=...
-#   GITHUB_RUNNER_DIR=/opt/actions-runner
-#   RUNNER_ONLY=0|1
-#   DEPLOY_MODE=full|app|monitor|manifests|none
-#   NONINTERACTIVE=0|1
+# Installer controls:
+#   REPO_URL, REPO_REF, INSTALL_DIR, NAMESPACE
+#   APP_IMAGE, MONITOR_IMAGE, SERVICE_NODE_PORT, INGRESS_ENABLED
+#   DEPLOY_MODE, GIT_CLEAN, NONINTERACTIVE, SKIP_HELP_DOCS_BUILD
+#   RUNTIME_DATA_DIR
+#
+# Runtime ConfigMap inputs:
+#   PHONE_IP, PHONE_INTERFACE, PHONE_PING_INTERVAL, PHONE_OFFLINE_THRESHOLD
+#   BATCH_WINDOW_SEC, ALERT_LEVEL, PORTAL_URL
+#
+# Runtime Secret inputs:
+#   SMS_SECRET_TOKEN, WHATSAPP_API_KEY, WHATSAPP_RECIPIENT
+#
+# Optional GitHub runner setup:
+#   INSTALL_GITHUB_RUNNER, GITHUB_RUNNER_URL, GITHUB_RUNNER_TOKEN,
+#   GITHUB_RUNNER_DIR, RUNNER_ONLY
 
 log() { printf '[otp-relay-k8s] %s\n' "$*"; }
 warn() { printf '[otp-relay-k8s] WARNING: %s\n' "$*" >&2; }
