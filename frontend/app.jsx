@@ -8,6 +8,36 @@ const CONFIG = {
   RING_CIRCUMFERENCE: 263.89,
 };
 
+
+function wizardClientSecret() {
+  const key = 'otp_relay_wizard_client_secret';
+  let value = localStorage.getItem(key);
+  if (!value) {
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    value = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    localStorage.setItem(key, value);
+  }
+  return value;
+}
+
+function htmlToSandboxedSrcDoc(html) {
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <base target="_blank" />
+  <style>
+    body { font-family: Arial, sans-serif; color: #363A3B; margin: 0; padding: 16px; line-height: 1.55; }
+    img, table { max-width: 100%; }
+    a { color: #006DCC; }
+  </style>
+</head>
+<body>${html || '<p>Loading…</p>'}</body>
+</html>`;
+}
+
+
 const API = {
   async json(url, options = {}) {
     const { headers, ...fetchOptions } = options;
@@ -41,8 +71,11 @@ const API = {
   claimOtp(token) { return this.json('/claim-otp', { method: 'POST', body: JSON.stringify({ token }) }); },
   claimStatus(token) { return this.json(`/claim-status/${encodeURIComponent(token)}`); },
   deleteClaim(token) { return this.json(`/claim-otp/${encodeURIComponent(token)}`, { method: 'DELETE' }); },
-  saveWizard(payload) { return this.json('/wizard/progress', { method: 'POST', body: JSON.stringify(payload) }); },
-  getWizard(token) { return this.json(`/wizard/progress/${encodeURIComponent(token)}`); },
+  saveWizard(payload, options = {}) {
+    const headers = { 'X-Wizard-Client': wizardClientSecret(), ...(options.headers || {}) };
+    return this.json('/wizard/progress', { method: 'POST', headers, body: JSON.stringify(payload) });
+  },
+  getWizard(token) { return this.json(`/wizard/progress/${encodeURIComponent(token)}`, { headers: { 'X-Wizard-Client': wizardClientSecret() } }); },
   adminAuthStatus() { return this.json('/admin/auth/status'); },
   adminAuthSetup(credential, current) { return this.json('/admin/auth/setup', { method: 'POST', body: JSON.stringify({ credential, current }) }); },
   adminAuthLogin(credential) { return this.json('/admin/auth/login', { method: 'POST', body: JSON.stringify({ credential }) }); },
@@ -322,27 +355,6 @@ function fromDateInputValue(v) {
   return v ? new Date(`${v}T00:00:00`).toISOString() : null;
 }
 
-const TOKEN_ENV_ACCESS = {
-  BMI: { test_env: '', prod_env: '' },
-  CSG: { test_env: '', prod_env: '' },
-  GOE: { test_env: '', prod_env: '' },
-  HAD: { test_env: '', prod_env: '' },
-  LNA: { test_env: '', prod_env: 'Mobile Statistics' },
-  JYN: { test_env: '', prod_env: '' },
-  STN: { test_env: '', prod_env: '' },
-  TTR: { test_env: '', prod_env: 'Mobile Statistics' },
-  YSH: { test_env: '', prod_env: '' },
-  JNB: { test_env: '', prod_env: '' },
-  KTV: { test_env: '', prod_env: '' },
-  FAL: { test_env: '', prod_env: '' },
-  PZ: { test_env: '', prod_env: 'Mobile Statistics' },
-  RBM: { test_env: '', prod_env: '' },
-  GAL: { test_env: 'Mobile Guard', prod_env: 'Mobile Guard' },
-  BHI: { test_env: '', prod_env: '' },
-  MRZ: { test_env: 'Mobile Plan', prod_env: 'Mobile Plan' },
-  TOB: { test_env: 'Mobile Plan', prod_env: 'Mobile Plan' },
-  KG: { test_env: '', prod_env: '' },
-};
 
 function fmtShortDate(iso) {
   if (!iso) return '—';
@@ -411,8 +423,8 @@ function mergeAdminUsers(wizardUsers = [], loadedUsers = []) {
         iits_pw_date: wizard.iits_pw_date || null,
         adm_pw_date: wizard.adm_pw_date || null,
         vpn_date: wizard.vpn_date || null,
-        test_env: wizard.test_env || (TOKEN_ENV_ACCESS[token] && TOKEN_ENV_ACCESS[token].test_env) || '',
-        prod_env: wizard.prod_env || (TOKEN_ENV_ACCESS[token] && TOKEN_ENV_ACCESS[token].prod_env) || '',
+        test_env: wizard.test_env || '',
+        prod_env: wizard.prod_env || '',
         updated_at: wizard.updated_at || wizard.lastActive || null,
         lastActive: wizard.lastActive || wizard.updated_at || null,
       };
@@ -568,6 +580,7 @@ function App() {
   const [login, setLogin] = useState({ tokenChars: ['', '', ''], error: '' });
   const [wizardUser, setWizardUser] = useState(emptyWizardUser());
   const [wizardStatus, setWizardStatus] = useState({ saving: false, message: '' });
+  const wizardSaveTimer = React.useRef(null);
   const [openStep, setOpenStep] = useState(null);
   const [faqOpen, setFaqOpen] = useState({});
   const [otp, setOtp] = useState({ panel: 'claim', message: '', position: 1, waitEstimate: 0, queueDepth: 0, otpValue: '———', activeRemaining: CONFIG.CLAIM_EXPIRY_SEC, otpRemaining: CONFIG.OTP_DISPLAY_SEC, token: '' });
@@ -692,6 +705,23 @@ function App() {
     }
   }
 
+  function saveWizardDebounced(patch) {
+    const next = { ...wizardUser, ...patch, token: (patch.token ?? wizardUser.token).trim().toUpperCase() };
+    setWizardUser(next);
+    if (!next.token) return;
+    setWizardStatus({ saving: true, message: 'Saving…' });
+    if (wizardSaveTimer.current) clearTimeout(wizardSaveTimer.current);
+    wizardSaveTimer.current = setTimeout(async () => {
+      try {
+        await API.saveWizard(next);
+        setWizardStatus({ saving: false, message: 'Saved to server' });
+        setTimeout(() => setWizardStatus(s => s.message === 'Saved to server' ? { ...s, message: '' } : s), 1500);
+      } catch (e) {
+        setWizardStatus({ saving: false, message: e.message || 'Save failed' });
+      }
+    }, 500);
+  }
+
   async function toggleStep(step) {
     if (step.owner !== 'user') return;
     const list = new Set(wizardUser.completed || []);
@@ -794,7 +824,7 @@ function App() {
     const current = admin.data?.users?.find(u => u.token === token);
     const completed = new Set(current?.adminCompleted || []);
     if (completed.has(stepId)) completed.delete(stepId); else completed.add(stepId);
-    await API.saveWizard({ ...current, token, adminCompleted: [...completed] });
+    await API.saveWizard({ ...current, token, adminCompleted: [...completed] }, { headers: { 'X-Admin-Session': admin.session } });
     try { await API.notifyAdminTask({ token, step_id: stepId, action: completed.has(stepId) ? 'done' : 'undone' }); } catch {}
     await loadAdminData();
   }
@@ -908,7 +938,7 @@ function App() {
       </header>
       <main className="app-shell">
         {view === 'otp' && <OtpView otp={otp} claimOtp={claimOtp} retryOtp={retryOtp} resetClaim={resetClaim} sidebar={sharedSidebar} currentUser={currentUser} />}
-        {view === 'wizard' && <WizardView user={wizardUser} saveWizard={saveWizard} wizardStatus={wizardStatus} openStep={openStep} setOpenStep={setOpenStep} doneCount={doneCount} progressPct={progressPct} nextStep={nextStep} toggleStep={toggleStep} />}
+        {view === 'wizard' && <WizardView user={wizardUser} saveWizard={saveWizard} saveWizardDebounced={saveWizardDebounced} wizardStatus={wizardStatus} openStep={openStep} setOpenStep={setOpenStep} doneCount={doneCount} progressPct={progressPct} nextStep={nextStep} toggleStep={toggleStep} />}
         {view === 'admin' && <AdminView admin={admin} setAdmin={setAdmin} doAdminAuth={doAdminAuth} loadAdminData={loadAdminData} toggleAdminStep={toggleAdminStep} pendingAdminTasks={pendingAdminTasks} saveConfig={saveConfig} />}
       </main>
     </>
@@ -1091,7 +1121,7 @@ function OtpView({ otp, claimOtp, retryOtp, resetClaim, sidebar, currentUser }) 
   );
 }
 
-function WizardView({ user, saveWizard, wizardStatus, openStep, setOpenStep, doneCount, progressPct, nextStep, toggleStep }) {
+function WizardView({ user, saveWizard, saveWizardDebounced, wizardStatus, openStep, setOpenStep, doneCount, progressPct, nextStep, toggleStep }) {
   const [guideOverlay, setGuideOverlay] = useState({ stepId: null, page: 0 });
   const [wizardGuide, setWizardGuide] = useState({ steps: {}, generatedAt: null });
   const [guideLoadState, setGuideLoadState] = useState({ loading: true, error: '' });
@@ -1214,9 +1244,9 @@ function WizardView({ user, saveWizard, wizardStatus, openStep, setOpenStep, don
         <div className="card side-card">
           <div className="side-card-title">Your credentials</div>
           <div className="form-grid">
-            <div className="field"><label>Display name</label><input value={user.display_name || ''} onChange={e => saveWizard({ display_name: e.target.value })} placeholder="e.g. Sara" /></div>
-            <div className="field"><label>IITS username</label><input value={user.iits_username || ''} onChange={e => saveWizard({ iits_username: e.target.value })} placeholder="IITS_…" /></div>
-            <div className="field"><label>ADM username</label><input value={user.adm_username || ''} onChange={e => saveWizard({ adm_username: e.target.value })} placeholder="ADM_…" /></div>
+            <div className="field"><label>Display name</label><input value={user.display_name || ''} onChange={e => saveWizardDebounced({ display_name: e.target.value })} placeholder="e.g. Sara" /></div>
+            <div className="field"><label>IITS username</label><input value={user.iits_username || ''} onChange={e => saveWizardDebounced({ iits_username: e.target.value })} placeholder="IITS_…" /></div>
+            <div className="field"><label>ADM username</label><input value={user.adm_username || ''} onChange={e => saveWizardDebounced({ adm_username: e.target.value })} placeholder="ADM_…" /></div>
           </div>
         </div>
 
@@ -1330,12 +1360,6 @@ function GuideOverlay({ step, guide, page, setPage, onClose, onPopOut }) {
     e.preventDefault();
   }
 
-  function openGuideLink(e) {
-    const link = e.target.closest && e.target.closest('a');
-    if (!link || !link.href) return;
-    e.preventDefault();
-    window.open(link.href, '_blank', 'noopener,noreferrer');
-  }
 
   const modalStyle = position ? { left: position.left, top: position.top, margin: 0, transform: 'none' } : undefined;
 
@@ -1369,7 +1393,12 @@ function GuideOverlay({ step, guide, page, setPage, onClose, onPopOut }) {
               <div className="small" style={{ marginTop: 12 }}>Use the tabs or the Back / Next buttons to move through only the help relevant to this wizard step.</div>
             </div>
           ) : activePage.type === 'html' ? (
-            <div className="guide-html" onClick={openGuideLink} dangerouslySetInnerHTML={{ __html: activePage.html || '' }} />
+            <iframe
+              title={`${step.title} guide page`}
+              sandbox="allow-popups allow-popups-to-escape-sandbox"
+              srcDoc={htmlToSandboxedSrcDoc(activePage.html || '')}
+              className="guide-html-frame"
+            />
           ) : (
             <GuideBlock block={activePage} />
           )}
@@ -1492,7 +1521,12 @@ function HelpView({ faqOpen, setFaqOpen } = {}) {
                     </div>
                     {open && (
                       <div className="faq-a" style={{ display: 'block' }}>
-                        <div dangerouslySetInnerHTML={{ __html: docHtml[doc.slug] || '<p>Loading…</p>' }} />
+                        <iframe
+                          title={doc.title}
+                          sandbox="allow-popups allow-popups-to-escape-sandbox"
+                          srcDoc={htmlToSandboxedSrcDoc(docHtml[doc.slug] || '<p>Loading…</p>')}
+                          className="help-doc-frame"
+                        />
                       </div>
                     )}
                   </div>
