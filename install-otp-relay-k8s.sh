@@ -402,31 +402,11 @@ if requires_app_image; then
     .installer-venv/bin/python scripts/build_help_docs.py
   fi
 
-  if [ ! -f package.json ]; then
-    log "package.json missing; creating frontend build package definition"
-    cat > package.json <<'EOF_PACKAGE_JSON'
-{
-  "private": true,
-  "scripts": {
-    "build:frontend": "babel frontend/app.jsx --presets @babel/preset-react --out-file frontend/app.raw.js && terser frontend/app.raw.js -c -m -o frontend/app.js && rm frontend/app.raw.js"
-  },
-  "devDependencies": {
-    "@babel/cli": "^7.24.0",
-    "@babel/core": "^7.24.0",
-    "@babel/preset-react": "^7.24.0",
-    "terser": "^5.31.0"
-  }
-}
-EOF_PACKAGE_JSON
-  fi
+  [ -f package.json ] || fatal "package.json is missing in repo root"
+  [ -f package-lock.json ] || fatal "package-lock.json is missing in repo root"
 
-  log "installing frontend build dependencies"
-  if [ -f package-lock.json ]; then
-    npm ci
-  else
-    npm install --package-lock-only
-    npm ci
-  fi
+  log "installing frontend build dependencies from committed package-lock.json"
+  npm ci
 
   log "building production frontend bundle frontend/app.js"
   npm run build:frontend
@@ -435,9 +415,20 @@ else
   log "DEPLOY_MODE=$DEPLOY_MODE does not require app help-doc build; skipping installer venv"
 fi
 
-log "writing Debian/K3s Docker and Kubernetes assets"
-mkdir -p k8s/manifests
-cat > k8s/Dockerfile <<'DOCKER'
+log "writing generated Docker and Kubernetes assets to a temporary deployment directory"
+GENERATED_DIR="$(mktemp -d /tmp/otp-relay-k8s.XXXXXX)"
+MANIFEST_DIR="$GENERATED_DIR/manifests"
+APP_DOCKERFILE="$GENERATED_DIR/Dockerfile"
+MONITOR_DOCKERFILE="$GENERATED_DIR/Dockerfile.monitor"
+
+cleanup_generated_assets() {
+  rm -rf "$GENERATED_DIR"
+}
+trap cleanup_generated_assets EXIT
+
+mkdir -p "$MANIFEST_DIR"
+
+cat > "$APP_DOCKERFILE" <<'DOCKER'
 FROM python:3.12-slim AS runtime
 WORKDIR /app
 COPY requirements.txt .
@@ -463,7 +454,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 CMD ["/app/venv/bin/python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
 DOCKER
 
-cat > k8s/Dockerfile.monitor <<'DOCKER'
+cat > "$MONITOR_DOCKERFILE" <<'DOCKER'
 FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt .
@@ -482,14 +473,14 @@ ENV OTP_RELAY_DATA_DIR=/app/data
 CMD ["/app/venv/bin/python", "monitor.py"]
 DOCKER
 
-cat > k8s/manifests/namespace.yaml <<EOF_NS
+cat > "$MANIFEST_DIR/namespace.yaml" <<EOF_NS
 apiVersion: v1
 kind: Namespace
 metadata:
   name: $NAMESPACE
 EOF_NS
 
-cat > k8s/manifests/configmap.yaml <<EOF_CM
+cat > "$MANIFEST_DIR/configmap.yaml" <<EOF_CM
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -516,7 +507,7 @@ data:
   PORTAL_URL: "$PORTAL_URL"
 EOF_CM
 
-cat > k8s/manifests/pvc.yaml <<EOF_PVC
+cat > "$MANIFEST_DIR/pvc.yaml" <<EOF_PVC
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -532,7 +523,7 @@ spec:
       storage: 1Gi
 EOF_PVC
 
-cat > k8s/manifests/deployment.yaml <<EOF_DEPLOY
+cat > "$MANIFEST_DIR/deployment.yaml" <<EOF_DEPLOY
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -599,7 +590,7 @@ spec:
             claimName: otp-relay-data
 EOF_DEPLOY
 
-cat > k8s/manifests/service.yaml <<EOF_SVC
+cat > "$MANIFEST_DIR/service.yaml" <<EOF_SVC
 apiVersion: v1
 kind: Service
 metadata:
@@ -620,7 +611,7 @@ spec:
 EOF_SVC
 
 if [ "$INGRESS_ENABLED" = "1" ]; then
-cat > k8s/manifests/ingress.yaml <<EOF_ING
+cat > "$MANIFEST_DIR/ingress.yaml" <<EOF_ING
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -639,11 +630,9 @@ spec:
                 port:
                   number: 80
 EOF_ING
-else
-  rm -f k8s/manifests/ingress.yaml
 fi
 
-cat > k8s/manifests/deployment-monitor.yaml <<EOF_MON
+cat > "$MANIFEST_DIR/deployment-monitor.yaml" <<EOF_MON
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -717,16 +706,16 @@ fi
 if requires_monitor_image; then
   python3 -m py_compile monitor.py
 fi
-k3s kubectl apply --dry-run=client -f k8s/manifests/namespace.yaml >/dev/null
-k3s kubectl apply -f k8s/manifests/namespace.yaml
+k3s kubectl apply --dry-run=client -f "$MANIFEST_DIR/namespace.yaml" >/dev/null
+k3s kubectl apply -f "$MANIFEST_DIR/namespace.yaml"
 k3s kubectl apply --dry-run=client \
-  -f k8s/manifests/configmap.yaml \
-  -f k8s/manifests/pvc.yaml \
-  -f k8s/manifests/deployment.yaml \
-  -f k8s/manifests/service.yaml \
-  -f k8s/manifests/deployment-monitor.yaml >/dev/null
+  -f "$MANIFEST_DIR/configmap.yaml" \
+  -f "$MANIFEST_DIR/pvc.yaml" \
+  -f "$MANIFEST_DIR/deployment.yaml" \
+  -f "$MANIFEST_DIR/service.yaml" \
+  -f "$MANIFEST_DIR/deployment-monitor.yaml" >/dev/null
 if [ "$INGRESS_ENABLED" = "1" ]; then
-  k3s kubectl apply --dry-run=client -f k8s/manifests/ingress.yaml >/dev/null
+  k3s kubectl apply --dry-run=client -f "$MANIFEST_DIR/ingress.yaml" >/dev/null
 fi
 
 if requires_manifests_apply; then
@@ -741,7 +730,7 @@ fi
 
 if requires_app_image; then
   log "building app image with Docker"
-  "$DOCKER_BIN" build -t "$APP_IMAGE" -f k8s/Dockerfile .
+  "$DOCKER_BIN" build -t "$APP_IMAGE" -f "$APP_DOCKERFILE" .
   log "importing app image into K3s containerd"
   tmp_app_tar="$(mktemp --suffix=.tar)"
   "$DOCKER_BIN" save "$APP_IMAGE" -o "$tmp_app_tar"
@@ -753,7 +742,7 @@ fi
 
 if requires_monitor_image; then
   log "building required monitor image with Docker"
-  "$DOCKER_BIN" build -t "$MONITOR_IMAGE" -f k8s/Dockerfile.monitor .
+  "$DOCKER_BIN" build -t "$MONITOR_IMAGE" -f "$MONITOR_DOCKERFILE" .
   log "importing required monitor image into K3s containerd"
   tmp_monitor_tar="$(mktemp --suffix=.tar)"
   "$DOCKER_BIN" save "$MONITOR_IMAGE" -o "$tmp_monitor_tar"
@@ -765,21 +754,21 @@ fi
 
 if requires_manifests_apply; then
   log "applying Kubernetes resources"
-  k3s kubectl apply -f k8s/manifests/configmap.yaml
-  k3s kubectl apply -f k8s/manifests/pvc.yaml
+  k3s kubectl apply -f "$MANIFEST_DIR/configmap.yaml"
+  k3s kubectl apply -f "$MANIFEST_DIR/pvc.yaml"
 
   if [ "$DEPLOY_MODE" = "full" ] || [ "$DEPLOY_MODE" = "app" ] || [ "$DEPLOY_MODE" = "manifests" ]; then
-    k3s kubectl apply -f k8s/manifests/deployment.yaml
-    k3s kubectl apply -f k8s/manifests/service.yaml
+    k3s kubectl apply -f "$MANIFEST_DIR/deployment.yaml"
+    k3s kubectl apply -f "$MANIFEST_DIR/service.yaml"
     if [ "$INGRESS_ENABLED" = "1" ]; then
-      k3s kubectl apply -f k8s/manifests/ingress.yaml
+      k3s kubectl apply -f "$MANIFEST_DIR/ingress.yaml"
     else
       k3s kubectl delete ingress otp-relay -n "$NAMESPACE" --ignore-not-found=true
     fi
   fi
 
   if [ "$DEPLOY_MODE" = "full" ] || [ "$DEPLOY_MODE" = "monitor" ] || [ "$DEPLOY_MODE" = "manifests" ]; then
-    k3s kubectl apply -f k8s/manifests/deployment-monitor.yaml
+    k3s kubectl apply -f "$MANIFEST_DIR/deployment-monitor.yaml"
   fi
 fi
 
@@ -816,6 +805,19 @@ if [ -n "$RUNTIME_DATA_DIR" ] && { [ "$DEPLOY_MODE" = "full" ] || [ "$DEPLOY_MOD
   k3s kubectl rollout restart deployment/otp-monitor -n "$NAMESPACE"
   k3s kubectl rollout status deployment/otp-relay -n "$NAMESPACE" --timeout=180s
   k3s kubectl rollout status deployment/otp-monitor -n "$NAMESPACE" --timeout=180s
+fi
+
+
+log "checking deployment working tree cleanliness"
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  dirty_status="$(git status --porcelain)"
+  if [ -n "$dirty_status" ]; then
+    warn "deployment working tree has uncommitted/generated files:"
+    printf '%s\n' "$dirty_status" >&2
+    warn "tracked modifications should now be unexpected; generated frontend files should be covered by .gitignore"
+  else
+    log "deployment working tree is clean"
+  fi
 fi
 
 
