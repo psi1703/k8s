@@ -153,5 +153,4 @@ jobs:
           WHATSAPP_RECIPIENT: ${{ secrets.WHATSAPP_RECIPIENT }}
           PORTAL_URL: ${{ secrets.PORTAL_URL }}
         run: |
-          chmod +x "$GITHUB_WORKSPACE/install-otp-relay-k8s.sh"
           sudo -n -E /usr/bin/bash "$GITHUB_WORKSPACE/install-otp-relay-k8s.sh"
