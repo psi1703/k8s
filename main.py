@@ -282,6 +282,10 @@ class WizardRecord(BaseModel):
     prod_env: str = ""
 
 
+class UserLoginPayload(BaseModel):
+    token: str
+
+
 class CredentialPayload(BaseModel):
     credential: str
     current: Optional[str] = None
@@ -491,6 +495,23 @@ async def healthz():
 @app.get("/readyz")
 async def readyz():
     return {"status": "ok", "users_loaded": len(users)}
+
+
+@app.post("/user/login")
+async def user_login(payload: UserLoginPayload):
+    """Validate one user token without exposing the full admin-only user directory."""
+    token = str(payload.token or "").strip().upper()
+    if token not in users:
+        audit("user_login_failed", token=token, detail="Unknown token", status="warn")
+        raise HTTPException(status_code=404, detail="Token not recognised. Check with IT.")
+
+    user = users[token]
+    audit("user_login", token=token, detail="User token validated")
+    return {
+        "token": user["token"],
+        "name": user["name"],
+        "email": user["email"],
+    }
 
 
 @app.post("/claim-otp")
