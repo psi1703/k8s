@@ -325,7 +325,7 @@ fi
 
 log "installing Kubernetes/deployment OS packages with apt-get"
 apt-get install -y --no-install-recommends \
-  iproute2 iptables nftables python3-venv jq
+  iproute2 iptables nftables python3-venv jq nodejs npm
 
 if requires_docker; then
   ensure_docker
@@ -377,7 +377,7 @@ log "checking required source files"
 [ -f requirements.txt ] || fatal "requirements.txt is missing in repo root"
 [ -d frontend ] || fatal "frontend/ directory is missing"
 [ -f frontend/index.html ] || fatal "frontend/index.html is missing"
-[ -f frontend/app.jsx ] || fatal "frontend/app.jsx is missing"
+[ -f frontend/app.jsx ] || fatal "frontend/app.jsx source is missing"
 [ -f frontend/style.css ] || fatal "frontend/style.css is missing"
 [ -f scripts/build_help_docs.py ] || fatal "required help-doc builder is missing: scripts/build_help_docs.py"
 [ -d docs/help ] || fatal "required help-doc input directory is missing: docs/help"
@@ -401,6 +401,36 @@ if requires_app_image; then
     log "building help docs with scripts/build_help_docs.py"
     .installer-venv/bin/python scripts/build_help_docs.py
   fi
+
+  if [ ! -f package.json ]; then
+    log "package.json missing; creating frontend build package definition"
+    cat > package.json <<'EOF_PACKAGE_JSON'
+{
+  "private": true,
+  "scripts": {
+    "build:frontend": "babel frontend/app.jsx --presets @babel/preset-react --out-file frontend/app.raw.js && terser frontend/app.raw.js -c -m -o frontend/app.js && rm frontend/app.raw.js"
+  },
+  "devDependencies": {
+    "@babel/cli": "^7.24.0",
+    "@babel/core": "^7.24.0",
+    "@babel/preset-react": "^7.24.0",
+    "terser": "^5.31.0"
+  }
+}
+EOF_PACKAGE_JSON
+  fi
+
+  log "installing frontend build dependencies"
+  if [ -f package-lock.json ]; then
+    npm ci
+  else
+    npm install --package-lock-only
+    npm ci
+  fi
+
+  log "building production frontend bundle frontend/app.js"
+  npm run build:frontend
+  [ -f frontend/app.js ] || fatal "frontend/app.js was not produced by npm run build:frontend"
 else
   log "DEPLOY_MODE=$DEPLOY_MODE does not require app help-doc build; skipping installer venv"
 fi
@@ -420,6 +450,9 @@ RUN useradd --system --uid 999 --no-create-home --shell /usr/sbin/nologin otprel
 COPY main.py .
 COPY frontend/ ./frontend/
 COPY docs/ ./docs/
+RUN test -f /app/frontend/app.js \
+  && rm -f /app/frontend/app.jsx \
+  && chown -R otprelay:otprelay /app
 USER otprelay
 ENV OTP_RELAY_DATA_DIR=/app/data \
     USERS_EXCEL_PATH=/app/data/users.xlsx \
