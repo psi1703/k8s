@@ -506,56 +506,26 @@ a:hover { text-decoration: underline; }
   overflow-x: visible;
   align-items: center;
 }
-.guide-html {
-  color: var(--text);
-  line-height: 1.62;
-}
-.guide-html h1,
-.guide-html h2,
-.guide-html h3 {
-  margin: 18px 0 10px;
-  line-height: 1.18;
-}
-.guide-html h1 { font-size: 24px; }
-.guide-html h2 { font-size: 19px; }
-.guide-html h3 { font-size: 16px; }
-.guide-html p,
-.guide-html ul,
-.guide-html ol {
-  margin: 0 0 14px;
-}
-.guide-html li {
-  margin: 6px 0;
-}
-.guide-html img {
+.guide-html-frame {
   display: block;
-  max-width: 100%;
-  height: auto;
-  border: 1px solid var(--border);
-  border-radius: 16px;
-  background: var(--surface-soft);
-  box-shadow: 0 10px 32px rgba(15, 23, 42, .12);
-  margin: 14px 0 18px;
-}
-.guide-html table {
   width: 100%;
-  border-collapse: collapse;
-  margin: 14px 0;
+  height: min(58vh, 560px);
+  min-height: 380px;
+  border: 0;
+  border-radius: 16px;
+  background: var(--surface);
 }
-.guide-html th,
-.guide-html td {
-  border: 1px solid var(--border);
-  padding: 8px 10px;
-  text-align: left;
-  vertical-align: top;
+
+.help-doc-frame {
+  display: block;
+  width: 100%;
+  height: min(70vh, 720px);
+  min-height: 420px;
+  border: 0;
+  border-radius: 14px;
+  background: var(--surface);
 }
-.guide-html code {
-  font-family: var(--mono);
-  background: var(--surface-soft);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 1px 5px;
-}
+
 .guide-dragging,
 .guide-dragging * {
   cursor: move !important;
