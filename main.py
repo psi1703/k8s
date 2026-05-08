@@ -7,12 +7,14 @@
 # diagnostics only.
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 import secrets
 import smtplib
+import threading
 from collections import deque
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
@@ -99,6 +101,17 @@ CONFIG_FILE = DATA_DIR / "admin_config.json"
 DEFAULT_ADMIN_TOKENS = ["JPR", "AMD", "SCH"]
 ADMIN_TTL_SECONDS = 8 * 60 * 60
 ADMIN_SESSIONS: Dict[str, float] = {}
+ADMIN_LOGIN_ATTEMPTS: Dict[str, Dict[str, Any]] = {}
+ADMIN_LOGIN_WINDOW_SECONDS = int(os.getenv("ADMIN_LOGIN_WINDOW_SECONDS", "300"))
+ADMIN_LOGIN_MAX_ATTEMPTS = int(os.getenv("ADMIN_LOGIN_MAX_ATTEMPTS", "8"))
+ADMIN_LOGIN_LOCKOUT_SECONDS = int(os.getenv("ADMIN_LOGIN_LOCKOUT_SECONDS", "900"))
+WIZARD_DB_LOCK = threading.Lock()
+WIZARD_CLIENT_SECRET_MIN_LENGTH = int(os.getenv("WIZARD_CLIENT_SECRET_MIN_LENGTH", "32"))
+
+
+def _utcnow_naive() -> datetime:
+    """Return a UTC timestamp compatible with existing naive queue timestamps."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _now_iso() -> str:
@@ -181,6 +194,80 @@ def _model_dump(model: BaseModel) -> Dict[str, Any]:
     return model.dict()
 
 
+def _client_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _check_login_rate_limit(request: Request) -> None:
+    key = _client_ip(request)
+    now_ts = datetime.now(timezone.utc).timestamp()
+    row = ADMIN_LOGIN_ATTEMPTS.get(
+        key,
+        {"count": 0, "window_start": now_ts, "locked_until": 0.0},
+    )
+
+    if float(row.get("locked_until", 0.0)) > now_ts:
+        raise HTTPException(status_code=429, detail="Too many failed login attempts. Try again later.")
+
+    if now_ts - float(row.get("window_start", now_ts)) > ADMIN_LOGIN_WINDOW_SECONDS:
+        row = {"count": 0, "window_start": now_ts, "locked_until": 0.0}
+
+    ADMIN_LOGIN_ATTEMPTS[key] = row
+
+
+def _record_login_failure(request: Request) -> None:
+    key = _client_ip(request)
+    now_ts = datetime.now(timezone.utc).timestamp()
+    row = ADMIN_LOGIN_ATTEMPTS.get(
+        key,
+        {"count": 0, "window_start": now_ts, "locked_until": 0.0},
+    )
+    row["count"] = int(row.get("count", 0)) + 1
+    if row["count"] >= ADMIN_LOGIN_MAX_ATTEMPTS:
+        row["locked_until"] = now_ts + ADMIN_LOGIN_LOCKOUT_SECONDS
+    ADMIN_LOGIN_ATTEMPTS[key] = row
+
+
+def _record_login_success(request: Request) -> None:
+    ADMIN_LOGIN_ATTEMPTS.pop(_client_ip(request), None)
+
+
+def _hash_wizard_secret(secret: str) -> str:
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def _valid_wizard_owner(row: Dict[str, Any], client_secret: Optional[str]) -> bool:
+    stored_hash = str(row.get("client_secret_hash") or "")
+    if not stored_hash or not client_secret or len(client_secret) < WIZARD_CLIENT_SECRET_MIN_LENGTH:
+        return False
+    return secrets.compare_digest(stored_hash, _hash_wizard_secret(client_secret))
+
+
+def _public_wizard_record(row: Dict[str, Any]) -> Dict[str, Any]:
+    public = dict(row)
+    public.pop("client_secret_hash", None)
+    return public
+
+
+def _default_wizard_record(token: str) -> Dict[str, Any]:
+    return {
+        "token": token,
+        "display_name": users[token]["name"],
+        "iits_username": "",
+        "adm_username": "",
+        "completed": [],
+        "adminCompleted": [],
+        "iits_pw_date": None,
+        "adm_pw_date": None,
+        "vpn_date": None,
+        "test_env": "",
+        "prod_env": "",
+    }
+
+
 class WizardRecord(BaseModel):
     token: str
     display_name: str = ""
@@ -191,6 +278,8 @@ class WizardRecord(BaseModel):
     iits_pw_date: Optional[str] = None
     adm_pw_date: Optional[str] = None
     vpn_date: Optional[str] = None
+    test_env: str = ""
+    prod_env: str = ""
 
 
 class CredentialPayload(BaseModel):
@@ -287,7 +376,7 @@ def load_users_from_excel(path: str, replace_existing: bool = True) -> int:
 # -- Audit log ----------------------------------------------------------------
 def audit(event: str, token: Optional[str] = None, detail: str = "", status: str = "info") -> None:
     entry = {
-        "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "ts": _utcnow_naive().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "event": event,
         "token": token or "",
         "detail": detail,
@@ -306,10 +395,12 @@ def audit(event: str, token: Optional[str] = None, detail: str = "", status: str
 
 
 def read_audit_log(limit: int = 200) -> list:
+    limit = max(1, min(int(limit or 200), 2000))
     try:
-        lines = Path(AUDIT_LOG_PATH).read_text(encoding="utf-8").strip().splitlines()
-        entries = [json.loads(line) for line in lines if line.strip()]
-        return list(reversed(entries))[:limit]
+        with Path(AUDIT_LOG_PATH).open("r", encoding="utf-8") as handle:
+            tail = deque(handle, maxlen=limit)
+        entries = [json.loads(line) for line in tail if line.strip()]
+        return list(reversed(entries))
     except FileNotFoundError:
         return []
     except Exception as exc:
@@ -320,7 +411,7 @@ def read_audit_log(limit: int = 200) -> list:
 # -- Queue and OTP state helpers ----------------------------------------------
 def purge_expired() -> None:
     """Evict the front-of-queue claim if it has exceeded CLAIM_EXPIRY_SEC."""
-    now = datetime.utcnow()
+    now = _utcnow_naive()
     while claim_queue:
         age = (now - claim_queue[0]["claimed_at"]).total_seconds()
         if age > CLAIM_EXPIRY_SEC:
@@ -332,7 +423,7 @@ def purge_expired() -> None:
 
 def purge_stale_otps() -> None:
     """Remove delivered OTPs that have exceeded OTP_DISPLAY_SEC."""
-    now = datetime.utcnow()
+    now = _utcnow_naive()
     stale = [
         token for token, value in pending_otps.items()
         if (now - value["arrived_at"]).total_seconds() > OTP_DISPLAY_SEC
@@ -416,7 +507,7 @@ async def claim_otp(request: Request):
 
     for i, claim in enumerate(claim_queue):
         if claim["token"] == token:
-            age = (datetime.utcnow() - claim["claimed_at"]).total_seconds()
+            age = (_utcnow_naive() - claim["claimed_at"]).total_seconds()
             remaining = max(0, int(CLAIM_EXPIRY_SEC - age))
             audit("claim_duplicate", token, f"Already at position {i + 1}", "warn")
             return {
@@ -427,11 +518,11 @@ async def claim_otp(request: Request):
             }
 
     if token in pending_otps:
-        age = (datetime.utcnow() - pending_otps[token]["arrived_at"]).total_seconds()
+        age = (_utcnow_naive() - pending_otps[token]["arrived_at"]).total_seconds()
         remaining = max(0, int(OTP_DISPLAY_SEC - age))
         return {"status": "otp_ready", "expires_in": remaining}
 
-    now = datetime.utcnow()
+    now = _utcnow_naive()
 
     if claim_queue:
         front_age = (now - claim_queue[0]["claimed_at"]).total_seconds()
@@ -473,13 +564,13 @@ async def claim_status(token: str):
     purge_stale_otps()
 
     if token in pending_otps:
-        age = (datetime.utcnow() - pending_otps[token]["arrived_at"]).total_seconds()
+        age = (_utcnow_naive() - pending_otps[token]["arrived_at"]).total_seconds()
         remaining = max(0, int(OTP_DISPLAY_SEC - age))
         return {"status": "delivered", "otp": pending_otps[token]["otp"], "expires_in": remaining}
 
     for i, claim in enumerate(claim_queue):
         if claim["token"] == token:
-            age = (datetime.utcnow() - claim["claimed_at"]).total_seconds()
+            age = (_utcnow_naive() - claim["claimed_at"]).total_seconds()
             remaining = max(0, int(CLAIM_EXPIRY_SEC - age))
             wait_estimate = max(0, i * CLAIM_EXPIRY_SEC)
             return {
@@ -542,21 +633,23 @@ async def sms_received(request: Request):
     recipient = claim_queue.popleft()
     otp = extract_otp(sms_body)
 
-    pending_otps[recipient["token"]] = {"otp": otp, "arrived_at": datetime.utcnow()}
+    pending_otps[recipient["token"]] = {"otp": otp, "arrived_at": _utcnow_naive()}
 
     audit("otp_delivered", recipient["token"], "OTP ready for display - queue unblocked")
     return {"status": "delivered", "recipient": recipient["name"]}
 
 
 @app.get("/admin/log")
-async def get_log(limit: int = 200):
+async def get_log(limit: int = 200, x_admin_session: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_session)
     entries = read_audit_log(limit)
     return {"entries": entries, "total": len(entries)}
 
 
 @app.get("/admin/queue")
-async def get_queue():
-    now = datetime.utcnow()
+async def get_queue(x_admin_session: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_session)
+    now = _utcnow_naive()
     return {
         "queue": [
             {
@@ -573,7 +666,8 @@ async def get_queue():
 
 
 @app.get("/admin/users")
-async def list_users():
+async def list_users(x_admin_session: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_session)
     return {
         "count": len(users),
         "users": [{"token": user["token"], "name": user["name"], "email": user["email"]} for user in users.values()],
@@ -654,8 +748,9 @@ async def reload_users(x_admin_session: Optional[str] = Header(default=None)):
 
 
 @app.get("/admin/smtp-test")
-async def smtp_test():
+async def smtp_test(x_admin_session: Optional[str] = Header(default=None)):
     """Sends a test email to the relay account - use to verify Exchange connectivity."""
+    _require_admin(x_admin_session)
     html = """<div style="font-family:Arial,sans-serif;padding:24px">
       <p>OTP Relay SMTP test - if you can read this, Exchange is working.</p>
     </div>"""
@@ -692,14 +787,18 @@ async def admin_auth_setup(payload: CredentialPayload):
 
 
 @app.post("/admin/auth/login")
-async def admin_auth_login(payload: CredentialPayload):
+async def admin_auth_login(payload: CredentialPayload, request: Request):
+    _check_login_rate_limit(request)
+
     db = _auth_db()
     stored = db.get("password_hash")
     if not stored:
         raise HTTPException(status_code=400, detail="Admin credential not configured")
     if not bcrypt.checkpw((payload.credential or "").encode("utf-8"), stored.encode("utf-8")):
+        _record_login_failure(request)
         audit("admin_auth_failed", detail="Incorrect admin credential", status="warn")
         raise HTTPException(status_code=401, detail="Incorrect credential")
+    _record_login_success(request)
     session = secrets.token_urlsafe(24)
     ADMIN_SESSIONS[session] = datetime.now(timezone.utc).timestamp()
     audit("admin_auth_login", detail="Admin session opened")
@@ -733,37 +832,81 @@ async def admin_config_save(payload: ConfigPayload, x_admin_session: Optional[st
 
 
 @app.post("/wizard/progress")
-async def wizard_progress_save(payload: WizardRecord):
+async def wizard_progress_save(
+    payload: WizardRecord,
+    x_wizard_client: Optional[str] = Header(default=None),
+    x_admin_session: Optional[str] = Header(default=None),
+):
     token = payload.token.strip().upper()
     if token not in users:
         raise HTTPException(status_code=404, detail="Unknown token")
-    db = _wizard_db()
-    row = _model_dump(payload)
-    row["token"] = token
-    row["updated_at"] = _now_iso()
-    db[token] = row
-    _save_wizard_db(db)
+
+    is_admin = False
+    try:
+        _require_admin(x_admin_session)
+        is_admin = True
+    except HTTPException:
+        is_admin = False
+
+    with WIZARD_DB_LOCK:
+        db = _wizard_db()
+        existing = db.get(token, {})
+
+        if not is_admin:
+            if not existing.get("client_secret_hash"):
+                if not x_wizard_client or len(x_wizard_client) < WIZARD_CLIENT_SECRET_MIN_LENGTH:
+                    raise HTTPException(status_code=401, detail="Wizard client secret required")
+                existing["client_secret_hash"] = _hash_wizard_secret(x_wizard_client)
+            elif not _valid_wizard_owner(existing, x_wizard_client):
+                raise HTTPException(status_code=403, detail="Wizard record belongs to another client")
+
+        row = _model_dump(payload)
+        row["token"] = token
+        row["updated_at"] = _now_iso()
+        row["client_secret_hash"] = existing.get("client_secret_hash")
+        db[token] = row
+        _save_wizard_db(db)
+
     audit("wizard_progress_saved", token=token, detail="Wizard profile/progress updated")
-    return {"status": "ok", "record": row}
+    return {"status": "ok", "record": _public_wizard_record(row)}
 
 
 @app.get("/wizard/progress/{token}")
-async def wizard_progress_get(token: str):
+async def wizard_progress_get(
+    token: str,
+    x_wizard_client: Optional[str] = Header(default=None),
+    x_admin_session: Optional[str] = Header(default=None),
+):
     token = token.strip().upper()
     if token not in users:
         raise HTTPException(status_code=404, detail="Unknown token")
-    db = _wizard_db()
-    return db.get(token, {
-        "token": token,
-        "display_name": users[token]["name"],
-        "iits_username": "",
-        "adm_username": "",
-        "completed": [],
-        "adminCompleted": [],
-        "iits_pw_date": None,
-        "adm_pw_date": None,
-        "vpn_date": None,
-    })
+
+    is_admin = False
+    try:
+        _require_admin(x_admin_session)
+        is_admin = True
+    except HTTPException:
+        is_admin = False
+
+    with WIZARD_DB_LOCK:
+        db = _wizard_db()
+        row = db.get(token)
+
+        if not row:
+            row = _default_wizard_record(token)
+            if not is_admin:
+                if not x_wizard_client or len(x_wizard_client) < WIZARD_CLIENT_SECRET_MIN_LENGTH:
+                    raise HTTPException(status_code=401, detail="Wizard client secret required")
+                row["client_secret_hash"] = _hash_wizard_secret(x_wizard_client)
+                row["updated_at"] = _now_iso()
+                db[token] = row
+                _save_wizard_db(db)
+            return _public_wizard_record(row)
+
+        if not is_admin and not _valid_wizard_owner(row, x_wizard_client):
+            raise HTTPException(status_code=403, detail="Wizard record belongs to another client")
+
+        return _public_wizard_record(row)
 
 
 @app.get("/admin/wizard")
@@ -784,6 +927,8 @@ async def admin_wizard(x_admin_session: Optional[str] = Header(default=None)):
             "iits_pw_date": rec.get("iits_pw_date"),
             "adm_pw_date": rec.get("adm_pw_date"),
             "vpn_date": rec.get("vpn_date"),
+            "test_env": rec.get("test_env", ""),
+            "prod_env": rec.get("prod_env", ""),
             "updated_at": rec.get("updated_at"),
         })
     return {"users": merged}
