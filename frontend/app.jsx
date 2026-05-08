@@ -863,6 +863,11 @@ function App() {
     setAdmin(s => ({ ...s, session: '', data: null }));
   }
 
+  function openAdminFromLogin() {
+    setView('admin');
+    if (admin.session && !admin.data) loadAdminData(admin.session);
+  }
+
 
   function submitLogin() {
     const token = normalizeToken(login.tokenChars.join(''));
@@ -916,8 +921,26 @@ function App() {
     </div>
   );
 
+  if (!currentUser && view === 'admin') {
+    return (
+      <>
+        <header className="topbar">
+          <div className="topbar-left"><Logo /><span className="topbar-title">OTP Portal</span></div>
+          <div className="topbar-right">
+            <span className="nav-pill active">Admin</span>
+            <button className="btn btn-secondary" onClick={() => setView('otp')}>User login</button>
+            {admin.session && <button className="btn btn-secondary" onClick={logoutAdmin}>Admin logout</button>}
+          </div>
+        </header>
+        <main className="app-shell">
+          <AdminView admin={admin} setAdmin={setAdmin} doAdminAuth={doAdminAuth} loadAdminData={loadAdminData} toggleAdminStep={toggleAdminStep} pendingAdminTasks={pendingAdminTasks} saveConfig={saveConfig} />
+        </main>
+      </>
+    );
+  }
+
   if (!currentUser) {
-    return <LoginGate login={login} setLogin={setLogin} submitLogin={submitLogin} />;
+    return <LoginGate login={login} setLogin={setLogin} submitLogin={submitLogin} openAdmin={openAdminFromLogin} />;
   }
 
   return (
@@ -945,7 +968,7 @@ function App() {
   );
 }
 
-function LoginGate({ login, setLogin, submitLogin }) {
+function LoginGate({ login, setLogin, submitLogin, openAdmin }) {
   const inputRefs = React.useRef([]);
   const token = login.tokenChars.join('');
   const disabled = token.trim().length < 2;
@@ -1013,7 +1036,11 @@ function LoginGate({ login, setLogin, submitLogin }) {
         </div>
         <div className="token-hint">2 or 3 characters · letters and digits only</div>
         {login.error && <div className="error-box" style={{ marginBottom: 12 }}>{login.error}</div>}
-        <button className="btn btn-primary" disabled={disabled} onClick={submitLogin}>Go</button>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+          <button className="btn btn-primary" disabled={disabled} onClick={submitLogin}>Go</button>
+          <button className="btn btn-secondary" type="button" onClick={openAdmin}>Admin login / setup</button>
+        </div>
+        <div className="small" style={{ marginTop: 12 }}>Admins can set up the portal and upload users.xlsx before user tokens are loaded.</div>
       </div>
     </div>
   );
