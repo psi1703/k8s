@@ -608,13 +608,6 @@ main
 # no modified tracked files
 ```
 
-Python cache files should not be committed. `.gitignore` should include:
-
-```text
-__pycache__/
-*.py[cod]
-```
-
 ---
 
 ## Git hygiene
