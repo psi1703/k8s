@@ -59,9 +59,9 @@ The application stayed at one replica because OTP queue state, pending OTPs, and
 
 ---
 
-### Phase 2 - LoadBalancer / MetalLB / source-of-truth deployment
+### Phase 2 - LoadBalancer / MetalLB / Redis foundation / source-of-truth deployment
 
-Phase 2 aligns the deployment with the 3-node/bare-metal Kubernetes diagram discussed with management.
+Phase 2 aligns the deployment with the 3-node/bare-metal Kubernetes diagram discussed with management. It is split into two practical parts: Phase 2A completed the platform/deployment alignment, and Phase 2B introduces Redis as the shared-state foundation before any replica increase.
 
 Phase 2 target flow:
 
@@ -93,6 +93,11 @@ INSTALL_METALLB=0
 REQUIRE_METALLB=1
 PVC_STORAGE_CLASS=local-path
 PVC_SIZE=1Gi
+REDIS_ENABLED=1
+REDIS_URL=redis://otp-redis:6379/0
+REDIS_REQUIRED=0
+REDIS_STORAGE_CLASS=local-path
+REDIS_SIZE=1Gi
 REPLICA_COUNT=1
 ```
 
@@ -101,7 +106,9 @@ Notes:
 - `LOADBALANCER_IP` is intentionally blank so MetalLB auto-assigns an address from its configured pool.
 - `INGRESS_ENABLED=0` means OTP Relay does not use Traefik in Phase 2. Traefik may still exist in K3s, but it is not the OTP Relay exposure path.
 - `REQUIRE_METALLB=1` makes deployment fail fast if LoadBalancer mode is selected but MetalLB is not available.
-- `REPLICA_COUNT=1` remains required until OTP queue, pending OTPs, and admin sessions are moved to shared state.
+- `REDIS_ENABLED=1` deploys Redis and passes `REDIS_URL` to the app for readiness validation.
+- `REDIS_REQUIRED=0` is intentional for the first Redis foundation rollout; after Redis is confirmed healthy, this can become `1`.
+- `REPLICA_COUNT=1` remains required until OTP queue, pending OTPs, and admin sessions are moved to Redis-backed shared state.
 
 Phase 2 changed the deployment source-of-truth model:
 
@@ -134,6 +141,8 @@ Phase 2 added or corrected the following areas:
 | Deployment restarts | multiple restart points possible | coalesced restart requests, one restart per deployment |
 | Wizard progress | could lock to stale browser client | token-owned progress with silent client rebinding |
 | Workflow modes | deployment-system changes could force full rebuild | manifests-only changes avoid unnecessary image rebuilds |
+| Redis | not deployed | Redis service/StatefulSet/PDB added as shared-state foundation |
+| Readiness | app/user readiness only | `/readyz` reports Redis connectivity when `REDIS_URL` is set |
 
 ---
 
@@ -170,6 +179,47 @@ A 3-node cluster is supported for placement and LoadBalancer exposure, but the a
 
 ---
 
+## Redis foundation status
+
+Redis is introduced as the Phase 2B shared-state foundation, but the application state migration is intentionally staged.
+
+Current Redis foundation scope:
+
+```text
+Redis Service:      otp-redis
+Redis StatefulSet:  otp-redis
+Redis PDB:          otp-redis-pdb
+App env:            REDIS_URL=redis://otp-redis:6379/0
+Readiness:          /readyz reports Redis status
+```
+
+Current Redis foundation does **not** yet move OTP runtime state. These remain in process memory until the next application-state migration step:
+
+```text
+claim_queue
+pending_otps
+ADMIN_SESSIONS
+ADMIN_LOGIN_ATTEMPTS
+```
+
+Therefore, even with Redis deployed, the app must stay at:
+
+```text
+REPLICA_COUNT=1
+```
+
+Redis completion criteria before increasing replicas:
+
+```text
+claim_queue is Redis-backed
+pending_otps are Redis-backed with TTL
+admin sessions are Redis-backed
+queue and SMS delivery operations are safe across two app pods
+REPLICA_COUNT=2 has been tested
+```
+
+---
+
 ## Repository structure
 
 ```text
@@ -199,6 +249,9 @@ otp-relay-k8s/
 │       ├── deployment.yaml
 │       ├── namespace.yaml
 │       ├── pvc.yaml
+│       ├── redis-pdb.yaml
+│       ├── redis-service.yaml
+│       ├── redis-statefulset.yaml
 │       ├── secret-example.env
 │       └── service.yaml
 ├── scripts/
@@ -263,6 +316,11 @@ MONITOR_NODE_SELECTOR_KEY / MONITOR_NODE_SELECTOR_VALUE
 PHONE_IP
 PHONE_INTERFACE
 PORTAL_URL
+REDIS_ENABLED
+REDIS_URL
+REDIS_REQUIRED
+REDIS_STORAGE_CLASS
+REDIS_SIZE
 ```
 
 Do not manually edit deployment files under `/opt/otp-relay-k8s` except for emergency recovery. The installer resets that checkout to `origin/main` on deployment.
@@ -305,6 +363,11 @@ INSTALL_METALLB=0
 REQUIRE_METALLB=1
 PVC_STORAGE_CLASS=local-path
 PVC_SIZE=1Gi
+REDIS_ENABLED=1
+REDIS_URL=redis://otp-redis:6379/0
+REDIS_REQUIRED=0
+REDIS_STORAGE_CLASS=local-path
+REDIS_SIZE=1Gi
 REPLICA_COUNT=1
 ```
 
@@ -406,6 +469,45 @@ Confirm the configured MetalLB IP range is free on the LAN and outside DHCP assi
 
 ---
 
+## Redis operations
+
+Redis is deployed as the Phase 2B shared-state foundation. It is internal-only and exposed through a ClusterIP service.
+
+Check Redis resources:
+
+```bash
+sudo k3s kubectl get svc otp-redis -n otp-relay
+sudo k3s kubectl get statefulset otp-redis -n otp-relay
+sudo k3s kubectl get pods -n otp-relay -l app=otp-redis -o wide
+sudo k3s kubectl get pdb otp-redis-pdb -n otp-relay
+```
+
+Check Redis rollout:
+
+```bash
+sudo k3s kubectl rollout status statefulset/otp-redis -n otp-relay --timeout=180s
+```
+
+Check the app sees Redis:
+
+```bash
+curl -s http://<assigned-loadbalancer-ip>/readyz
+```
+
+Expected during Redis foundation rollout:
+
+```json
+{
+  "status": "ok",
+  "redis": "ok",
+  "redis_required": false
+}
+```
+
+Keep `REDIS_REQUIRED=0` until Redis is confirmed healthy. Then it can be changed to `1` so readiness fails if Redis is unavailable.
+
+---
+
 ## GitHub Actions deployment
 
 Workflow:
@@ -431,7 +533,7 @@ WHATSAPP_RECIPIENT
 
 `PORTAL_URL` should normally be left unset for Phase 2 auto-detection. If `PORTAL_URL` is explicitly supplied, the installer preserves that value and does not replace it with the MetalLB-assigned IP.
 
-Manual workflow dispatch can override service type, MetalLB install, LoadBalancer IP, node selectors, PVC storage class, PVC size, ingress, and deployment mode.
+Manual workflow dispatch can override service type, MetalLB install, LoadBalancer IP, node selectors, PVC storage class, PVC size, Redis settings, ingress, and deployment mode.
 
 Deployment mode behavior:
 
@@ -585,6 +687,15 @@ sudo k3s kubectl get svc otp-relay -n otp-relay -o wide
 sudo k3s kubectl get svc otp-relay -n otp-relay -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; echo
 sudo k3s kubectl get configmap otp-relay-config -n otp-relay -o jsonpath='{.data.PORTAL_URL}'; echo
 curl -i http://<assigned-loadbalancer-ip>/readyz
+```
+
+Check Redis foundation:
+
+```bash
+sudo k3s kubectl get svc,statefulset,pdb -n otp-relay | grep -E 'otp-redis|NAME'
+sudo k3s kubectl get pods -n otp-relay -l app=otp-redis -o wide
+sudo k3s kubectl rollout status statefulset/otp-redis -n otp-relay --timeout=180s
+curl -s http://<assigned-loadbalancer-ip>/readyz
 ```
 
 Check that the running deployment uses the expected runtime shape:
