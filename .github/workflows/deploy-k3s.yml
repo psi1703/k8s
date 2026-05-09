@@ -15,6 +15,68 @@ on:
           - monitor
           - manifests
           - none
+      service_type:
+        description: "Kubernetes service exposure"
+        required: true
+        default: NodePort
+        type: choice
+        options:
+          - NodePort
+          - LoadBalancer
+      ingress_enabled:
+        description: "Enable Traefik ingress"
+        required: true
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "0"
+      install_metallb:
+        description: "Install/configure MetalLB before deploying"
+        required: true
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
+      require_metallb:
+        description: "Fail if LoadBalancer mode cannot find MetalLB"
+        required: true
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
+      loadbalancer_ip:
+        description: "Optional fixed LoadBalancer IP"
+        required: false
+        default: ""
+        type: string
+      metallb_ip_range:
+        description: "MetalLB IP pool, for example 172.31.11.120-172.31.11.130"
+        required: false
+        default: ""
+        type: string
+      app_node:
+        description: "Optional hostname for app pod nodeSelector"
+        required: false
+        default: ""
+        type: string
+      monitor_node:
+        description: "Optional hostname for monitor pod nodeSelector"
+        required: false
+        default: ""
+        type: string
+      pvc_storage_class:
+        description: "Optional PVC storageClassName"
+        required: false
+        default: ""
+        type: string
+      pvc_size:
+        description: "PVC size"
+        required: true
+        default: 1Gi
+        type: string
   push:
     branches:
       - main
@@ -86,19 +148,19 @@ jobs:
             [ -n "$file" ] || continue
 
             case "$file" in
-              install-otp-relay-k8s.sh|.github/workflows/deploy-k3s.yml)
+              install-otp-relay-k8s.sh|.github/workflows/deploy-k3s.yml|package.json|package-lock.json|.dockerignore)
                 DEPLOY_SYSTEM_CHANGED=1
                 ;;
 
-              main.py|requirements.txt|k8s/Dockerfile|frontend/*|frontend/**|scripts/build_help_docs.py|docs/help/*|docs/help/**)
+              main.py|requirements.txt|frontend/*|frontend/**|scripts/build_help_docs.py|docs/help/*|docs/help/**)
                 APP_CHANGED=1
                 ;;
 
-              monitor.py|k8s/Dockerfile.monitor)
+              monitor.py)
                 MONITOR_CHANGED=1
                 ;;
 
-              k8s/manifests/*|k8s/manifests/**)
+              k8s/manifests/*|k8s/manifests/**|k8s/Dockerfile|k8s/Dockerfile.monitor)
                 MANIFESTS_CHANGED=1
                 ;;
 
@@ -143,8 +205,24 @@ jobs:
           NAMESPACE: otp-relay
           APP_IMAGE: otp-relay:latest
           MONITOR_IMAGE: otp-monitor:latest
+
+          # Default single-server mode. Manual workflow runs can override these inputs.
+          SERVICE_TYPE: ${{ github.event.inputs.service_type || 'NodePort' }}
           SERVICE_NODE_PORT: "30080"
-          INGRESS_ENABLED: "1"
+          INGRESS_ENABLED: ${{ github.event.inputs.ingress_enabled || '1' }}
+          LOADBALANCER_IP: ${{ github.event.inputs.loadbalancer_ip || '' }}
+          INSTALL_METALLB: ${{ github.event.inputs.install_metallb || '0' }}
+          REQUIRE_METALLB: ${{ github.event.inputs.require_metallb || '0' }}
+          METALLB_IP_RANGE: ${{ github.event.inputs.metallb_ip_range || '' }}
+
+          REPLICA_COUNT: "1"
+          APP_NODE_SELECTOR_KEY: ${{ github.event.inputs.app_node && 'kubernetes.io/hostname' || '' }}
+          APP_NODE_SELECTOR_VALUE: ${{ github.event.inputs.app_node || '' }}
+          MONITOR_NODE_SELECTOR_KEY: ${{ github.event.inputs.monitor_node && 'kubernetes.io/hostname' || '' }}
+          MONITOR_NODE_SELECTOR_VALUE: ${{ github.event.inputs.monitor_node || '' }}
+          PVC_STORAGE_CLASS: ${{ github.event.inputs.pvc_storage_class || '' }}
+          PVC_SIZE: ${{ github.event.inputs.pvc_size || '1Gi' }}
+
           NONINTERACTIVE: "1"
           GIT_CLEAN: "1"
           PHONE_IP: ${{ secrets.PHONE_IP }}
