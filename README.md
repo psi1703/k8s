@@ -174,36 +174,43 @@ A 3-node cluster is supported for placement and LoadBalancer exposure, but the a
 
 ```text
 otp-relay-k8s/
-├── main.py
-├── monitor.py
-├── requirements.txt
-├── package.json
-├── package-lock.json
-├── install-otp-relay-k8s.sh
-├── .github/workflows/deploy-k3s.yml
+├── .github/
+│   └── workflows/
+│       └── deploy-k3s.yml
+├── docs/
+│   ├── diagrams/
+│   │   ├── phase-map.svg
+│   │   └── phase1-architecture.svg
+│   └── k8s-plan.md
 ├── frontend/
-│   ├── index.html
 │   ├── app.jsx
 │   ├── guide.html
+│   ├── index.html
 │   └── style.css
-├── docs/
-│   ├── operations/
-│   └── help/
+├── k8s/
+│   ├── Dockerfile
+│   ├── Dockerfile.monitor
+│   ├── docs/
+│   └── manifests/
+│       ├── configmap.yaml
+│       ├── deployment-monitor.yaml
+│       ├── deployment.yaml
+│       ├── namespace.yaml
+│       ├── pvc.yaml
+│       ├── secret-example.env
+│       └── service.yaml
 ├── scripts/
 │   ├── build_help_docs.py
 │   └── generate_sample_users.py
-└── k8s/
-    ├── Dockerfile
-    ├── Dockerfile.monitor
-    ├── docs/
-    └── manifests/
-        ├── namespace.yaml
-        ├── configmap.yaml
-        ├── pvc.yaml
-        ├── deployment.yaml
-        ├── deployment-monitor.yaml
-        ├── service.yaml
-        └── ingress.yaml
+├── .gitignore
+├── LICENSE
+├── README.md
+├── install-otp-relay-k8s.sh
+├── main.py
+├── monitor.py
+├── package-lock.json
+├── package.json
+└── requirements.txt
 ```
 
 Generated files such as `frontend/app.js`, `frontend/help/`, `node_modules/`, and rendered deployment files under `/tmp` are not source files.
