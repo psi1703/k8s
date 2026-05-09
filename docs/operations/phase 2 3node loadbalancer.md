@@ -6,7 +6,7 @@ Phase 2 keeps the Phase 1 source-of-truth model:
 GitHub main → GitHub Actions → installer → K3s
 ```
 
-It adds manager-style cluster options without moving deployment logic out of the installer.
+It adds cluster options without moving deployment logic out of the installer.
 
 ## Supported Phase 2 options
 
@@ -45,7 +45,7 @@ INGRESS_ENABLED=0
 INSTALL_METALLB=1
 REQUIRE_METALLB=1
 METALLB_IP_RANGE=172.31.11.120-172.31.11.130
-LOADBALANCER_IP=172.31.11.120
+LOADBALANCER_IP=
 APP_NODE_SELECTOR_KEY=kubernetes.io/hostname
 APP_NODE_SELECTOR_VALUE=<app-node>
 MONITOR_NODE_SELECTOR_KEY=kubernetes.io/hostname
