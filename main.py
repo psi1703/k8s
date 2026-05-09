@@ -16,6 +16,7 @@ import secrets
 import smtplib
 import threading
 from collections import deque
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -92,6 +93,13 @@ claim_queue: deque = deque()
 # Delivered OTPs held in memory only - never written to disk or logs.
 # Structure: { token: { "otp": str, "arrived_at": datetime } }
 pending_otps: Dict[str, Dict[str, Any]] = {}
+
+# Redis shared-state keys. Redis is used when REDIS_URL is configured and reachable.
+# The in-memory structures above remain as a safe fallback while REDIS_REQUIRED=0.
+REDIS_QUEUE_KEY = "otp:queue"
+REDIS_QUEUE_LOCK_KEY = "otp:lock:queue"
+REDIS_CLAIM_PREFIX = "otp:claim:"
+REDIS_PENDING_PREFIX = "otp:pending:"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -176,6 +184,207 @@ def _redis_status() -> str:
         return "ok"
     except Exception:
         return "error"
+
+
+def _use_redis_state() -> bool:
+    return redis_client is not None
+
+
+def _redis_claim_key(token: str) -> str:
+    return f"{REDIS_CLAIM_PREFIX}{token}"
+
+
+def _redis_pending_key(token: str) -> str:
+    return f"{REDIS_PENDING_PREFIX}{token}"
+
+
+@contextmanager
+def _redis_queue_lock():
+    if redis_client is None:
+        raise HTTPException(status_code=503, detail="Redis queue is unavailable")
+
+    lock = redis_client.lock(REDIS_QUEUE_LOCK_KEY, timeout=10, blocking_timeout=5)
+    acquired = False
+    try:
+        acquired = lock.acquire(blocking=True)
+        if not acquired:
+            raise HTTPException(status_code=503, detail="OTP queue is busy. Try again.")
+        yield
+    finally:
+        if acquired:
+            try:
+                lock.release()
+            except Exception:
+                pass
+
+
+def _parse_redis_datetime(value: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value).astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return _utcnow_naive()
+
+
+def _redis_queue_tokens() -> List[str]:
+    if redis_client is None:
+        return []
+    return [str(token).upper() for token in redis_client.lrange(REDIS_QUEUE_KEY, 0, -1)]
+
+
+def _redis_get_claim(token: str) -> Optional[Dict[str, Any]]:
+    if redis_client is None:
+        return None
+    row = redis_client.hgetall(_redis_claim_key(token))
+    if not row:
+        return None
+    return {
+        "token": str(row.get("token") or token).upper(),
+        "name": str(row.get("name") or users.get(token, {}).get("name", "")),
+        "email": str(row.get("email") or users.get(token, {}).get("email", "")),
+        "claimed_at": _parse_redis_datetime(str(row.get("claimed_at") or "")),
+    }
+
+
+def _redis_remove_claim(token: str) -> None:
+    if redis_client is None:
+        return
+    token = token.upper()
+    redis_client.lrem(REDIS_QUEUE_KEY, 0, token)
+    redis_client.delete(_redis_claim_key(token))
+
+
+def _redis_purge_expired_claims() -> None:
+    if redis_client is None:
+        return
+
+    now = _utcnow_naive()
+    while True:
+        token = redis_client.lindex(REDIS_QUEUE_KEY, 0)
+        if not token:
+            return
+        token = str(token).upper()
+        claim = _redis_get_claim(token)
+        if not claim:
+            redis_client.lpop(REDIS_QUEUE_KEY)
+            redis_client.delete(_redis_claim_key(token))
+            continue
+
+        age = (now - claim["claimed_at"]).total_seconds()
+        if age <= CLAIM_EXPIRY_SEC:
+            return
+
+        redis_client.lpop(REDIS_QUEUE_KEY)
+        redis_client.delete(_redis_claim_key(token))
+        audit("claim_expired", token, f"No OTP arrived within {CLAIM_EXPIRY_SEC}s - evicted from slot 1", "warn")
+
+
+def _redis_get_pending_otp(token: str) -> Optional[Dict[str, Any]]:
+    if redis_client is None:
+        return None
+
+    token = token.upper()
+    key = _redis_pending_key(token)
+    row = redis_client.hgetall(key)
+    if not row:
+        return None
+
+    ttl = redis_client.ttl(key)
+    if ttl == -2:
+        return None
+    if ttl == -1:
+        arrived_at = _parse_redis_datetime(str(row.get("arrived_at") or ""))
+        age = (_utcnow_naive() - arrived_at).total_seconds()
+        ttl = max(0, int(OTP_DISPLAY_SEC - age))
+        redis_client.expire(key, ttl)
+
+    return {
+        "otp": str(row.get("otp") or "-"),
+        "arrived_at": _parse_redis_datetime(str(row.get("arrived_at") or "")),
+        "expires_in": max(0, int(ttl)),
+    }
+
+
+def _redis_set_pending_otp(token: str, otp: str) -> None:
+    if redis_client is None:
+        return
+
+    key = _redis_pending_key(token.upper())
+    redis_client.hset(key, mapping={"otp": otp, "arrived_at": _now_iso()})
+    redis_client.expire(key, OTP_DISPLAY_SEC)
+
+
+def _redis_delete_pending_otp(token: str) -> bool:
+    if redis_client is None:
+        return False
+    return bool(redis_client.delete(_redis_pending_key(token.upper())))
+
+
+def _redis_add_claim(token: str) -> Dict[str, Any]:
+    if redis_client is None:
+        raise HTTPException(status_code=503, detail="Redis queue is unavailable")
+
+    token = token.upper()
+    now = _utcnow_naive()
+    claim = {
+        "token": token,
+        "name": users[token]["name"],
+        "email": users[token]["email"],
+        "claimed_at": now,
+    }
+    redis_client.hset(_redis_claim_key(token), mapping={
+        "token": token,
+        "name": claim["name"],
+        "email": claim["email"],
+        "claimed_at": now.replace(tzinfo=timezone.utc).isoformat(),
+    })
+    redis_client.rpush(REDIS_QUEUE_KEY, token)
+    return claim
+
+
+def _redis_queue_position(token: str) -> int:
+    token = token.upper()
+    for index, queued_token in enumerate(_redis_queue_tokens(), start=1):
+        if queued_token == token:
+            return index
+    return 0
+
+
+def _redis_pop_next_claim() -> Optional[Dict[str, Any]]:
+    if redis_client is None:
+        return None
+
+    _redis_purge_expired_claims()
+    while True:
+        token = redis_client.lpop(REDIS_QUEUE_KEY)
+        if not token:
+            return None
+        token = str(token).upper()
+        claim = _redis_get_claim(token)
+        redis_client.delete(_redis_claim_key(token))
+        if claim:
+            return claim
+
+
+def _redis_admin_queue() -> List[Dict[str, Any]]:
+    if redis_client is None:
+        return []
+
+    _redis_purge_expired_claims()
+    now = _utcnow_naive()
+    rows: List[Dict[str, Any]] = []
+    for index, token in enumerate(_redis_queue_tokens(), start=1):
+        claim = _redis_get_claim(token)
+        if not claim:
+            continue
+        rows.append({
+            "token": claim["token"],
+            "name": claim["name"],
+            "email": claim["email"],
+            "claimed_at": claim["claimed_at"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "expires_in": max(0, int(CLAIM_EXPIRY_SEC - (now - claim["claimed_at"]).total_seconds())),
+            "position": index,
+        })
+    return rows
 
 
 def _ensure_data_dir() -> None:
@@ -494,6 +703,11 @@ def read_audit_log(limit: int = 200) -> list:
 # -- Queue and OTP state helpers ----------------------------------------------
 def purge_expired() -> None:
     """Evict the front-of-queue claim if it has exceeded CLAIM_EXPIRY_SEC."""
+    if _use_redis_state():
+        with _redis_queue_lock():
+            _redis_purge_expired_claims()
+        return
+
     now = _utcnow_naive()
     while claim_queue:
         age = (now - claim_queue[0]["claimed_at"]).total_seconds()
@@ -506,6 +720,10 @@ def purge_expired() -> None:
 
 def purge_stale_otps() -> None:
     """Remove delivered OTPs that have exceeded OTP_DISPLAY_SEC."""
+    if _use_redis_state():
+        # Redis expires pending OTPs with key TTL. No disk/log copy is kept.
+        return
+
     now = _utcnow_naive()
     stale = [
         token for token, value in pending_otps.items()
@@ -620,6 +838,57 @@ async def claim_otp(request: Request):
         audit("claim_rejected", token, "Unknown token", "error")
         raise HTTPException(status_code=404, detail="Token not recognised. Check with your IT department.")
 
+    if _use_redis_state():
+        with _redis_queue_lock():
+            _redis_purge_expired_claims()
+
+            pending = _redis_get_pending_otp(token)
+            if pending:
+                return {"status": "otp_ready", "expires_in": pending["expires_in"]}
+
+            position = _redis_queue_position(token)
+            if position:
+                claim = _redis_get_claim(token)
+                remaining = CLAIM_EXPIRY_SEC
+                if claim:
+                    age = (_utcnow_naive() - claim["claimed_at"]).total_seconds()
+                    remaining = max(0, int(CLAIM_EXPIRY_SEC - age))
+                audit("claim_duplicate", token, f"Already at position {position}", "warn")
+                return {
+                    "status": "already_queued",
+                    "position": position,
+                    "expires_in": remaining,
+                    "queue_depth": len(_redis_queue_tokens()),
+                }
+
+            tokens = _redis_queue_tokens()
+            if tokens:
+                front_claim = _redis_get_claim(tokens[0])
+                if front_claim:
+                    front_age = (_utcnow_naive() - front_claim["claimed_at"]).total_seconds()
+                    if front_age < CONCURRENT_RISK_SEC:
+                        audit(
+                            "concurrent_risk",
+                            token,
+                            f"New claim while {front_claim['token']} has been active for only {int(front_age)}s",
+                            "warn",
+                        )
+
+            _redis_add_claim(token)
+            position = _redis_queue_position(token)
+            queue_depth = len(_redis_queue_tokens())
+            wait_estimate = max(0, (position - 1) * CLAIM_EXPIRY_SEC)
+
+            audit("claim_queued", token, f"Queue position {position} of {queue_depth}")
+            return {
+                "status": "queued",
+                "position": position,
+                "name": users[token]["name"],
+                "expires_in": CLAIM_EXPIRY_SEC,
+                "queue_depth": queue_depth,
+                "wait_estimate": wait_estimate,
+            }
+
     purge_expired()
     purge_stale_otps()
 
@@ -678,6 +947,39 @@ async def claim_otp(request: Request):
 async def claim_status(token: str):
     token = token.upper()
 
+    if _use_redis_state():
+        with _redis_queue_lock():
+            _redis_purge_expired_claims()
+
+            pending = _redis_get_pending_otp(token)
+            if pending:
+                return {"status": "delivered", "otp": pending["otp"], "expires_in": pending["expires_in"]}
+
+            position = _redis_queue_position(token)
+            if position:
+                claim = _redis_get_claim(token)
+                if claim:
+                    age = (_utcnow_naive() - claim["claimed_at"]).total_seconds()
+                    remaining = max(0, int(CLAIM_EXPIRY_SEC - age))
+                    wait_estimate = max(0, (position - 1) * CLAIM_EXPIRY_SEC)
+                    return {
+                        "status": "waiting",
+                        "position": position,
+                        "expires_in": remaining,
+                        "queue_depth": len(_redis_queue_tokens()),
+                        "wait_estimate": wait_estimate,
+                    }
+
+        for entry in read_audit_log(500):
+            if entry.get("token") == token:
+                if entry["event"] in ("otp_delivered", "otp_display_expired"):
+                    return {"status": "done"}
+                if entry["event"] == "claim_expired":
+                    return {"status": "idle_expired"}
+                break
+
+        return {"status": "unknown"}
+
     purge_expired()
     purge_stale_otps()
 
@@ -715,6 +1017,18 @@ async def cancel_claim(token: str):
     """Discard a delivered OTP and remove/requeue claim state for retry flows."""
     token = token.upper()
 
+    if _use_redis_state():
+        with _redis_queue_lock():
+            if _redis_delete_pending_otp(token):
+                audit("otp_discarded", token, "User requested retry - OTP discarded from Redis")
+
+            position = _redis_queue_position(token)
+            _redis_remove_claim(token)
+            if position:
+                audit("claim_cancelled", token, "Removed from queue by user")
+
+        return {"status": "ok"}
+
     if token in pending_otps:
         del pending_otps[token]
         audit("otp_discarded", token, "User requested retry - OTP discarded from memory")
@@ -737,6 +1051,25 @@ async def sms_received(request: Request):
     data = await request.json()
     sms_body = str(data.get("body", "")).strip()
     audit("sms_received", detail=f"SMS arrived ({len(sms_body)} chars)")
+
+    if _use_redis_state():
+        with _redis_queue_lock():
+            recipient = _redis_pop_next_claim()
+
+        if not recipient:
+            await asyncio.sleep(4)
+            with _redis_queue_lock():
+                recipient = _redis_pop_next_claim()
+
+        if not recipient:
+            audit("sms_unmatched", detail="No claimant in queue - SMS discarded", status="warn")
+            return {"status": "no_claimant"}
+
+        otp = extract_otp(sms_body)
+        _redis_set_pending_otp(recipient["token"], otp)
+
+        audit("otp_delivered", recipient["token"], "OTP ready for display - queue unblocked")
+        return {"status": "delivered", "recipient": recipient["name"]}
 
     purge_expired()
     purge_stale_otps()
@@ -767,6 +1100,11 @@ async def get_log(limit: int = 200, x_admin_session: Optional[str] = Header(defa
 @app.get("/admin/queue")
 async def get_queue(x_admin_session: Optional[str] = Header(default=None)):
     _require_admin(x_admin_session)
+
+    if _use_redis_state():
+        with _redis_queue_lock():
+            return {"queue": _redis_admin_queue()}
+
     now = _utcnow_naive()
     return {
         "queue": [
