@@ -1,0 +1,16 @@
+.git
+.github
+.installer-venv
+.venv
+venv
+node_modules
+frontend/app.raw.js
+data
+*.log
+*.tar
+*.tar.gz
+__pycache__
+.pytest_cache
+.DS_Store
+.vscode
+.idea
