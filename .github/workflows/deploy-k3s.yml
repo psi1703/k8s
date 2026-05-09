@@ -18,7 +18,7 @@ on:
       service_type:
         description: "Kubernetes service exposure"
         required: true
-        default: NodePort
+        default: LoadBalancer
         type: choice
         options:
           - NodePort
@@ -207,7 +207,7 @@ jobs:
           MONITOR_IMAGE: otp-monitor:latest
 
           # Default single-server mode. Manual workflow runs can override these inputs.
-          SERVICE_TYPE: ${{ github.event.inputs.service_type || 'NodePort' }}
+          SERVICE_TYPE: ${{ github.event.inputs.service_type || 'LoadBalancer' }}
           SERVICE_NODE_PORT: "30080"
           INGRESS_ENABLED: ${{ github.event.inputs.ingress_enabled || '1' }}
           LOADBALANCER_IP: ${{ github.event.inputs.loadbalancer_ip || '' }}
