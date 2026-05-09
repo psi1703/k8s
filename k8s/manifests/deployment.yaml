@@ -36,6 +36,8 @@ spec:
           env:
             - name: OTP_RELAY_DATA_DIR
               value: /app/data
+            - name: REDIS_URL
+              value: redis://otp-redis:6379/0
             - name: SMS_SECRET_TOKEN
               valueFrom:
                 secretKeyRef:
