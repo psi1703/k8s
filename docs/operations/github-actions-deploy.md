@@ -2,70 +2,29 @@
 
 This is the recommended deployment path for the OTP Relay Kubernetes repository.
 
-The GitHub Actions workflow runs on a self-hosted runner installed on the K3s server. The installer registers the runner before Docker/K3s deployment work starts. The runner builds the app and monitor images locally, imports them into K3s containerd, applies the Kubernetes manifests, and restarts the deployments.
-
-This avoids Docker Hub, a private registry, SSH file copy, and manual image tar handoff.
-
----
-
-## Deployment model
-
 ```text
 git push to main
-  -> GitHub Actions job starts
-  -> self-hosted runner on the K3s server checks out the repo
-  -> installer syncs /opt/otp-relay-k8s to origin/main
-  -> installer builds otp-relay:latest and otp-monitor:latest
-  -> installer imports both images into K3s
-  -> installer applies manifests and waits for rollouts
+  ↓
+GitHub Actions job starts
+  ↓
+self-hosted runner checks out the repo
+  ↓
+installer syncs /opt/otp-relay-k8s to origin/main
+  ↓
+installer builds app.js, help docs, images, generated manifests
+  ↓
+installer imports images into K3s
+  ↓
+installer applies resources and waits for rollouts
 ```
 
-The installer remains the source of truth. The workflow intentionally calls `install-otp-relay-k8s.sh` instead of duplicating deployment logic in YAML.
+The workflow intentionally calls `install-otp-relay-k8s.sh` from the checked-out commit instead of duplicating deployment logic in YAML.
 
 ---
 
-## One-time runner bootstrap
+## Required secrets
 
-Create a self-hosted runner token in GitHub:
-
-```text
-Repository -> Settings -> Actions -> Runners -> New self-hosted runner
-```
-
-Then run this once on the K3s server. Runner setup happens first, before Docker and K3s deployment packages are installed:
-
-```bash
-sudo INSTALL_GITHUB_RUNNER=1 \
-  GITHUB_RUNNER_URL="https://github.com/psi1703/k8s" \
-  GITHUB_RUNNER_TOKEN="PASTE_RUNNER_TOKEN_HERE" \
-  PHONE_IP="172.31.10.161" \
-  PHONE_INTERFACE="eth0" \
-  WHATSAPP_API_KEY="PASTE_WHATSAPP_API_KEY_HERE" \
-  WHATSAPP_RECIPIENT="PASTE_WHATSAPP_RECIPIENT_HERE" \
-  PORTAL_URL="http://SERVER_IP_OR_DNS" \
-  NONINTERACTIVE=1 \
-  bash install-otp-relay-k8s.sh
-```
-
-The installer does not assign a custom runner name or custom labels. GitHub's default runner name and default labels are used.
-
-The workflow targets the default labels:
-
-```text
-self-hosted, Linux, X64
-```
-
----
-
-## Required GitHub Actions secrets
-
-Create these repository secrets:
-
-```text
-Settings -> Secrets and variables -> Actions -> New repository secret
-```
-
-Required:
+Create these in GitHub Actions secrets:
 
 ```text
 PHONE_IP
@@ -75,93 +34,84 @@ WHATSAPP_RECIPIENT
 PORTAL_URL
 ```
 
-Example:
-
-```text
-PHONE_IP=172.31.10.161
-PHONE_INTERFACE=eth0
-PORTAL_URL=http://172.31.11.107
-```
-
-Do not commit WhatsApp credentials or runtime secrets into the repository.
+Do not commit WhatsApp credentials or runtime secrets.
 
 ---
 
-## Normal deployment
+## Default single-server mode
 
-After the runner is online and the secrets exist, deploy by pushing to `main`:
+Default workflow values preserve the current Debian server deployment:
 
-```bash
-git add .
-git commit -m "Add GitHub Actions K3s deployment"
-git push origin main
-```
-
-You can also deploy manually from GitHub:
-
-```text
-Actions -> Deploy OTP Relay to K3s -> Run workflow
+```yaml
+SERVICE_TYPE: NodePort
+SERVICE_NODE_PORT: "30080"
+INGRESS_ENABLED: "1"
+INSTALL_METALLB: "0"
+REQUIRE_METALLB: "0"
+REPLICA_COUNT: "1"
 ```
 
 ---
 
-## What the workflow does
+## 3-node / LoadBalancer mode
 
-The workflow file is:
+Manual workflow dispatch can use:
 
-```text
-.github/workflows/deploy-k3s.yml
+```yaml
+SERVICE_TYPE: LoadBalancer
+INGRESS_ENABLED: "0"
+INSTALL_METALLB: "1"
+REQUIRE_METALLB: "1"
+METALLB_IP_RANGE: 172.31.11.120-172.31.11.130
+LOADBALANCER_IP: 172.31.11.120
+APP_NODE_SELECTOR_KEY: kubernetes.io/hostname
+APP_NODE_SELECTOR_VALUE: <app-node-name>
+MONITOR_NODE_SELECTOR_KEY: kubernetes.io/hostname
+MONITOR_NODE_SELECTOR_VALUE: <phone-network-node-name>
+PVC_STORAGE_CLASS: local-path
+PVC_SIZE: 1Gi
 ```
 
-It runs on:
+`REPLICA_COUNT` remains `1` because the queue, pending OTPs, and admin sessions are in process memory.
 
-- push to `main`
-- manual `workflow_dispatch`
+---
 
-The workflow command is intentionally narrow:
+## MetalLB behavior
 
-```bash
-sudo -E /usr/bin/bash /opt/otp-relay-k8s/install-otp-relay-k8s.sh
-```
+If `INSTALL_METALLB=1`, the installer:
 
-During runner bootstrap, the installer creates a restricted sudoers rule allowing the runner user to execute only that installer command with environment preservation.
+1. applies the MetalLB native manifest
+2. waits for CRDs
+3. waits for controller and speaker readiness
+4. creates an `IPAddressPool`
+5. creates an `L2Advertisement`
+
+If `INSTALL_METALLB=0` and `SERVICE_TYPE=LoadBalancer`, the installer only checks whether MetalLB is already present.
+
+Set `REQUIRE_METALLB=1` to fail fast if MetalLB is not installed.
 
 ---
 
 ## Operational checks
 
-On the server:
-
 ```bash
-sudo systemctl status actions.runner* --no-pager
-sudo k3s kubectl get pods -n otp-relay
-sudo k3s kubectl get svc,ingress -n otp-relay
+sudo k3s kubectl get nodes -o wide
+sudo k3s kubectl get storageclass
+sudo k3s kubectl get pods -n metallb-system
+sudo k3s kubectl get pods,svc,ingress -n otp-relay
 sudo k3s kubectl logs -n otp-relay deployment/otp-relay --tail=100
 sudo k3s kubectl logs -n otp-relay deployment/otp-monitor --tail=100
 ```
 
-In GitHub:
-
-```text
-Repository -> Actions -> Deploy OTP Relay to K3s
-```
-
-A successful run should show the installer completing the app rollout and monitor rollout.
-
----
-
-## Fallback deployment
-
-If GitHub Actions is unavailable, run the installer directly on the server:
+After each deploy:
 
 ```bash
-sudo PHONE_IP="172.31.10.161" \
-  PHONE_INTERFACE="eth0" \
-  WHATSAPP_API_KEY="PASTE_WHATSAPP_API_KEY_HERE" \
-  WHATSAPP_RECIPIENT="PASTE_WHATSAPP_RECIPIENT_HERE" \
-  PORTAL_URL="http://SERVER_IP_OR_DNS" \
-  NONINTERACTIVE=1 \
-  bash /opt/otp-relay-k8s/install-otp-relay-k8s.sh
+cd /opt/otp-relay-k8s
+git status
 ```
 
-The manual Docker image export process remains available as a last-resort fallback, but GitHub Actions is the preferred path.
+Expected:
+
+```text
+nothing to commit, working tree clean
+```
