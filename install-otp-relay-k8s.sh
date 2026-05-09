@@ -106,6 +106,11 @@ GITHUB_RUNNER_USER="${GITHUB_RUNNER_USER:-actions-runner}"
 RUNNER_ONLY="${RUNNER_ONLY:-0}"
 DEPLOY_MODE="${DEPLOY_MODE:-full}"
 DOCKER_BIN="${DOCKER_BIN:-}"
+REDIS_ENABLED="${REDIS_ENABLED:-1}"
+REDIS_URL="${REDIS_URL:-redis://otp-redis:6379/0}"
+REDIS_REQUIRED="${REDIS_REQUIRED:-0}"
+REDIS_STORAGE_CLASS="${REDIS_STORAGE_CLASS:-local-path}"
+REDIS_SIZE="${REDIS_SIZE:-1Gi}"
 RESTART_APP_REQUIRED=0
 RESTART_MONITOR_REQUIRED=0
 
@@ -288,6 +293,16 @@ validate_k8s_topology_settings() {
   case "$SERVICE_TYPE" in
     NodePort|LoadBalancer) ;;
     *) fatal "unsupported SERVICE_TYPE=$SERVICE_TYPE. Use NodePort or LoadBalancer." ;;
+  esac
+
+  case "$REDIS_ENABLED" in
+    0|1) ;;
+    *) fatal "unsupported REDIS_ENABLED=$REDIS_ENABLED. Use 0 or 1." ;;
+  esac
+
+  case "$REDIS_REQUIRED" in
+    0|1) ;;
+    *) fatal "unsupported REDIS_REQUIRED=$REDIS_REQUIRED. Use 0 or 1." ;;
   esac
 
   if [ "$SERVICE_TYPE" = "NodePort" ]; then
@@ -713,6 +728,11 @@ log "checking required source files"
 for required_manifest in namespace.yaml pvc.yaml deployment.yaml service.yaml deployment-monitor.yaml; do
   [ -f "k8s/manifests/$required_manifest" ] || fatal "k8s/manifests/$required_manifest is missing"
 done
+if [ "$REDIS_ENABLED" = "1" ]; then
+  for required_manifest in redis-service.yaml redis-statefulset.yaml redis-pdb.yaml; do
+    [ -f "k8s/manifests/$required_manifest" ] || fatal "k8s/manifests/$required_manifest is missing"
+  done
+fi
 [ -f scripts/build_help_docs.py ] || fatal "required help-doc builder is missing: scripts/build_help_docs.py"
 [ -d docs/help ] || fatal "required help-doc input directory is missing: docs/help"
 
@@ -807,6 +827,11 @@ ALERT_LEVEL="$ALERT_LEVEL" \
 SERVER_HOSTNAME="$SERVER_HOSTNAME" \
 SERVER_IP="$SERVER_IP" \
 PORTAL_URL="$PORTAL_URL" \
+REDIS_ENABLED="$REDIS_ENABLED" \
+REDIS_URL="$REDIS_URL" \
+REDIS_REQUIRED="$REDIS_REQUIRED" \
+REDIS_STORAGE_CLASS="$REDIS_STORAGE_CLASS" \
+REDIS_SIZE="$REDIS_SIZE" \
 python3 - <<'PY_RENDER_MANIFESTS'
 import os
 import re
@@ -904,6 +929,32 @@ if (manifest_dir / "deployment.yaml").exists():
     text = set_recreate_strategy(text)
     text = set_first_image(text, os.environ["APP_IMAGE"])
     text = add_nodesel(text, os.environ.get("APP_NODE_SELECTOR_KEY", ""), os.environ.get("APP_NODE_SELECTOR_VALUE", ""))
+
+    # Redis is introduced first as a reachable cluster service while the app
+    # remains REPLICA_COUNT=1. Queue/session state migration happens later.
+    text = re.sub(
+        r"\n            - name: REDIS_URL\n              value: .*",
+        "",
+        text,
+    )
+    text = re.sub(
+        r"\n            - name: REDIS_REQUIRED\n              value: .*",
+        "",
+        text,
+    )
+    if os.environ.get("REDIS_ENABLED") == "1":
+        redis_env = (
+            f"            - name: REDIS_URL\n"
+            f"              value: {os.environ['REDIS_URL']}\n"
+            f"            - name: REDIS_REQUIRED\n"
+            f"              value: \"{os.environ['REDIS_REQUIRED']}\"\n"
+        )
+        text = text.replace(
+            "            - name: SMS_SECRET_TOKEN\n",
+            redis_env + "            - name: SMS_SECRET_TOKEN\n",
+            1,
+        )
+
     write("deployment.yaml", text)
 
 # Monitor deployment
@@ -926,6 +977,23 @@ if (manifest_dir / "service.yaml").exists():
     if os.environ["SERVICE_TYPE"] == "NodePort":
         text = text.replace("      targetPort: 8000\n", f"      targetPort: 8000\n      nodePort: {os.environ['SERVICE_NODE_PORT']}\n", 1)
     write("service.yaml", text)
+
+# Redis manifests
+for name in ["redis-service.yaml", "redis-statefulset.yaml", "redis-pdb.yaml"]:
+    path = manifest_dir / name
+    if path.exists():
+        text = replace_namespace(read(name))
+        if name == "redis-statefulset.yaml":
+            text = re.sub(r"\n        storageClassName: .*", "", text)
+            redis_storage_class = os.environ.get("REDIS_STORAGE_CLASS", "")
+            if redis_storage_class:
+                text = text.replace(
+                    "        accessModes:\n",
+                    f"        storageClassName: {redis_storage_class}\n        accessModes:\n",
+                    1,
+                )
+            text = re.sub(r"(\n            storage: ).*", rf"\g<1>{os.environ['REDIS_SIZE']}", text)
+        write(name, text)
 
 # Ingress
 if (manifest_dir / "ingress.yaml").exists():
@@ -950,6 +1018,12 @@ k3s kubectl apply --dry-run=client \
   -f "$MANIFEST_DIR/deployment-monitor.yaml" >/dev/null
 if [ "$INGRESS_ENABLED" = "1" ] && [ -f "$MANIFEST_DIR/ingress.yaml" ]; then
   k3s kubectl apply --dry-run=client -f "$MANIFEST_DIR/ingress.yaml" >/dev/null
+fi
+if [ "$REDIS_ENABLED" = "1" ]; then
+  k3s kubectl apply --dry-run=client \
+    -f "$MANIFEST_DIR/redis-service.yaml" \
+    -f "$MANIFEST_DIR/redis-statefulset.yaml" \
+    -f "$MANIFEST_DIR/redis-pdb.yaml" >/dev/null
 fi
 
 if requires_manifests_apply; then
@@ -990,6 +1064,14 @@ if requires_manifests_apply; then
   log "applying Kubernetes resources"
   apply_runtime_configmap
   k3s kubectl apply -f "$MANIFEST_DIR/pvc.yaml"
+
+  if [ "$REDIS_ENABLED" = "1" ]; then
+    log "applying Redis shared-state resources"
+    k3s kubectl apply -f "$MANIFEST_DIR/redis-service.yaml"
+    k3s kubectl apply -f "$MANIFEST_DIR/redis-statefulset.yaml"
+    k3s kubectl apply -f "$MANIFEST_DIR/redis-pdb.yaml"
+    k3s kubectl rollout status statefulset/otp-redis -n "$NAMESPACE" --timeout=180s
+  fi
 
   if [ "$DEPLOY_MODE" = "full" ] || [ "$DEPLOY_MODE" = "app" ] || [ "$DEPLOY_MODE" = "manifests" ]; then
     k3s kubectl apply -f "$MANIFEST_DIR/deployment.yaml"
@@ -1078,6 +1160,7 @@ Deploy mode:  $DEPLOY_MODE
 App node selector:     ${APP_NODE_SELECTOR_KEY:-none}=${APP_NODE_SELECTOR_VALUE:-}
 Monitor node selector: ${MONITOR_NODE_SELECTOR_KEY:-none}=${MONITOR_NODE_SELECTOR_VALUE:-}
 PVC storage:           ${PVC_STORAGE_CLASS:-default} / $PVC_SIZE
+Redis:                enabled=$REDIS_ENABLED required=$REDIS_REQUIRED url=${REDIS_URL:-none} storage=${REDIS_STORAGE_CLASS:-default}/$REDIS_SIZE
 
 Useful commands:
   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
