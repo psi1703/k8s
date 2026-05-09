@@ -78,7 +78,12 @@ SERVER_HOSTNAME="${SERVER_HOSTNAME:-$(hostname -f 2>/dev/null || hostname)}"
 SERVER_IP="${SERVER_IP:-$(hostname -I 2>/dev/null | awk '{print $1}') }"
 SERVER_IP="$(printf '%s' "$SERVER_IP" | xargs)"
 SERVER_IP="${SERVER_IP:-127.0.0.1}"
+PORTAL_URL_EXPLICIT=0
+if [ -n "${PORTAL_URL:-}" ]; then
+  PORTAL_URL_EXPLICIT=1
+fi
 PORTAL_URL="${PORTAL_URL:-http://$SERVER_IP}"
+ASSIGNED_LOADBALANCER_ADDRESS=""
 PHONE_IP="${PHONE_IP:-172.31.10.161}"
 PHONE_INTERFACE="${PHONE_INTERFACE:-$(ip route show default 2>/dev/null | awk '{print $5; exit}') }"
 PHONE_INTERFACE="$(printf '%s' "$PHONE_INTERFACE" | xargs)"
@@ -388,6 +393,88 @@ check_loadbalancer_prereqs() {
   else
     warn "MetalLB namespace was not found. LoadBalancer service may stay pending unless another load balancer is installed."
   fi
+}
+
+apply_runtime_configmap() {
+  k3s kubectl create configmap otp-relay-config \
+    --namespace "$NAMESPACE" \
+    --from-literal=CLAIM_EXPIRY_SEC="90" \
+    --from-literal=OTP_DISPLAY_SEC="285" \
+    --from-literal=CONCURRENT_RISK_SEC="30" \
+    --from-literal=OTP_RELAY_DATA_DIR="/app/data" \
+    --from-literal=USERS_EXCEL_PATH="/app/data/users.xlsx" \
+    --from-literal=AUDIT_LOG_PATH="/app/data/audit.log" \
+    --from-literal=PHONE_IP="$PHONE_IP" \
+    --from-literal=PHONE_INTERFACE="$PHONE_INTERFACE" \
+    --from-literal=PHONE_PING_INTERVAL="$PHONE_PING_INTERVAL" \
+    --from-literal=PHONE_OFFLINE_THRESHOLD="$PHONE_OFFLINE_THRESHOLD" \
+    --from-literal=BATCH_WINDOW_SEC="$BATCH_WINDOW_SEC" \
+    --from-literal=ALERT_LEVEL="$ALERT_LEVEL" \
+    --from-literal=SERVER_HOSTNAME="$SERVER_HOSTNAME" \
+    --from-literal=SERVER_IP="$SERVER_IP" \
+    --from-literal=PORTAL_URL="$PORTAL_URL" \
+    --dry-run=client -o yaml | k3s kubectl apply -f -
+}
+
+restart_deployment_if_exists() {
+  deployment_name="$1"
+  if k3s kubectl get deployment "$deployment_name" -n "$NAMESPACE" >/dev/null 2>&1; then
+    k3s kubectl rollout restart "deployment/$deployment_name" -n "$NAMESPACE"
+  fi
+}
+
+resolve_portal_url_from_service() {
+  PORTAL_URL_CONFIG_REFRESHED=0
+
+  [ "$SERVICE_TYPE" = "LoadBalancer" ] || return 0
+
+  if [ "$PORTAL_URL_EXPLICIT" = "1" ]; then
+    log "PORTAL_URL was explicitly provided; leaving it as $PORTAL_URL"
+    return 0
+  fi
+
+  if [ -n "$LOADBALANCER_IP" ]; then
+    ASSIGNED_LOADBALANCER_ADDRESS="$LOADBALANCER_IP"
+    PORTAL_URL="http://$LOADBALANCER_IP"
+    SERVER_IP="$LOADBALANCER_IP"
+    log "using requested LoadBalancer IP for PORTAL_URL: $PORTAL_URL"
+    apply_runtime_configmap
+    PORTAL_URL_CONFIG_REFRESHED=1
+    return 0
+  fi
+
+  log "waiting for LoadBalancer address assignment for service otp-relay"
+  for i in $(seq 1 60); do
+    assigned_address="$({
+      k3s kubectl get svc otp-relay \
+        -n "$NAMESPACE" \
+        -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true
+    })"
+    assigned_address="$(printf '%s' "$assigned_address" | xargs)"
+
+    if [ -z "$assigned_address" ]; then
+      assigned_address="$({
+        k3s kubectl get svc otp-relay \
+          -n "$NAMESPACE" \
+          -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true
+      })"
+      assigned_address="$(printf '%s' "$assigned_address" | xargs)"
+    fi
+
+    if [ -n "$assigned_address" ]; then
+      ASSIGNED_LOADBALANCER_ADDRESS="$assigned_address"
+      PORTAL_URL="http://$assigned_address"
+      SERVER_IP="$assigned_address"
+      log "using assigned LoadBalancer address for PORTAL_URL: $PORTAL_URL"
+      apply_runtime_configmap
+      PORTAL_URL_CONFIG_REFRESHED=1
+      return 0
+    fi
+
+    sleep 2
+  done
+
+  warn "LoadBalancer address was not assigned within timeout; keeping PORTAL_URL=$PORTAL_URL"
 }
 
 if [ -z "$INSTALL_GITHUB_RUNNER" ]; then
@@ -950,12 +1037,13 @@ fi
 
 if requires_manifests_apply; then
   log "applying Kubernetes resources"
-  k3s kubectl apply -f "$MANIFEST_DIR/configmap.yaml"
+  apply_runtime_configmap
   k3s kubectl apply -f "$MANIFEST_DIR/pvc.yaml"
 
   if [ "$DEPLOY_MODE" = "full" ] || [ "$DEPLOY_MODE" = "app" ] || [ "$DEPLOY_MODE" = "manifests" ]; then
     k3s kubectl apply -f "$MANIFEST_DIR/deployment.yaml"
     k3s kubectl apply -f "$MANIFEST_DIR/service.yaml"
+    resolve_portal_url_from_service
     if [ "$INGRESS_ENABLED" = "1" ]; then
       k3s kubectl apply -f "$MANIFEST_DIR/ingress.yaml"
     else
@@ -965,6 +1053,12 @@ if requires_manifests_apply; then
 
   if [ "$DEPLOY_MODE" = "full" ] || [ "$DEPLOY_MODE" = "monitor" ] || [ "$DEPLOY_MODE" = "manifests" ]; then
     k3s kubectl apply -f "$MANIFEST_DIR/deployment-monitor.yaml"
+  fi
+
+  if [ "${PORTAL_URL_CONFIG_REFRESHED:-0}" = "1" ]; then
+    log "restarting deployments to pick up refreshed PORTAL_URL ConfigMap"
+    restart_deployment_if_exists otp-relay
+    restart_deployment_if_exists otp-monitor
   fi
 fi
 
@@ -1021,10 +1115,10 @@ cat <<EOF_DONE
 
 OTP Relay Kubernetes deployment complete.
 
-Portal URL:   http://$SERVER_IP/
+Portal URL:   $PORTAL_URL/
 NodePort URL: http://$SERVER_IP:$SERVICE_NODE_PORT/
 Service type: $SERVICE_TYPE
-LoadBalancer: ${LOADBALANCER_IP:-auto/none}
+LoadBalancer: ${ASSIGNED_LOADBALANCER_ADDRESS:-${LOADBALANCER_IP:-auto/none}}
 MetalLB:      install=$INSTALL_METALLB range=${METALLB_IP_RANGE:-none}
 Namespace:    $NAMESPACE
 Repo path:    $INSTALL_DIR
