@@ -315,3 +315,7 @@ frontend/help/
 ```
 
 After deployment, the installer checks that `/opt/otp-relay-k8s` is clean.
+
+## Deployment source of truth
+
+The GitHub repository is the source of truth for deployment assets. The installer builds images from `k8s/Dockerfile` and `k8s/Dockerfile.monitor`, and it stages `k8s/manifests/*.yaml` into a temporary render directory before applying runtime values such as service type, PVC size/storage class, node selectors, and portal URL. Do not edit generated files under `/tmp` or `/opt/otp-relay-k8s` during deployment; commit changes to the repo files instead.

@@ -20,15 +20,13 @@ FROM python:3.12-slim AS python-builder
 
 WORKDIR /build
 
-COPY main.py .
+COPY requirements.txt .
 
 RUN python -m venv /build/venv && \
-    /build/venv/bin/pip install --no-cache-dir \
-    fastapi \
-    uvicorn \
-    openpyxl \
-    python-dotenv \
-    python-multipart
+    /build/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    /build/venv/bin/pip install --no-cache-dir -r requirements.txt
+
+COPY main.py .
 
 # ── Stage 3: runtime ──────────────────────────────────────────────────────────
 FROM python:3.12-slim AS runtime

@@ -56,3 +56,7 @@ REPLICA_COUNT=1
 ```
 
 Choose a MetalLB IP range that is outside DHCP and unused on the LAN.
+
+## GitHub source of truth
+
+Phase 2 deployments use the committed Dockerfiles and manifests as source. The installer only stages and renders runtime values before applying them to K3s. For MetalLB auto-assignment, keep `LOADBALANCER_IP=` blank and read the assigned IP from the `otp-relay` Service.

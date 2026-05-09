@@ -19,4 +19,6 @@ data:
   PHONE_OFFLINE_THRESHOLD: "2"
   BATCH_WINDOW_SEC: "10"
   ALERT_LEVEL: "error"
-  SERVER_HOSTNAME: "srvk3s01.init-db.lan"
+  SERVER_HOSTNAME: "otp-relay-k8s"
+  SERVER_IP: "127.0.0.1"
+  PORTAL_URL: "http://127.0.0.1"

@@ -396,6 +396,62 @@ check_loadbalancer_prereqs() {
 }
 
 apply_runtime_configmap() {
+  if [ -n "${MANIFEST_DIR:-}" ] && [ -f "$MANIFEST_DIR/configmap.yaml" ]; then
+    MANIFEST_DIR="$MANIFEST_DIR" \
+    NAMESPACE="$NAMESPACE" \
+    PHONE_IP="$PHONE_IP" \
+    PHONE_INTERFACE="$PHONE_INTERFACE" \
+    PHONE_PING_INTERVAL="$PHONE_PING_INTERVAL" \
+    PHONE_OFFLINE_THRESHOLD="$PHONE_OFFLINE_THRESHOLD" \
+    BATCH_WINDOW_SEC="$BATCH_WINDOW_SEC" \
+    ALERT_LEVEL="$ALERT_LEVEL" \
+    SERVER_HOSTNAME="$SERVER_HOSTNAME" \
+    SERVER_IP="$SERVER_IP" \
+    PORTAL_URL="$PORTAL_URL" \
+    python3 - <<'PY_RUNTIME_CONFIGMAP'
+import os
+import re
+from pathlib import Path
+
+path = Path(os.environ["MANIFEST_DIR"]) / "configmap.yaml"
+text = path.read_text(encoding="utf-8")
+text = re.sub(r"(\n  namespace: )otp-relay(\n)", rf"\g<1>{os.environ['NAMESPACE']}\2", text)
+
+def set_data_value(payload: str, key: str, value: str) -> str:
+    escaped = value.replace('"', '\\"')
+    line = f'  {key}: "{escaped}"'
+    pattern = rf"^  {re.escape(key)}: .*?$"
+    if re.search(pattern, payload, flags=re.MULTILINE):
+        return re.sub(pattern, line, payload, flags=re.MULTILINE)
+    if not payload.endswith("\n"):
+        payload += "\n"
+    return payload + line + "\n"
+
+for key, value in {
+    "CLAIM_EXPIRY_SEC": "90",
+    "OTP_DISPLAY_SEC": "285",
+    "CONCURRENT_RISK_SEC": "30",
+    "OTP_RELAY_DATA_DIR": "/app/data",
+    "USERS_EXCEL_PATH": "/app/data/users.xlsx",
+    "AUDIT_LOG_PATH": "/app/data/audit.log",
+    "PHONE_IP": os.environ["PHONE_IP"],
+    "PHONE_INTERFACE": os.environ["PHONE_INTERFACE"],
+    "PHONE_PING_INTERVAL": os.environ["PHONE_PING_INTERVAL"],
+    "PHONE_OFFLINE_THRESHOLD": os.environ["PHONE_OFFLINE_THRESHOLD"],
+    "BATCH_WINDOW_SEC": os.environ["BATCH_WINDOW_SEC"],
+    "ALERT_LEVEL": os.environ["ALERT_LEVEL"],
+    "SERVER_HOSTNAME": os.environ["SERVER_HOSTNAME"],
+    "SERVER_IP": os.environ["SERVER_IP"],
+    "PORTAL_URL": os.environ["PORTAL_URL"],
+}.items():
+    text = set_data_value(text, key, value)
+
+path.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+PY_RUNTIME_CONFIGMAP
+    k3s kubectl apply -f "$MANIFEST_DIR/configmap.yaml"
+    return 0
+  fi
+
   k3s kubectl create configmap otp-relay-config \
     --namespace "$NAMESPACE" \
     --from-literal=CLAIM_EXPIRY_SEC="90" \
@@ -415,7 +471,6 @@ apply_runtime_configmap() {
     --from-literal=PORTAL_URL="$PORTAL_URL" \
     --dry-run=client -o yaml | k3s kubectl apply -f -
 }
-
 restart_deployment_if_exists() {
   deployment_name="$1"
   if k3s kubectl get deployment "$deployment_name" -n "$NAMESPACE" >/dev/null 2>&1; then
@@ -608,6 +663,12 @@ log "checking required source files"
 [ -f frontend/index.html ] || fatal "frontend/index.html is missing"
 [ -f frontend/app.jsx ] || fatal "frontend/app.jsx source is missing"
 [ -f frontend/style.css ] || fatal "frontend/style.css is missing"
+[ -f k8s/Dockerfile ] || fatal "k8s/Dockerfile is missing"
+[ -f k8s/Dockerfile.monitor ] || fatal "k8s/Dockerfile.monitor is missing"
+[ -d k8s/manifests ] || fatal "k8s/manifests directory is missing"
+for required_manifest in namespace.yaml pvc.yaml deployment.yaml service.yaml deployment-monitor.yaml; do
+  [ -f "k8s/manifests/$required_manifest" ] || fatal "k8s/manifests/$required_manifest is missing"
+done
 [ -f scripts/build_help_docs.py ] || fatal "required help-doc builder is missing: scripts/build_help_docs.py"
 [ -d docs/help ] || fatal "required help-doc input directory is missing: docs/help"
 
@@ -644,11 +705,12 @@ else
   log "DEPLOY_MODE=$DEPLOY_MODE does not require app help-doc build; skipping installer venv"
 fi
 
-log "writing generated Docker and Kubernetes assets to a temporary deployment directory"
+log "staging repository Dockerfiles and Kubernetes manifests for deployment"
 GENERATED_DIR="$(mktemp -d /tmp/otp-relay-k8s.XXXXXX)"
+SOURCE_MANIFEST_DIR="k8s/manifests"
 MANIFEST_DIR="$GENERATED_DIR/manifests"
-APP_DOCKERFILE="$GENERATED_DIR/Dockerfile"
-MONITOR_DOCKERFILE="$GENERATED_DIR/Dockerfile.monitor"
+APP_DOCKERFILE="k8s/Dockerfile"
+MONITOR_DOCKERFILE="k8s/Dockerfile.monitor"
 
 cleanup_generated_assets() {
   rm -rf "$GENERATED_DIR"
@@ -656,85 +718,8 @@ cleanup_generated_assets() {
 trap cleanup_generated_assets EXIT
 
 mkdir -p "$MANIFEST_DIR"
-
-cat > "$APP_DOCKERFILE" <<'DOCKER'
-FROM python:3.12-slim AS runtime
-WORKDIR /app
-COPY requirements.txt .
-RUN useradd --system --uid 999 --no-create-home --shell /usr/sbin/nologin otprelay \
-  && python -m venv /app/venv \
-  && /app/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
-  && /app/venv/bin/pip install --no-cache-dir -r requirements.txt \
-  && mkdir -p /app/data \
-  && chown -R otprelay:otprelay /app
-COPY main.py .
-COPY frontend/ ./frontend/
-COPY docs/ ./docs/
-RUN test -f /app/frontend/app.js \
-  && rm -f /app/frontend/app.jsx \
-  && chown -R otprelay:otprelay /app
-USER otprelay
-ENV OTP_RELAY_DATA_DIR=/app/data \
-    USERS_EXCEL_PATH=/app/data/users.xlsx \
-    AUDIT_LOG_PATH=/app/data/audit.log
-EXPOSE 8000
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD /app/venv/bin/python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz')"
-CMD ["/app/venv/bin/python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
-DOCKER
-
-cat > "$MONITOR_DOCKERFILE" <<'DOCKER'
-FROM python:3.12-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends iputils-arping \
-  && rm -rf /var/lib/apt/lists/* \
-  && useradd --system --uid 999 --no-create-home --shell /usr/sbin/nologin otprelay \
-  && python -m venv /app/venv \
-  && /app/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
-  && /app/venv/bin/pip install --no-cache-dir -r requirements.txt \
-  && mkdir -p /app/data \
-  && chown -R otprelay:otprelay /app
-COPY monitor.py .
-USER otprelay
-ENV OTP_RELAY_DATA_DIR=/app/data
-CMD ["/app/venv/bin/python", "monitor.py"]
-DOCKER
-
-cat > "$MANIFEST_DIR/namespace.yaml" <<EOF_NS
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: $NAMESPACE
-EOF_NS
-
-cat > "$MANIFEST_DIR/configmap.yaml" <<EOF_CM
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: otp-relay-config
-  namespace: $NAMESPACE
-data:
-  # App runtime
-  CLAIM_EXPIRY_SEC: "90"
-  OTP_DISPLAY_SEC: "285"
-  CONCURRENT_RISK_SEC: "30"
-  OTP_RELAY_DATA_DIR: "/app/data"
-  USERS_EXCEL_PATH: "/app/data/users.xlsx"
-  AUDIT_LOG_PATH: "/app/data/audit.log"
-
-  # Monitor runtime. monitor.py is a required component.
-  PHONE_IP: "$PHONE_IP"
-  PHONE_INTERFACE: "$PHONE_INTERFACE"
-  PHONE_PING_INTERVAL: "$PHONE_PING_INTERVAL"
-  PHONE_OFFLINE_THRESHOLD: "$PHONE_OFFLINE_THRESHOLD"
-  BATCH_WINDOW_SEC: "$BATCH_WINDOW_SEC"
-  ALERT_LEVEL: "$ALERT_LEVEL"
-  SERVER_HOSTNAME: "$SERVER_HOSTNAME"
-  SERVER_IP: "$SERVER_IP"
-  PORTAL_URL: "$PORTAL_URL"
-EOF_CM
+cp "$SOURCE_MANIFEST_DIR"/*.yaml "$MANIFEST_DIR"/
+rm -f "$MANIFEST_DIR/secret-example.env"
 
 existing_pvc_storage_class="$(
   k3s kubectl get pvc otp-relay-data \
@@ -754,233 +739,155 @@ if [ -n "$existing_pvc_storage_class" ] \
   fatal "PVC otp-relay-data already exists with storageClassName=$existing_pvc_storage_class; refusing to change immutable storageClassName to $PVC_STORAGE_CLASS"
 fi
 
-cat > "$MANIFEST_DIR/pvc.yaml" <<EOF_PVC
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: otp-relay-data
-  namespace: $NAMESPACE
-  labels:
-    app: otp-relay
-spec:
-  accessModes:
-    - ReadWriteOnce
-EOF_PVC
-if [ -n "$PVC_STORAGE_CLASS" ]; then
-  cat >> "$MANIFEST_DIR/pvc.yaml" <<EOF_PVC_STORAGE
-  storageClassName: $PVC_STORAGE_CLASS
-EOF_PVC_STORAGE
-fi
-cat >> "$MANIFEST_DIR/pvc.yaml" <<EOF_PVC_SPEC
-  resources:
-    requests:
-      storage: $PVC_SIZE
-EOF_PVC_SPEC
+log "rendering runtime values into staged repository manifests"
+MANIFEST_DIR="$MANIFEST_DIR" \
+NAMESPACE="$NAMESPACE" \
+APP_IMAGE="$APP_IMAGE" \
+MONITOR_IMAGE="$MONITOR_IMAGE" \
+SERVICE_TYPE="$SERVICE_TYPE" \
+SERVICE_NODE_PORT="$SERVICE_NODE_PORT" \
+LOADBALANCER_IP="$LOADBALANCER_IP" \
+PVC_STORAGE_CLASS="$PVC_STORAGE_CLASS" \
+PVC_SIZE="$PVC_SIZE" \
+REPLICA_COUNT="$REPLICA_COUNT" \
+APP_NODE_SELECTOR_KEY="$APP_NODE_SELECTOR_KEY" \
+APP_NODE_SELECTOR_VALUE="$APP_NODE_SELECTOR_VALUE" \
+MONITOR_NODE_SELECTOR_KEY="$MONITOR_NODE_SELECTOR_KEY" \
+MONITOR_NODE_SELECTOR_VALUE="$MONITOR_NODE_SELECTOR_VALUE" \
+PHONE_IP="$PHONE_IP" \
+PHONE_INTERFACE="$PHONE_INTERFACE" \
+PHONE_PING_INTERVAL="$PHONE_PING_INTERVAL" \
+PHONE_OFFLINE_THRESHOLD="$PHONE_OFFLINE_THRESHOLD" \
+BATCH_WINDOW_SEC="$BATCH_WINDOW_SEC" \
+ALERT_LEVEL="$ALERT_LEVEL" \
+SERVER_HOSTNAME="$SERVER_HOSTNAME" \
+SERVER_IP="$SERVER_IP" \
+PORTAL_URL="$PORTAL_URL" \
+python3 - <<'PY_RENDER_MANIFESTS'
+import os
+import re
+from pathlib import Path
 
-cat > "$MANIFEST_DIR/deployment.yaml" <<EOF_DEPLOY
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: otp-relay
-  namespace: $NAMESPACE
-  labels:
-    app: otp-relay
-spec:
-  replicas: $REPLICA_COUNT
-  selector:
-    matchLabels:
-      app: otp-relay
-  strategy:
-    type: Recreate
-  template:
-    metadata:
-      labels:
-        app: otp-relay
-    spec:
-EOF_DEPLOY
-if [ -n "$APP_NODE_SELECTOR_KEY" ]; then
-  cat >> "$MANIFEST_DIR/deployment.yaml" <<EOF_DEPLOY_NODE
-      nodeSelector:
-        $APP_NODE_SELECTOR_KEY: "$APP_NODE_SELECTOR_VALUE"
-EOF_DEPLOY_NODE
-fi
-cat >> "$MANIFEST_DIR/deployment.yaml" <<EOF_DEPLOY_REST
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 999
-        fsGroup: 999
-      containers:
-        - name: app
-          image: $APP_IMAGE
-          imagePullPolicy: IfNotPresent
-          ports:
-            - containerPort: 8000
-          envFrom:
-            - configMapRef:
-                name: otp-relay-config
-          env:
-            - name: SMS_SECRET_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: otp-relay-secrets
-                  key: SMS_SECRET_TOKEN
-          resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 500m
-              memory: 256Mi
-          readinessProbe:
-            httpGet:
-              path: /readyz
-              port: 8000
-            initialDelaySeconds: 10
-            periodSeconds: 10
-          livenessProbe:
-            httpGet:
-              path: /healthz
-              port: 8000
-            initialDelaySeconds: 20
-            periodSeconds: 30
-          volumeMounts:
-            - name: data
-              mountPath: /app/data
-      volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: otp-relay-data
-EOF_DEPLOY_REST
+manifest_dir = Path(os.environ["MANIFEST_DIR"])
+namespace = os.environ["NAMESPACE"]
 
-cat > "$MANIFEST_DIR/service.yaml" <<EOF_SVC
-apiVersion: v1
-kind: Service
-metadata:
-  name: otp-relay
-  namespace: $NAMESPACE
-  labels:
-    app: otp-relay
-spec:
-  type: $SERVICE_TYPE
-EOF_SVC
-if [ "$SERVICE_TYPE" = "LoadBalancer" ] && [ -n "$LOADBALANCER_IP" ]; then
-  cat >> "$MANIFEST_DIR/service.yaml" <<EOF_SVC_LB
-  loadBalancerIP: $LOADBALANCER_IP
-EOF_SVC_LB
-fi
-cat >> "$MANIFEST_DIR/service.yaml" <<EOF_SVC_SPEC
-  selector:
-    app: otp-relay
-  ports:
-    - name: http
-      port: 80
-      targetPort: 8000
-EOF_SVC_SPEC
-if [ "$SERVICE_TYPE" = "NodePort" ]; then
-  cat >> "$MANIFEST_DIR/service.yaml" <<EOF_SVC_NODEPORT
-      nodePort: $SERVICE_NODE_PORT
-EOF_SVC_NODEPORT
-fi
-cat >> "$MANIFEST_DIR/service.yaml" <<EOF_SVC_END
-      protocol: TCP
-EOF_SVC_END
 
-if [ "$INGRESS_ENABLED" = "1" ]; then
-cat > "$MANIFEST_DIR/ingress.yaml" <<EOF_ING
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: otp-relay
-  namespace: $NAMESPACE
-spec:
-  ingressClassName: traefik
-  rules:
-    - http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: otp-relay
-                port:
-                  number: 80
-EOF_ING
-fi
+def read(name: str) -> str:
+    return (manifest_dir / name).read_text(encoding="utf-8")
 
-cat > "$MANIFEST_DIR/deployment-monitor.yaml" <<EOF_MON
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: otp-monitor
-  namespace: $NAMESPACE
-  labels:
-    app: otp-monitor
-spec:
-  replicas: $REPLICA_COUNT
-  selector:
-    matchLabels:
-      app: otp-monitor
-  strategy:
-    type: Recreate
-  template:
-    metadata:
-      labels:
-        app: otp-monitor
-    spec:
-EOF_MON
-if [ -n "$MONITOR_NODE_SELECTOR_KEY" ]; then
-  cat >> "$MANIFEST_DIR/deployment-monitor.yaml" <<EOF_MON_NODE
-      nodeSelector:
-        $MONITOR_NODE_SELECTOR_KEY: "$MONITOR_NODE_SELECTOR_VALUE"
-EOF_MON_NODE
-fi
-cat >> "$MANIFEST_DIR/deployment-monitor.yaml" <<EOF_MON_REST
-      hostNetwork: true
-      dnsPolicy: ClusterFirstWithHostNet
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 999
-        fsGroup: 999
-      containers:
-        - name: monitor
-          image: $MONITOR_IMAGE
-          imagePullPolicy: IfNotPresent
-          envFrom:
-            - configMapRef:
-                name: otp-relay-config
-          env:
-            - name: WHATSAPP_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: otp-relay-secrets
-                  key: WHATSAPP_API_KEY
-            - name: WHATSAPP_RECIPIENT
-              valueFrom:
-                secretKeyRef:
-                  name: otp-relay-secrets
-                  key: WHATSAPP_RECIPIENT
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
-              add:
-                - NET_RAW
-          resources:
-            requests:
-              cpu: 50m
-              memory: 64Mi
-            limits:
-              cpu: 200m
-              memory: 128Mi
-          volumeMounts:
-            - name: data
-              mountPath: /app/data
-      volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: otp-relay-data
-EOF_MON_REST
+
+def write(name: str, text: str) -> None:
+    (manifest_dir / name).write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+
+
+def replace_namespace(text: str) -> str:
+    text = re.sub(r"(\n  namespace: )otp-relay(\n)", rf"\g<1>{namespace}\2", text)
+    return text
+
+
+def set_data_value(text: str, key: str, value: str) -> str:
+    escaped = value.replace('"', '\\"')
+    line = f'  {key}: "{escaped}"'
+    pattern = rf"^  {re.escape(key)}: .*?$"
+    if re.search(pattern, text, flags=re.MULTILINE):
+        return re.sub(pattern, line, text, flags=re.MULTILINE)
+    if not text.endswith("\n"):
+        text += "\n"
+    return text + line + "\n"
+
+
+def set_replicas(text: str) -> str:
+    return re.sub(r"^  replicas: .*$", f"  replicas: {os.environ['REPLICA_COUNT']}", text, flags=re.MULTILINE)
+
+
+def set_recreate_strategy(text: str) -> str:
+    return re.sub(r"  strategy:\n(?:    .*\n)+?  template:", "  strategy:\n    type: Recreate\n  template:", text)
+
+
+def set_first_image(text: str, image: str) -> str:
+    return re.sub(r"(\n\s*image: ).*", rf"\g<1>{image}", text, count=1)
+
+
+def remove_nodesel(text: str) -> str:
+    return re.sub(r"\n      nodeSelector:\n(?:        .+\n)+", "\n", text)
+
+
+def add_nodesel(text: str, key: str, value: str) -> str:
+    text = remove_nodesel(text)
+    if not key:
+        return text
+    block = f"      nodeSelector:\n        {key}: \"{value}\"\n"
+    return text.replace("    spec:\n", "    spec:\n" + block, 1)
+
+# Namespace
+if (manifest_dir / "namespace.yaml").exists():
+    write("namespace.yaml", f"apiVersion: v1\nkind: Namespace\nmetadata:\n  name: {namespace}\n")
+
+# ConfigMap remains a repo manifest, rendered here for dry-run/reference. Live ConfigMap is applied by apply_runtime_configmap.
+if (manifest_dir / "configmap.yaml").exists():
+    text = replace_namespace(read("configmap.yaml"))
+    for key in [
+        "CLAIM_EXPIRY_SEC", "OTP_DISPLAY_SEC", "CONCURRENT_RISK_SEC",
+        "OTP_RELAY_DATA_DIR", "USERS_EXCEL_PATH", "AUDIT_LOG_PATH",
+        "PHONE_IP", "PHONE_INTERFACE", "PHONE_PING_INTERVAL", "PHONE_OFFLINE_THRESHOLD",
+        "BATCH_WINDOW_SEC", "ALERT_LEVEL", "SERVER_HOSTNAME", "SERVER_IP", "PORTAL_URL",
+    ]:
+        defaults = {
+            "CLAIM_EXPIRY_SEC": "90",
+            "OTP_DISPLAY_SEC": "285",
+            "CONCURRENT_RISK_SEC": "30",
+            "OTP_RELAY_DATA_DIR": "/app/data",
+            "USERS_EXCEL_PATH": "/app/data/users.xlsx",
+            "AUDIT_LOG_PATH": "/app/data/audit.log",
+        }
+        text = set_data_value(text, key, os.environ.get(key, defaults.get(key, "")))
+    write("configmap.yaml", text)
+
+# PVC
+if (manifest_dir / "pvc.yaml").exists():
+    text = replace_namespace(read("pvc.yaml"))
+    text = re.sub(r"\n  storageClassName: .*", "", text)
+    storage_class = os.environ.get("PVC_STORAGE_CLASS", "")
+    if storage_class:
+        text = text.replace("  accessModes:\n", f"  storageClassName: {storage_class}\n  accessModes:\n", 1)
+    text = re.sub(r"(\n      storage: ).*", rf"\g<1>{os.environ['PVC_SIZE']}", text)
+    write("pvc.yaml", text)
+
+# App deployment
+if (manifest_dir / "deployment.yaml").exists():
+    text = replace_namespace(read("deployment.yaml"))
+    text = set_replicas(text)
+    text = set_recreate_strategy(text)
+    text = set_first_image(text, os.environ["APP_IMAGE"])
+    text = add_nodesel(text, os.environ.get("APP_NODE_SELECTOR_KEY", ""), os.environ.get("APP_NODE_SELECTOR_VALUE", ""))
+    write("deployment.yaml", text)
+
+# Monitor deployment
+if (manifest_dir / "deployment-monitor.yaml").exists():
+    text = replace_namespace(read("deployment-monitor.yaml"))
+    text = set_replicas(text)
+    text = set_recreate_strategy(text)
+    text = set_first_image(text, os.environ["MONITOR_IMAGE"])
+    text = add_nodesel(text, os.environ.get("MONITOR_NODE_SELECTOR_KEY", ""), os.environ.get("MONITOR_NODE_SELECTOR_VALUE", ""))
+    write("deployment-monitor.yaml", text)
+
+# Service
+if (manifest_dir / "service.yaml").exists():
+    text = replace_namespace(read("service.yaml"))
+    text = re.sub(r"^  type: .*$", f"  type: {os.environ['SERVICE_TYPE']}", text, flags=re.MULTILINE)
+    text = re.sub(r"\n  loadBalancerIP: .*", "", text)
+    text = re.sub(r"\n      nodePort: .*", "", text)
+    if os.environ["SERVICE_TYPE"] == "LoadBalancer" and os.environ.get("LOADBALANCER_IP"):
+        text = text.replace(f"  type: {os.environ['SERVICE_TYPE']}\n", f"  type: {os.environ['SERVICE_TYPE']}\n  loadBalancerIP: {os.environ['LOADBALANCER_IP']}\n", 1)
+    if os.environ["SERVICE_TYPE"] == "NodePort":
+        text = text.replace("      targetPort: 8000\n", f"      targetPort: 8000\n      nodePort: {os.environ['SERVICE_NODE_PORT']}\n", 1)
+    write("service.yaml", text)
+
+# Ingress
+if (manifest_dir / "ingress.yaml").exists():
+    text = replace_namespace(read("ingress.yaml"))
+    write("ingress.yaml", text)
+PY_RENDER_MANIFESTS
 
 log "validating Python syntax and Kubernetes manifests"
 if requires_app_image; then
@@ -997,7 +904,7 @@ k3s kubectl apply --dry-run=client \
   -f "$MANIFEST_DIR/deployment.yaml" \
   -f "$MANIFEST_DIR/service.yaml" \
   -f "$MANIFEST_DIR/deployment-monitor.yaml" >/dev/null
-if [ "$INGRESS_ENABLED" = "1" ]; then
+if [ "$INGRESS_ENABLED" = "1" ] && [ -f "$MANIFEST_DIR/ingress.yaml" ]; then
   k3s kubectl apply --dry-run=client -f "$MANIFEST_DIR/ingress.yaml" >/dev/null
 fi
 
@@ -1044,7 +951,7 @@ if requires_manifests_apply; then
     k3s kubectl apply -f "$MANIFEST_DIR/deployment.yaml"
     k3s kubectl apply -f "$MANIFEST_DIR/service.yaml"
     resolve_portal_url_from_service
-    if [ "$INGRESS_ENABLED" = "1" ]; then
+    if [ "$INGRESS_ENABLED" = "1" ] && [ -f "$MANIFEST_DIR/ingress.yaml" ]; then
       k3s kubectl apply -f "$MANIFEST_DIR/ingress.yaml"
     else
       k3s kubectl delete ingress otp-relay -n "$NAMESPACE" --ignore-not-found=true
