@@ -26,7 +26,7 @@ on:
       ingress_enabled:
         description: "Enable Traefik ingress"
         required: true
-        default: "1"
+        default: "0"
         type: choice
         options:
           - "1"
@@ -209,7 +209,7 @@ jobs:
           # Default single-server mode. Manual workflow runs can override these inputs.
           SERVICE_TYPE: ${{ github.event.inputs.service_type || 'LoadBalancer' }}
           SERVICE_NODE_PORT: "30080"
-          INGRESS_ENABLED: ${{ github.event.inputs.ingress_enabled || '1' }}
+          INGRESS_ENABLED: ${{ github.event.inputs.ingress_enabled || '0' }}
           LOADBALANCER_IP: ${{ github.event.inputs.loadbalancer_ip || '' }}
           INSTALL_METALLB: ${{ github.event.inputs.install_metallb || '0' }}
           REQUIRE_METALLB: ${{ github.event.inputs.require_metallb || '0' }}
