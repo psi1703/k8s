@@ -246,6 +246,25 @@ def _valid_wizard_owner(row: Dict[str, Any], client_secret: Optional[str]) -> bo
     return secrets.compare_digest(stored_hash, _hash_wizard_secret(client_secret))
 
 
+def _bind_wizard_client(row: Dict[str, Any], client_secret: Optional[str]) -> bool:
+    """Silently bind or rebind a wizard record to the current browser client.
+
+    The user token is the durable owner of wizard progress. The client secret is
+    only a background edit marker, so stale PVC/browser state must not block a
+    valid token from continuing its own wizard progress.
+    """
+    if not client_secret or len(client_secret) < WIZARD_CLIENT_SECRET_MIN_LENGTH:
+        raise HTTPException(status_code=401, detail="Wizard client secret required")
+
+    current_hash = _hash_wizard_secret(client_secret)
+    if secrets.compare_digest(str(row.get("client_secret_hash") or ""), current_hash):
+        return False
+
+    row["client_secret_hash"] = current_hash
+    row["client_bound_at"] = _now_iso()
+    return True
+
+
 def _public_wizard_record(row: Dict[str, Any]) -> Dict[str, Any]:
     public = dict(row)
     public.pop("client_secret_hash", None)
@@ -874,17 +893,14 @@ async def wizard_progress_save(
         existing = db.get(token, {})
 
         if not is_admin:
-            if not existing.get("client_secret_hash"):
-                if not x_wizard_client or len(x_wizard_client) < WIZARD_CLIENT_SECRET_MIN_LENGTH:
-                    raise HTTPException(status_code=401, detail="Wizard client secret required")
-                existing["client_secret_hash"] = _hash_wizard_secret(x_wizard_client)
-            elif not _valid_wizard_owner(existing, x_wizard_client):
-                raise HTTPException(status_code=403, detail="Wizard record belongs to another client")
+            _bind_wizard_client(existing, x_wizard_client)
 
         row = _model_dump(payload)
         row["token"] = token
         row["updated_at"] = _now_iso()
         row["client_secret_hash"] = existing.get("client_secret_hash")
+        if existing.get("client_bound_at"):
+            row["client_bound_at"] = existing.get("client_bound_at")
         db[token] = row
         _save_wizard_db(db)
 
@@ -916,16 +932,18 @@ async def wizard_progress_get(
         if not row:
             row = _default_wizard_record(token)
             if not is_admin:
-                if not x_wizard_client or len(x_wizard_client) < WIZARD_CLIENT_SECRET_MIN_LENGTH:
-                    raise HTTPException(status_code=401, detail="Wizard client secret required")
-                row["client_secret_hash"] = _hash_wizard_secret(x_wizard_client)
+                _bind_wizard_client(row, x_wizard_client)
                 row["updated_at"] = _now_iso()
                 db[token] = row
                 _save_wizard_db(db)
             return _public_wizard_record(row)
 
-        if not is_admin and not _valid_wizard_owner(row, x_wizard_client):
-            raise HTTPException(status_code=403, detail="Wizard record belongs to another client")
+        if not is_admin:
+            changed = _bind_wizard_client(row, x_wizard_client)
+            if changed:
+                row["updated_at"] = _now_iso()
+                db[token] = row
+                _save_wizard_db(db)
 
         return _public_wizard_record(row)
 
