@@ -649,6 +649,24 @@ data:
   PORTAL_URL: "$PORTAL_URL"
 EOF_CM
 
+existing_pvc_storage_class="$(
+  k3s kubectl get pvc otp-relay-data \
+    -n "$NAMESPACE" \
+    -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true
+)"
+existing_pvc_storage_class="$(printf '%s' "$existing_pvc_storage_class" | xargs)"
+
+if [ -n "$existing_pvc_storage_class" ] && [ -z "$PVC_STORAGE_CLASS" ]; then
+  warn "PVC otp-relay-data already exists with storageClassName=$existing_pvc_storage_class; preserving it"
+  PVC_STORAGE_CLASS="$existing_pvc_storage_class"
+fi
+
+if [ -n "$existing_pvc_storage_class" ] \
+  && [ -n "$PVC_STORAGE_CLASS" ] \
+  && [ "$PVC_STORAGE_CLASS" != "$existing_pvc_storage_class" ]; then
+  fatal "PVC otp-relay-data already exists with storageClassName=$existing_pvc_storage_class; refusing to change immutable storageClassName to $PVC_STORAGE_CLASS"
+fi
+
 cat > "$MANIFEST_DIR/pvc.yaml" <<EOF_PVC
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -658,6 +676,8 @@ metadata:
   labels:
     app: otp-relay
 spec:
+  accessModes:
+    - ReadWriteOnce
 EOF_PVC
 if [ -n "$PVC_STORAGE_CLASS" ]; then
   cat >> "$MANIFEST_DIR/pvc.yaml" <<EOF_PVC_STORAGE
@@ -665,8 +685,6 @@ if [ -n "$PVC_STORAGE_CLASS" ]; then
 EOF_PVC_STORAGE
 fi
 cat >> "$MANIFEST_DIR/pvc.yaml" <<EOF_PVC_SPEC
-  accessModes:
-    - ReadWriteOnce
   resources:
     requests:
       storage: $PVC_SIZE
