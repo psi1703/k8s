@@ -26,6 +26,11 @@ from typing import Any, Dict, List, Optional
 import bcrypt
 import openpyxl
 from dotenv import load_dotenv
+
+try:
+    import redis
+except ImportError:
+    redis = None
 from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -77,6 +82,8 @@ CONCURRENT_RISK_SEC = int(os.getenv("CONCURRENT_RISK_SEC", "30"))
 USERS_EXCEL_PATH = str(_resolve_runtime_path(os.getenv("USERS_EXCEL_PATH", "data/users.xlsx")))
 USERS_EXCEL_MAX_BYTES = int(os.getenv("USERS_EXCEL_MAX_BYTES", str(5 * 1024 * 1024)))
 AUDIT_LOG_PATH = str(_resolve_runtime_path(os.getenv("AUDIT_LOG_PATH", "data/audit.log")))
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+REDIS_REQUIRED = os.getenv("REDIS_REQUIRED", "0").strip() == "1"
 
 # -- State --------------------------------------------------------------------
 users: Dict[str, Dict[str, str]] = {}
@@ -92,6 +99,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
 logger = logging.getLogger("otp-relay")
+redis_client = None
 
 # -- Server-backed wizard/admin state -----------------------------------------
 DATA_DIR = _resolve_runtime_path(os.environ.get("OTP_RELAY_DATA_DIR", "data"))
@@ -116,6 +124,58 @@ def _utcnow_naive() -> datetime:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _redis_enabled() -> bool:
+    return bool(REDIS_URL)
+
+
+def _init_redis_client() -> None:
+    global redis_client
+
+    if not REDIS_URL:
+        redis_client = None
+        logger.info("Redis disabled; using in-memory runtime state")
+        return
+
+    if redis is None:
+        redis_client = None
+        message = "REDIS_URL is set but redis package is not installed"
+        if REDIS_REQUIRED:
+            raise RuntimeError(message)
+        logger.warning(message)
+        return
+
+    redis_client = redis.Redis.from_url(
+        REDIS_URL,
+        decode_responses=True,
+        socket_connect_timeout=2,
+        socket_timeout=2,
+        health_check_interval=30,
+    )
+
+    try:
+        redis_client.ping()
+        logger.info("Redis connected: %s", REDIS_URL)
+    except Exception as exc:
+        redis_client = None
+        if REDIS_REQUIRED:
+            raise RuntimeError(f"Redis is required but not reachable: {exc}") from exc
+        logger.warning("Redis not reachable; continuing with in-memory runtime state: %s", exc)
+
+
+def _redis_status() -> str:
+    if not REDIS_URL:
+        return "disabled"
+
+    if redis_client is None:
+        return "unavailable"
+
+    try:
+        redis_client.ping()
+        return "ok"
+    except Exception:
+        return "error"
 
 
 def _ensure_data_dir() -> None:
@@ -497,6 +557,7 @@ async def background_purge() -> None:
 @app.on_event("startup")
 async def startup() -> None:
     _ensure_data_dir()
+    _init_redis_client()
     if os.path.exists(USERS_EXCEL_PATH):
         count = load_users_from_excel(USERS_EXCEL_PATH)
         audit("server_start", detail=f"{count} users loaded")
@@ -513,7 +574,24 @@ async def healthz():
 
 @app.get("/readyz")
 async def readyz():
-    return {"status": "ok", "users_loaded": len(users)}
+    redis_status = _redis_status()
+
+    if REDIS_REQUIRED and redis_status != "ok":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "not_ready",
+                "users_loaded": len(users),
+                "redis": redis_status,
+            },
+        )
+
+    return {
+        "status": "ok",
+        "users_loaded": len(users),
+        "redis": redis_status,
+        "redis_required": REDIS_REQUIRED,
+    }
 
 
 @app.post("/user/login")
