@@ -68,7 +68,7 @@ on:
         default: ""
         type: string
       pvc_storage_class:
-        description: "Optional PVC storageClassName"
+        description: "Optional PVC storageClassName; use local-path for default K3s storage"
         required: false
         default: "local-path"
         type: string
@@ -220,7 +220,7 @@ jobs:
           APP_NODE_SELECTOR_VALUE: ${{ github.event.inputs.app_node || '' }}
           MONITOR_NODE_SELECTOR_KEY: ${{ github.event.inputs.monitor_node && 'kubernetes.io/hostname' || '' }}
           MONITOR_NODE_SELECTOR_VALUE: ${{ github.event.inputs.monitor_node || '' }}
-          PVC_STORAGE_CLASS: ${{ github.event.inputs.pvc_storage_class || '' }}
+          PVC_STORAGE_CLASS: ${{ github.event.inputs.pvc_storage_class || 'local-path' }}
           PVC_SIZE: ${{ github.event.inputs.pvc_size || '1Gi' }}
 
           NONINTERACTIVE: "1"
