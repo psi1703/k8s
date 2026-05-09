@@ -181,6 +181,8 @@ otp-relay-k8s/
 │   ├── diagrams/
 │   │   ├── phase-map.svg
 │   │   └── phase1-architecture.svg
+│   ├── help/
+│   ├── operations/
 │   └── k8s-plan.md
 ├── frontend/
 │   ├── app.jsx
@@ -202,6 +204,7 @@ otp-relay-k8s/
 ├── scripts/
 │   ├── build_help_docs.py
 │   └── generate_sample_users.py
+├── .dockerignore
 ├── .gitignore
 ├── LICENSE
 ├── README.md
@@ -213,7 +216,22 @@ otp-relay-k8s/
 └── requirements.txt
 ```
 
-Generated files such as `frontend/app.js`, `frontend/help/`, `node_modules/`, and rendered deployment files under `/tmp` are not source files.
+Generated files/directories are not source files and should not be committed:
+
+```text
+__pycache__/
+*.py[cod]
+.installer-venv/
+node_modules/
+frontend/app.js
+frontend/app.raw.js
+frontend/help/
+data/
+*.log
+*.tar
+*.tar.gz
+/tmp/otp-relay-k8s.*
+```
 
 ---
 
