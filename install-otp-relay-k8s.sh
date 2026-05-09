@@ -1,18 +1,34 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Safe one-click installer/update script for psi1703/k8s OTP Relay on Debian-family servers.
-# Installs/updates the portal app and the required monitor pod without touching SSH,
-# CIFS mounts, cron jobs, firewall rules, or unrelated services.
+# Safe one-click installer/update script for psi1703/k8s OTP Relay.
+# Installs/updates the portal app and the required monitor pod.
 #
 # Normal use:
 #   sudo bash install-otp-relay-k8s.sh
 #
 # Installer controls:
 #   REPO_URL, REPO_REF, INSTALL_DIR, NAMESPACE
-#   APP_IMAGE, MONITOR_IMAGE, SERVICE_NODE_PORT, INGRESS_ENABLED
-#   DEPLOY_MODE, GIT_CLEAN, NONINTERACTIVE, SKIP_HELP_DOCS_BUILD
-#   RUNTIME_DATA_DIR
+#   APP_IMAGE, MONITOR_IMAGE, DEPLOY_MODE, GIT_CLEAN, NONINTERACTIVE
+#   SKIP_HELP_DOCS_BUILD, RUNTIME_DATA_DIR
+#
+# Kubernetes topology/exposure controls:
+#   SERVICE_TYPE=NodePort|LoadBalancer
+#   SERVICE_NODE_PORT=30080
+#   LOADBALANCER_IP=172.31.x.x
+#   INGRESS_ENABLED=0|1
+#   PVC_STORAGE_CLASS=<storage-class-name>
+#   PVC_SIZE=1Gi
+#   REPLICA_COUNT=1
+#   APP_NODE_SELECTOR_KEY=kubernetes.io/hostname
+#   APP_NODE_SELECTOR_VALUE=<node-name>
+#   MONITOR_NODE_SELECTOR_KEY=kubernetes.io/hostname
+#   MONITOR_NODE_SELECTOR_VALUE=<node-name>
+#   REQUIRE_METALLB=0|1
+#   INSTALL_METALLB=0|1
+#   METALLB_VERSION=v0.15.3
+#   METALLB_IP_RANGE=172.31.11.120-172.31.11.130
+#   METALLB_POOL_NAME=otp-relay-pool
 #
 # Runtime ConfigMap inputs:
 #   PHONE_IP, PHONE_INTERFACE, PHONE_PING_INTERVAL, PHONE_OFFLINE_THRESHOLD
@@ -41,8 +57,23 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/otp-relay-k8s}"
 NAMESPACE="${NAMESPACE:-otp-relay}"
 APP_IMAGE="${APP_IMAGE:-otp-relay:latest}"
 MONITOR_IMAGE="${MONITOR_IMAGE:-otp-monitor:latest}"
+SERVICE_TYPE="${SERVICE_TYPE:-NodePort}"
 SERVICE_NODE_PORT="${SERVICE_NODE_PORT:-30080}"
+LOADBALANCER_IP="${LOADBALANCER_IP:-}"
 INGRESS_ENABLED="${INGRESS_ENABLED:-1}"
+PVC_STORAGE_CLASS="${PVC_STORAGE_CLASS:-}"
+PVC_SIZE="${PVC_SIZE:-1Gi}"
+REPLICA_COUNT="${REPLICA_COUNT:-1}"
+APP_NODE_SELECTOR_KEY="${APP_NODE_SELECTOR_KEY:-}"
+APP_NODE_SELECTOR_VALUE="${APP_NODE_SELECTOR_VALUE:-}"
+MONITOR_NODE_SELECTOR_KEY="${MONITOR_NODE_SELECTOR_KEY:-}"
+MONITOR_NODE_SELECTOR_VALUE="${MONITOR_NODE_SELECTOR_VALUE:-}"
+REQUIRE_METALLB="${REQUIRE_METALLB:-0}"
+INSTALL_METALLB="${INSTALL_METALLB:-0}"
+METALLB_VERSION="${METALLB_VERSION:-v0.15.3}"
+METALLB_MANIFEST_URL="${METALLB_MANIFEST_URL:-https://raw.githubusercontent.com/metallb/metallb/${METALLB_VERSION}/config/manifests/metallb-native.yaml}"
+METALLB_IP_RANGE="${METALLB_IP_RANGE:-}"
+METALLB_POOL_NAME="${METALLB_POOL_NAME:-otp-relay-pool}"
 SERVER_HOSTNAME="${SERVER_HOSTNAME:-$(hostname -f 2>/dev/null || hostname)}"
 SERVER_IP="${SERVER_IP:-$(hostname -I 2>/dev/null | awk '{print $1}') }"
 SERVER_IP="$(printf '%s' "$SERVER_IP" | xargs)"
@@ -246,6 +277,119 @@ requires_manifests_apply() {
   esac
 }
 
+validate_k8s_topology_settings() {
+  case "$SERVICE_TYPE" in
+    NodePort|LoadBalancer) ;;
+    *) fatal "unsupported SERVICE_TYPE=$SERVICE_TYPE. Use NodePort or LoadBalancer." ;;
+  esac
+
+  if [ "$SERVICE_TYPE" = "NodePort" ]; then
+    case "$SERVICE_NODE_PORT" in
+      ''|*[!0-9]*) fatal "SERVICE_NODE_PORT must be numeric for SERVICE_TYPE=NodePort" ;;
+    esac
+    if [ "$SERVICE_NODE_PORT" -lt 30000 ] || [ "$SERVICE_NODE_PORT" -gt 32767 ]; then
+      fatal "SERVICE_NODE_PORT must be between 30000 and 32767"
+    fi
+  fi
+
+  if [ "$SERVICE_TYPE" = "LoadBalancer" ] && [ "$INGRESS_ENABLED" = "1" ]; then
+    warn "SERVICE_TYPE=LoadBalancer and INGRESS_ENABLED=1 are both enabled. Usually one exposure path is enough."
+  fi
+
+  if [ "$REPLICA_COUNT" != "1" ]; then
+    fatal "REPLICA_COUNT must remain 1. OTP queue, pending OTPs, and admin sessions are in process memory."
+  fi
+
+  if { [ -n "$APP_NODE_SELECTOR_KEY" ] && [ -z "$APP_NODE_SELECTOR_VALUE" ]; } || { [ -z "$APP_NODE_SELECTOR_KEY" ] && [ -n "$APP_NODE_SELECTOR_VALUE" ]; }; then
+    fatal "APP_NODE_SELECTOR_KEY and APP_NODE_SELECTOR_VALUE must be set together"
+  fi
+
+  if { [ -n "$MONITOR_NODE_SELECTOR_KEY" ] && [ -z "$MONITOR_NODE_SELECTOR_VALUE" ]; } || { [ -z "$MONITOR_NODE_SELECTOR_KEY" ] && [ -n "$MONITOR_NODE_SELECTOR_VALUE" ]; }; then
+    fatal "MONITOR_NODE_SELECTOR_KEY and MONITOR_NODE_SELECTOR_VALUE must be set together"
+  fi
+}
+
+validate_selected_node() {
+  label_key="$1"
+  label_value="$2"
+  label_name="$3"
+
+  [ -n "$label_key" ] || return 0
+
+  if ! k3s kubectl get node -l "$label_key=$label_value" -o name | grep -q .; then
+    fatal "$label_name node selector did not match any node: $label_key=$label_value"
+  fi
+}
+
+install_metallb_if_requested() {
+  [ "$INSTALL_METALLB" = "1" ] || return 0
+
+  [ "$SERVICE_TYPE" = "LoadBalancer" ] || fatal "INSTALL_METALLB=1 requires SERVICE_TYPE=LoadBalancer"
+  [ -n "$METALLB_IP_RANGE" ] || fatal "INSTALL_METALLB=1 requires METALLB_IP_RANGE, for example 172.31.11.120-172.31.11.130"
+
+  log "installing MetalLB $METALLB_VERSION from $METALLB_MANIFEST_URL"
+  k3s kubectl apply -f "$METALLB_MANIFEST_URL"
+
+  log "waiting for MetalLB namespace and CRDs"
+  for i in $(seq 1 60); do
+    if k3s kubectl get namespace metallb-system >/dev/null 2>&1 \
+      && k3s kubectl get crd ipaddresspools.metallb.io >/dev/null 2>&1 \
+      && k3s kubectl get crd l2advertisements.metallb.io >/dev/null 2>&1; then
+      break
+    fi
+    sleep 2
+    [ "$i" -lt 60 ] || fatal "MetalLB CRDs were not ready after install"
+  done
+
+  k3s kubectl wait --for=condition=Established crd/ipaddresspools.metallb.io --timeout=120s
+  k3s kubectl wait --for=condition=Established crd/l2advertisements.metallb.io --timeout=120s
+
+  log "waiting for MetalLB controller and speaker"
+  k3s kubectl rollout status deployment/controller -n metallb-system --timeout=180s
+  k3s kubectl rollout status daemonset/speaker -n metallb-system --timeout=180s
+
+  log "configuring MetalLB L2 address pool $METALLB_POOL_NAME=$METALLB_IP_RANGE"
+  cat <<EOF_METALLB | k3s kubectl apply -f -
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: $METALLB_POOL_NAME
+  namespace: metallb-system
+spec:
+  addresses:
+    - $METALLB_IP_RANGE
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: ${METALLB_POOL_NAME}-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - $METALLB_POOL_NAME
+EOF_METALLB
+}
+
+check_loadbalancer_prereqs() {
+  [ "$SERVICE_TYPE" = "LoadBalancer" ] || return 0
+
+  log "SERVICE_TYPE=LoadBalancer selected"
+  if [ -n "$LOADBALANCER_IP" ]; then
+    log "requested LoadBalancer IP: $LOADBALANCER_IP"
+  else
+    warn "LOADBALANCER_IP is not set. The cluster load balancer must allocate an address automatically."
+  fi
+
+  if k3s kubectl get namespace metallb-system >/dev/null 2>&1; then
+    log "MetalLB namespace found"
+    k3s kubectl get pods -n metallb-system --no-headers 2>/dev/null || true
+  elif [ "$REQUIRE_METALLB" = "1" ]; then
+    fatal "SERVICE_TYPE=LoadBalancer requires MetalLB, but namespace metallb-system was not found"
+  else
+    warn "MetalLB namespace was not found. LoadBalancer service may stay pending unless another load balancer is installed."
+  fi
+}
+
 if [ -z "$INSTALL_GITHUB_RUNNER" ]; then
   if prompt_yes_no "Install a GitHub Actions self-hosted runner for CI/CD deployments from GitHub? [y/N]" "N"; then
     INSTALL_GITHUB_RUNNER=1
@@ -305,6 +449,7 @@ case "$DEPLOY_MODE" in
   *) fatal "unsupported DEPLOY_MODE=$DEPLOY_MODE. Use full, app, monitor, manifests, or none." ;;
 esac
 log "deployment mode: $DEPLOY_MODE"
+validate_k8s_topology_settings
 
 if [ "$DEPLOY_MODE" = "none" ]; then
   log "DEPLOY_MODE=none; no deployment changes required. Exiting before Docker/K3s work."
@@ -337,6 +482,15 @@ for i in $(seq 1 60); do
   sleep 2
   [ "$i" -lt 60 ] || fatal "K3s node did not become Ready"
 done
+
+log "cluster nodes"
+k3s kubectl get nodes -o wide
+log "cluster storage classes"
+k3s kubectl get storageclass 2>/dev/null || true
+validate_selected_node "$APP_NODE_SELECTOR_KEY" "$APP_NODE_SELECTOR_VALUE" "app"
+validate_selected_node "$MONITOR_NODE_SELECTOR_KEY" "$MONITOR_NODE_SELECTOR_VALUE" "monitor"
+install_metallb_if_requested
+check_loadbalancer_prereqs
 
 log "syncing repository into $INSTALL_DIR"
 if [ -d "$INSTALL_DIR/.git" ]; then
@@ -504,12 +658,19 @@ metadata:
   labels:
     app: otp-relay
 spec:
+EOF_PVC
+if [ -n "$PVC_STORAGE_CLASS" ]; then
+  cat >> "$MANIFEST_DIR/pvc.yaml" <<EOF_PVC_STORAGE
+  storageClassName: $PVC_STORAGE_CLASS
+EOF_PVC_STORAGE
+fi
+cat >> "$MANIFEST_DIR/pvc.yaml" <<EOF_PVC_SPEC
   accessModes:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 1Gi
-EOF_PVC
+      storage: $PVC_SIZE
+EOF_PVC_SPEC
 
 cat > "$MANIFEST_DIR/deployment.yaml" <<EOF_DEPLOY
 apiVersion: apps/v1
@@ -520,7 +681,7 @@ metadata:
   labels:
     app: otp-relay
 spec:
-  replicas: 1
+  replicas: $REPLICA_COUNT
   selector:
     matchLabels:
       app: otp-relay
@@ -531,6 +692,14 @@ spec:
       labels:
         app: otp-relay
     spec:
+EOF_DEPLOY
+if [ -n "$APP_NODE_SELECTOR_KEY" ]; then
+  cat >> "$MANIFEST_DIR/deployment.yaml" <<EOF_DEPLOY_NODE
+      nodeSelector:
+        $APP_NODE_SELECTOR_KEY: "$APP_NODE_SELECTOR_VALUE"
+EOF_DEPLOY_NODE
+fi
+cat >> "$MANIFEST_DIR/deployment.yaml" <<EOF_DEPLOY_REST
       securityContext:
         runAsNonRoot: true
         runAsUser: 999
@@ -576,7 +745,7 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: otp-relay-data
-EOF_DEPLOY
+EOF_DEPLOY_REST
 
 cat > "$MANIFEST_DIR/service.yaml" <<EOF_SVC
 apiVersion: v1
@@ -587,16 +756,29 @@ metadata:
   labels:
     app: otp-relay
 spec:
-  type: NodePort
+  type: $SERVICE_TYPE
+EOF_SVC
+if [ "$SERVICE_TYPE" = "LoadBalancer" ] && [ -n "$LOADBALANCER_IP" ]; then
+  cat >> "$MANIFEST_DIR/service.yaml" <<EOF_SVC_LB
+  loadBalancerIP: $LOADBALANCER_IP
+EOF_SVC_LB
+fi
+cat >> "$MANIFEST_DIR/service.yaml" <<EOF_SVC_SPEC
   selector:
     app: otp-relay
   ports:
     - name: http
       port: 80
       targetPort: 8000
+EOF_SVC_SPEC
+if [ "$SERVICE_TYPE" = "NodePort" ]; then
+  cat >> "$MANIFEST_DIR/service.yaml" <<EOF_SVC_NODEPORT
       nodePort: $SERVICE_NODE_PORT
+EOF_SVC_NODEPORT
+fi
+cat >> "$MANIFEST_DIR/service.yaml" <<EOF_SVC_END
       protocol: TCP
-EOF_SVC
+EOF_SVC_END
 
 if [ "$INGRESS_ENABLED" = "1" ]; then
 cat > "$MANIFEST_DIR/ingress.yaml" <<EOF_ING
@@ -629,7 +811,7 @@ metadata:
   labels:
     app: otp-monitor
 spec:
-  replicas: 1
+  replicas: $REPLICA_COUNT
   selector:
     matchLabels:
       app: otp-monitor
@@ -640,6 +822,14 @@ spec:
       labels:
         app: otp-monitor
     spec:
+EOF_MON
+if [ -n "$MONITOR_NODE_SELECTOR_KEY" ]; then
+  cat >> "$MANIFEST_DIR/deployment-monitor.yaml" <<EOF_MON_NODE
+      nodeSelector:
+        $MONITOR_NODE_SELECTOR_KEY: "$MONITOR_NODE_SELECTOR_VALUE"
+EOF_MON_NODE
+fi
+cat >> "$MANIFEST_DIR/deployment-monitor.yaml" <<EOF_MON_REST
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       securityContext:
@@ -685,7 +875,7 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: otp-relay-data
-EOF_MON
+EOF_MON_REST
 
 log "validating Python syntax and Kubernetes manifests"
 if requires_app_image; then
@@ -815,6 +1005,9 @@ OTP Relay Kubernetes deployment complete.
 
 Portal URL:   http://$SERVER_IP/
 NodePort URL: http://$SERVER_IP:$SERVICE_NODE_PORT/
+Service type: $SERVICE_TYPE
+LoadBalancer: ${LOADBALANCER_IP:-auto/none}
+MetalLB:      install=$INSTALL_METALLB range=${METALLB_IP_RANGE:-none}
 Namespace:    $NAMESPACE
 Repo path:    $INSTALL_DIR
 OS/arch:      $OS_NAME / $ARCH_RAW
@@ -822,6 +1015,9 @@ Monitor:      installed as required component
 Runner:       $INSTALL_GITHUB_RUNNER
 Runner only:  $RUNNER_ONLY
 Deploy mode:  $DEPLOY_MODE
+App node selector:     ${APP_NODE_SELECTOR_KEY:-none}=${APP_NODE_SELECTOR_VALUE:-}
+Monitor node selector: ${MONITOR_NODE_SELECTOR_KEY:-none}=${MONITOR_NODE_SELECTOR_VALUE:-}
+PVC storage:           ${PVC_STORAGE_CLASS:-default} / $PVC_SIZE
 
 Useful commands:
   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
