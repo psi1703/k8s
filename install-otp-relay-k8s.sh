@@ -106,6 +106,8 @@ GITHUB_RUNNER_USER="${GITHUB_RUNNER_USER:-actions-runner}"
 RUNNER_ONLY="${RUNNER_ONLY:-0}"
 DEPLOY_MODE="${DEPLOY_MODE:-full}"
 DOCKER_BIN="${DOCKER_BIN:-}"
+RESTART_APP_REQUIRED=0
+RESTART_MONITOR_REQUIRED=0
 
 OS_ID="unknown"
 OS_NAME="unknown"
@@ -471,10 +473,52 @@ PY_RUNTIME_CONFIGMAP
     --from-literal=PORTAL_URL="$PORTAL_URL" \
     --dry-run=client -o yaml | k3s kubectl apply -f -
 }
-restart_deployment_if_exists() {
+mark_deployment_restart_required() {
   deployment_name="$1"
-  if k3s kubectl get deployment "$deployment_name" -n "$NAMESPACE" >/dev/null 2>&1; then
-    k3s kubectl rollout restart "deployment/$deployment_name" -n "$NAMESPACE"
+  case "$deployment_name" in
+    otp-relay) RESTART_APP_REQUIRED=1 ;;
+    otp-monitor) RESTART_MONITOR_REQUIRED=1 ;;
+    *) fatal "unknown deployment restart request: $deployment_name" ;;
+  esac
+}
+
+rollout_restart_deployment_if_exists() {
+  deployment_name="$1"
+
+  if ! k3s kubectl get deployment "$deployment_name" -n "$NAMESPACE" >/dev/null 2>&1; then
+    warn "deployment/$deployment_name does not exist yet; skipping rollout restart"
+    return 0
+  fi
+
+  for attempt in 1 2 3; do
+    if k3s kubectl rollout restart "deployment/$deployment_name" -n "$NAMESPACE"; then
+      return 0
+    fi
+
+    if [ "$attempt" -lt 3 ]; then
+      warn "rollout restart for deployment/$deployment_name was rejected or raced; retrying"
+      sleep 2
+    fi
+  done
+
+  fatal "failed to trigger rollout restart for deployment/$deployment_name"
+}
+
+perform_pending_rollout_restarts() {
+  if [ "$RESTART_APP_REQUIRED" = "1" ]; then
+    log "restarting app deployment"
+    rollout_restart_deployment_if_exists otp-relay
+    log "waiting for app rollout"
+    k3s kubectl rollout status deployment/otp-relay -n "$NAMESPACE" --timeout=180s
+    RESTART_APP_REQUIRED=0
+  fi
+
+  if [ "$RESTART_MONITOR_REQUIRED" = "1" ]; then
+    log "restarting monitor deployment"
+    rollout_restart_deployment_if_exists otp-monitor
+    log "waiting for monitor rollout"
+    k3s kubectl rollout status deployment/otp-monitor -n "$NAMESPACE" --timeout=180s
+    RESTART_MONITOR_REQUIRED=0
   fi
 }
 
@@ -963,25 +1007,23 @@ if requires_manifests_apply; then
   fi
 
   if [ "${PORTAL_URL_CONFIG_REFRESHED:-0}" = "1" ]; then
-    log "restarting deployments to pick up refreshed PORTAL_URL ConfigMap"
-    restart_deployment_if_exists otp-relay
-    restart_deployment_if_exists otp-monitor
+    log "marking deployments for restart to pick up refreshed PORTAL_URL ConfigMap"
+    mark_deployment_restart_required otp-relay
+    mark_deployment_restart_required otp-monitor
   fi
 fi
 
 if requires_app_image; then
-  log "restarting app deployment to pick up freshly imported local app image"
-  k3s kubectl rollout restart deployment/otp-relay -n "$NAMESPACE"
-  log "waiting for app rollout"
-  k3s kubectl rollout status deployment/otp-relay -n "$NAMESPACE" --timeout=180s
+  log "marking app deployment for restart to pick up freshly imported local app image"
+  mark_deployment_restart_required otp-relay
 fi
 
 if requires_monitor_image; then
-  log "restarting monitor deployment to pick up freshly imported local monitor image"
-  k3s kubectl rollout restart deployment/otp-monitor -n "$NAMESPACE"
-  log "waiting for monitor rollout"
-  k3s kubectl rollout status deployment/otp-monitor -n "$NAMESPACE" --timeout=180s
+  log "marking monitor deployment for restart to pick up freshly imported local monitor image"
+  mark_deployment_restart_required otp-monitor
 fi
+
+perform_pending_rollout_restarts
 
 if [ "$DEPLOY_MODE" = "manifests" ]; then
   log "manifest-only apply complete; checking rollout status for existing deployments"
@@ -998,10 +1040,9 @@ if [ -n "$RUNTIME_DATA_DIR" ] && { [ "$DEPLOY_MODE" = "full" ] || [ "$DEPLOY_MOD
       k3s kubectl cp "$RUNTIME_DATA_DIR/$f" "$NAMESPACE/$pod:/app/data/$f" -n "$NAMESPACE"
     fi
   done
-  k3s kubectl rollout restart deployment/otp-relay -n "$NAMESPACE"
-  k3s kubectl rollout restart deployment/otp-monitor -n "$NAMESPACE"
-  k3s kubectl rollout status deployment/otp-relay -n "$NAMESPACE" --timeout=180s
-  k3s kubectl rollout status deployment/otp-monitor -n "$NAMESPACE" --timeout=180s
+  mark_deployment_restart_required otp-relay
+  mark_deployment_restart_required otp-monitor
+  perform_pending_rollout_restarts
 fi
 
 
