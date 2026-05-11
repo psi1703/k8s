@@ -108,7 +108,7 @@ DEPLOY_MODE="${DEPLOY_MODE:-full}"
 DOCKER_BIN="${DOCKER_BIN:-}"
 REDIS_ENABLED="${REDIS_ENABLED:-1}"
 REDIS_URL="${REDIS_URL:-redis://otp-redis:6379/0}"
-REDIS_REQUIRED="${REDIS_REQUIRED:-0}"
+REDIS_REQUIRED="${REDIS_REQUIRED:-1}"
 REDIS_STORAGE_CLASS="${REDIS_STORAGE_CLASS:-local-path}"
 REDIS_SIZE="${REDIS_SIZE:-1Gi}"
 RESTART_APP_REQUIRED=0
@@ -319,7 +319,7 @@ validate_k8s_topology_settings() {
   fi
 
   if [ "$REPLICA_COUNT" != "1" ]; then
-    fatal "REPLICA_COUNT must remain 1. OTP queue, pending OTPs, and admin sessions are in process memory."
+    fatal "REPLICA_COUNT must remain 1 until the manager OTP trigger test and final two-replica OTP validation are complete."
   fi
 
   if { [ -n "$APP_NODE_SELECTOR_KEY" ] && [ -z "$APP_NODE_SELECTOR_VALUE" ]; } || { [ -z "$APP_NODE_SELECTOR_KEY" ] && [ -n "$APP_NODE_SELECTOR_VALUE" ]; }; then
@@ -930,8 +930,8 @@ if (manifest_dir / "deployment.yaml").exists():
     text = set_first_image(text, os.environ["APP_IMAGE"])
     text = add_nodesel(text, os.environ.get("APP_NODE_SELECTOR_KEY", ""), os.environ.get("APP_NODE_SELECTOR_VALUE", ""))
 
-    # Redis is introduced first as a reachable cluster service while the app
-    # remains REPLICA_COUNT=1. Queue/session state migration happens later.
+    # Redis is the Phase 2 shared-state service for OTP queue, pending OTPs,
+    # admin sessions, and admin login-attempt tracking.
     text = re.sub(
         r"\n            - name: REDIS_URL\n              value: .*",
         "",
