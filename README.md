@@ -173,8 +173,7 @@ Keep the portal deployment at one replica for now:
 REPLICA_COUNT=1
 ```
 
-The OTP queue, pending OTPs, and admin sessions are currently stored in process memory. Multiple replicas would create separate queues and sessions and could route a user to the wrong in-memory state.
-
+The OTP queue and pending OTPs have Redis-backed support with in-memory fallback while REDIS_REQUIRED=0. Admin sessions and admin login-attempt tracking are still process-memory state, so the app must remain at one replica until admin session state is moved to Redis and two-pod behavior is tested.
 A 3-node cluster is supported for placement and LoadBalancer exposure, but the app remains a single-replica workload until shared state is introduced.
 
 ---
@@ -193,13 +192,18 @@ App env:            REDIS_URL=redis://otp-redis:6379/0
 Readiness:          /readyz reports Redis status
 ```
 
-Current Redis foundation does **not** yet move OTP runtime state. These remain in process memory until the next application-state migration step:
+Current Redis-backed scope:
 
 ```text
-claim_queue
-pending_otps
+claim_queue / OTP queue
+pending_otps / pending OTP state
+Redis readiness reporting through /readyz
+```
+
+Still process-local:
+```text
 ADMIN_SESSIONS
-ADMIN_LOGIN_ATTEMPTS
+ADMIN_LOGIN_ATTEMPT
 ```
 
 Therefore, even with Redis deployed, the app must stay at:
@@ -210,11 +214,14 @@ REPLICA_COUNT=1
 
 Redis completion criteria before increasing replicas:
 
+Before increasing replicas:
 ```text
-claim_queue is Redis-backed
-pending_otps are Redis-backed with TTL
+manager OTP trigger test passes
+pending OTP survives app pod restart
+Redis is made required, REDIS_REQUIRED=1
 admin sessions are Redis-backed
-queue and SMS delivery operations are safe across two app pods
+admin login-attempt tracking is Redis-backed or otherwise safe
+queue and SMS delivery are tested across two app pods
 REPLICA_COUNT=2 has been tested
 ```
 
