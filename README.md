@@ -59,9 +59,9 @@ The application stayed at one replica because OTP queue state, pending OTPs, and
 
 ---
 
-### Phase 2 - LoadBalancer / MetalLB / Redis foundation / source-of-truth deployment
+### Phase 2 - LoadBalancer / MetalLB / Redis shared state / source-of-truth deployment
 
-Phase 2 aligns the deployment with the 3-node/bare-metal Kubernetes diagram discussed with management. It is split into two practical parts: Phase 2A completed the platform/deployment alignment, and Phase 2B introduces Redis as the shared-state foundation before any replica increase.
+Phase 2 aligns the deployment with the bare-metal Kubernetes diagram discussed with management. It is split into practical parts: Phase 2A completed the platform/deployment alignment, Phase 2B introduced Redis for OTP runtime state, and Phase 2C moved admin session/rate-limit state into Redis. Final Phase 2 acceptance is still pending the live manager OTP trigger test.
 
 Phase 2 target flow:
 
@@ -95,7 +95,7 @@ PVC_STORAGE_CLASS=local-path
 PVC_SIZE=1Gi
 REDIS_ENABLED=1
 REDIS_URL=redis://otp-redis:6379/0
-REDIS_REQUIRED=0
+REDIS_REQUIRED=1
 REDIS_STORAGE_CLASS=local-path
 REDIS_SIZE=1Gi
 REPLICA_COUNT=1
@@ -106,9 +106,9 @@ Notes:
 - `LOADBALANCER_IP` is intentionally blank so MetalLB auto-assigns an address from its configured pool.
 - `INGRESS_ENABLED=0` means OTP Relay does not use Traefik in Phase 2. Traefik may still exist in K3s, but it is not the OTP Relay exposure path.
 - `REQUIRE_METALLB=1` makes deployment fail fast if LoadBalancer mode is selected but MetalLB is not available.
-- `REDIS_ENABLED=1` deploys Redis and passes `REDIS_URL` to the app for readiness validation.
-- `REDIS_REQUIRED=0` is intentional for the first Redis foundation rollout; after Redis is confirmed healthy, this can become `1`.
-- `REPLICA_COUNT=1` remains required until OTP queue, pending OTPs, and admin sessions are moved to Redis-backed shared state.
+- `REDIS_ENABLED=1` deploys Redis and passes `REDIS_URL` to the app.
+- `REDIS_REQUIRED=1` is now the Phase 2 validation/default posture. Readiness fails if Redis is unavailable.
+- `REPLICA_COUNT=1` remains the normal live setting until the manager-led OTP trigger test and final two-replica OTP validation are complete.
 
 Phase 2 changed the deployment source-of-truth model:
 
@@ -141,8 +141,11 @@ Phase 2 added or corrected the following areas:
 | Deployment restarts | multiple restart points possible | coalesced restart requests, one restart per deployment |
 | Wizard progress | could lock to stale browser client | token-owned progress with silent client rebinding |
 | Workflow modes | deployment-system changes could force full rebuild | manifests-only changes avoid unnecessary image rebuilds |
-| Redis | not deployed | Redis service/StatefulSet/PDB added as shared-state foundation |
-| Readiness | app/user readiness only | `/readyz` reports Redis connectivity when `REDIS_URL` is set |
+| Redis | not deployed | Redis service/StatefulSet/PDB added and required for Phase 2 validation |
+| OTP runtime state | process-local queue/pending OTPs | Redis-backed OTP queue and pending OTP state, with TTLs |
+| Admin sessions | process-local sessions | Redis-backed admin sessions with sliding TTL |
+| Admin login attempts | process-local rate-limit counters | Redis-backed login-attempt tracking and lockout state |
+| Readiness | app/user readiness only | `/readyz` reports Redis status and fails when `REDIS_REQUIRED=1` and Redis is unavailable |
 
 ---
 
@@ -150,7 +153,7 @@ Phase 2 added or corrected the following areas:
 
 The OTP Relay Portal lets users claim a single active OTP slot, trigger the external OTP only when they are first in queue, and view the received OTP on-screen.
 
-OTP values are held in memory only. They are never written to disk or audit logs.
+OTP values are never written to disk or audit logs. During Phase 2, pending OTP display state is stored in Redis with TTL-based expiry when Redis is available and required.
 
 The portal includes:
 
@@ -167,62 +170,73 @@ The portal includes:
 
 ## Runtime design constraint
 
-Keep the portal deployment at one replica for now:
+Keep the live portal deployment at one replica until final OTP acceptance testing is complete:
 
 ```text
 REPLICA_COUNT=1
 ```
 
-The OTP queue and pending OTPs have Redis-backed support with in-memory fallback while REDIS_REQUIRED=0. Admin sessions and admin login-attempt tracking are still process-memory state, so the app must remain at one replica until admin session state is moved to Redis and two-pod behavior is tested.
-A 3-node cluster is supported for placement and LoadBalancer exposure, but the app remains a single-replica workload until shared state is introduced.
+The following Phase 2 shared-state work is complete:
+
+```text
+OTP queue                     Redis-backed
+Pending OTP display state      Redis-backed with TTL
+Admin sessions                 Redis-backed with sliding TTL
+Admin login-attempt tracking   Redis-backed with lockout/window TTL
+Redis readiness                Required with REDIS_REQUIRED=1
+```
+
+A temporary two-replica validation has already confirmed that two app pods can become `Running 1/1` on the current single-node K3s cluster with the app PVC mounted. The live setting remains one replica because final OTP acceptance still requires the manager-led OTP trigger test, pending-OTP restart test, and final two-replica OTP flow validation.
+
+A multi-node cluster is supported for placement and LoadBalancer exposure, but the app PVC is currently `ReadWriteOnce` with K3s `local-path` storage. Any future multi-node/two-replica mode must account for PVC placement and file-backed runtime data.
 
 ---
 
-## Redis foundation status
+## Redis shared-state status
 
-Redis is introduced as the Phase 2B shared-state foundation, but the application state migration is intentionally staged.
+Redis is now the Phase 2 shared-state service for OTP runtime state and admin authentication/session state.
 
-Current Redis foundation scope:
+Current Redis resources:
 
 ```text
 Redis Service:      otp-redis
 Redis StatefulSet:  otp-redis
 Redis PDB:          otp-redis-pdb
+Redis PVC:          redis-data-otp-redis-0
 App env:            REDIS_URL=redis://otp-redis:6379/0
 Readiness:          /readyz reports Redis status
+Required mode:      REDIS_REQUIRED=1
 ```
 
 Current Redis-backed scope:
 
 ```text
-claim_queue / OTP queue
-pending_otps / pending OTP state
+OTP queue / claim queue
+Pending OTP display state
+Admin sessions
+Admin login-attempt tracking
 Redis readiness reporting through /readyz
 ```
 
-Still process-local:
+Validated Phase 2C behavior:
+
 ```text
-ADMIN_SESSIONS
-ADMIN_LOGIN_ATTEMPT
+/readyz reports redis=ok and redis_required=true
+Admin login creates admin:session:<session> in Redis
+Admin logout removes admin:session:<session> from Redis
+Failed admin login creates admin:login_attempt:<client-ip> in Redis
+Successful admin login clears admin:login_attempt:<client-ip>
+Temporary REPLICA_COUNT=2 test reached Running 1/1 for both app pods
+Deployment was scaled back to REPLICA_COUNT=1 after validation
 ```
 
-Therefore, even with Redis deployed, the app must stay at:
+Remaining final Phase 2 acceptance criteria:
 
 ```text
-REPLICA_COUNT=1
-```
-
-Redis completion criteria before increasing replicas:
-
-Before increasing replicas:
-```text
-manager OTP trigger test passes
-pending OTP survives app pod restart
-Redis is made required, REDIS_REQUIRED=1
-admin sessions are Redis-backed
-admin login-attempt tracking is Redis-backed or otherwise safe
-queue and SMS delivery are tested across two app pods
-REPLICA_COUNT=2 has been tested
+Manager OTP trigger test passes
+Pending OTP survives app pod restart during a real OTP flow
+Queue and SMS delivery are tested across two app pods
+Final REPLICA_COUNT=2 OTP validation passes
 ```
 
 ---
@@ -372,7 +386,7 @@ PVC_STORAGE_CLASS=local-path
 PVC_SIZE=1Gi
 REDIS_ENABLED=1
 REDIS_URL=redis://otp-redis:6379/0
-REDIS_REQUIRED=0
+REDIS_REQUIRED=1
 REDIS_STORAGE_CLASS=local-path
 REDIS_SIZE=1Gi
 REPLICA_COUNT=1
@@ -478,7 +492,7 @@ Confirm the configured MetalLB IP range is free on the LAN and outside DHCP assi
 
 ## Redis operations
 
-Redis is deployed as the Phase 2B shared-state foundation. It is internal-only and exposed through a ClusterIP service.
+Redis is deployed as the Phase 2 shared-state service. It is internal-only and exposed through a ClusterIP service.
 
 Check Redis resources:
 
@@ -501,17 +515,40 @@ Check the app sees Redis:
 curl -s http://<assigned-loadbalancer-ip>/readyz
 ```
 
-Expected during Redis foundation rollout:
+Expected in Phase 2 required-Redis mode:
 
 ```json
 {
   "status": "ok",
   "redis": "ok",
-  "redis_required": false
+  "redis_required": true
 }
 ```
 
-Keep `REDIS_REQUIRED=0` until Redis is confirmed healthy. Then it can be changed to `1` so readiness fails if Redis is unavailable.
+`REDIS_REQUIRED=1` is the Phase 2 validation/default setting. If Redis is unavailable, `/readyz` must fail instead of allowing a silent in-memory fallback.
+
+Check Redis-backed admin/session state:
+
+```bash
+sudo k3s kubectl exec statefulset/otp-redis -n otp-relay -- redis-cli --scan --pattern 'admin:*'
+sudo k3s kubectl exec statefulset/otp-redis -n otp-relay -- redis-cli --scan --pattern 'admin:session:*'
+sudo k3s kubectl exec statefulset/otp-redis -n otp-relay -- redis-cli --scan --pattern 'admin:login_attempt:*'
+```
+
+Expected behavior:
+
+```text
+Admin login creates admin:session:<session>
+Admin logout removes admin:session:<session>
+Failed admin login creates admin:login_attempt:<client-ip>
+Successful admin login removes admin:login_attempt:<client-ip>
+```
+
+Check OTP Redis keys during a live OTP test:
+
+```bash
+sudo k3s kubectl exec statefulset/otp-redis -n otp-relay -- redis-cli --scan --pattern 'otp:*'
+```
 
 ---
 
@@ -712,6 +749,7 @@ sudo k3s kubectl get deploy otp-relay -n otp-relay -o jsonpath='{.spec.strategy.
 sudo k3s kubectl get deploy otp-relay -n otp-relay -o jsonpath='{.spec.replicas}'; echo
 sudo k3s kubectl get pvc otp-relay-data -n otp-relay -o jsonpath='{.spec.storageClassName}'; echo
 sudo k3s kubectl get svc otp-relay -n otp-relay -o jsonpath='{.spec.type}'; echo
+sudo k3s kubectl get deploy otp-relay -n otp-relay -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REDIS_REQUIRED")].value}'; echo
 ```
 
 Expected Phase 2 values:
@@ -721,6 +759,63 @@ Recreate
 1
 local-path
 LoadBalancer
+1
+```
+
+---
+
+## Phase 2 validation status
+
+Current status:
+
+```text
+Phase 2C complete; final OTP acceptance test pending.
+```
+
+Validated:
+
+```text
+/readyz reports redis=ok and redis_required=true
+Redis admin session key appears after admin login
+Redis admin session key disappears after admin logout
+Redis login-attempt key appears after failed admin login
+Redis login-attempt key clears after successful admin login
+Deployment strategy is Recreate
+otp-relay-data PVC is Bound with local-path storage
+redis-data-otp-redis-0 PVC is Bound with local-path storage
+Temporary scale to 2 app replicas succeeded
+Both app pods reached Running 1/1
+Deployment was scaled back to REPLICA_COUNT=1
+```
+
+Pending manager-led final acceptance:
+
+```text
+Trigger one real OTP flow
+Confirm OTP displays correctly
+Restart app during pending OTP state and confirm pending OTP survives
+Run final controlled REPLICA_COUNT=2 OTP flow validation
+```
+
+Manager OTP test script:
+
+```text
+1. Open http://<assigned-loadbalancer-ip>/.
+2. Log in with a valid user token.
+3. Request OTP.
+4. Wait for the OTP to arrive/display.
+5. Confirm whether the OTP appears correctly.
+6. Do not test multiple users at once yet.
+7. Record the token used and approximate time.
+```
+
+Operator log collection after manager test:
+
+```bash
+sudo k3s kubectl logs deployment/otp-relay -n otp-relay --tail=300
+sudo k3s kubectl logs statefulset/otp-redis -n otp-relay --tail=150
+sudo k3s kubectl exec statefulset/otp-redis -n otp-relay -- redis-cli --scan --pattern 'otp:*'
+curl -s http://<assigned-loadbalancer-ip>/readyz
 ```
 
 ---
