@@ -134,6 +134,8 @@ REDIS_QUEUE_KEY = "otp:queue"
 REDIS_QUEUE_LOCK_KEY = "otp:lock:queue"
 REDIS_CLAIM_PREFIX = "otp:claim:"
 REDIS_PENDING_PREFIX = "otp:pending:"
+REDIS_ADMIN_SESSION_PREFIX = "admin:session:"
+REDIS_ADMIN_LOGIN_ATTEMPT_PREFIX = "admin:login_attempt:"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -230,6 +232,15 @@ def _redis_claim_key(token: str) -> str:
 
 def _redis_pending_key(token: str) -> str:
     return f"{REDIS_PENDING_PREFIX}{token}"
+
+
+def _redis_admin_session_key(session: str) -> str:
+    return f"{REDIS_ADMIN_SESSION_PREFIX}{session}"
+
+
+def _redis_admin_login_attempt_key(client_ip: str) -> str:
+    safe_ip = re.sub(r"[^A-Za-z0-9_.:-]", "_", client_ip or "unknown")
+    return f"{REDIS_ADMIN_LOGIN_ATTEMPT_PREFIX}{safe_ip}"
 
 
 @contextmanager
@@ -474,20 +485,78 @@ def _save_config_db(db: Dict[str, Any]) -> None:
 
 
 def _purge_admin_sessions() -> None:
+    """Expire stale in-memory admin sessions.
+
+    Redis-backed admin sessions use native key TTLs, so there is nothing to
+    purge here when Redis is active.
+    """
+    if _use_redis_state():
+        return
+
     now_ts = datetime.now(timezone.utc).timestamp()
     stale = [session for session, ts in ADMIN_SESSIONS.items() if now_ts - ts > ADMIN_TTL_SECONDS]
     for session in stale:
         ADMIN_SESSIONS.pop(session, None)
 
 
+def _create_admin_session() -> str:
+    session = secrets.token_urlsafe(24)
+    now_ts = datetime.now(timezone.utc).timestamp()
+
+    # Keep the local copy as a fallback while REDIS_REQUIRED=0.
+    ADMIN_SESSIONS[session] = now_ts
+
+    if _use_redis_state():
+        try:
+            redis_client.setex(_redis_admin_session_key(session), ADMIN_TTL_SECONDS, str(now_ts))
+        except Exception as exc:
+            if REDIS_REQUIRED:
+                raise HTTPException(status_code=503, detail="Redis admin session store is unavailable") from exc
+            logger.warning("Could not write admin session to Redis; using in-memory fallback: %s", exc)
+
+    return session
+
+
+def _delete_admin_session(session: str) -> None:
+    ADMIN_SESSIONS.pop(session, None)
+
+    if _use_redis_state():
+        try:
+            redis_client.delete(_redis_admin_session_key(session))
+        except Exception as exc:
+            if REDIS_REQUIRED:
+                raise HTTPException(status_code=503, detail="Redis admin session store is unavailable") from exc
+            logger.warning("Could not delete admin session from Redis: %s", exc)
+
+
 def _require_admin(session: Optional[str]) -> None:
-    _purge_admin_sessions()
     if not session:
         raise HTTPException(status_code=401, detail="Missing admin session")
+
+    now_ts = datetime.now(timezone.utc).timestamp()
+
+    if _use_redis_state():
+        try:
+            existing = redis_client.get(_redis_admin_session_key(session))
+            if not existing:
+                raise HTTPException(status_code=401, detail="Invalid admin session")
+
+            # Sliding expiration: every valid admin request refreshes the session TTL.
+            redis_client.setex(_redis_admin_session_key(session), ADMIN_TTL_SECONDS, str(now_ts))
+            ADMIN_SESSIONS[session] = now_ts
+            return
+        except HTTPException:
+            raise
+        except Exception as exc:
+            if REDIS_REQUIRED:
+                raise HTTPException(status_code=503, detail="Redis admin session store is unavailable") from exc
+            logger.warning("Could not validate admin session in Redis; using in-memory fallback: %s", exc)
+
+    _purge_admin_sessions()
     ts = ADMIN_SESSIONS.get(session)
     if not ts:
         raise HTTPException(status_code=401, detail="Invalid admin session")
-    ADMIN_SESSIONS[session] = datetime.now(timezone.utc).timestamp()
+    ADMIN_SESSIONS[session] = now_ts
 
 
 def _model_dump(model: BaseModel) -> Dict[str, Any]:
@@ -504,38 +573,88 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def _default_login_attempt_row(now_ts: float) -> Dict[str, Any]:
+    return {"count": 0, "window_start": now_ts, "locked_until": 0.0}
+
+
+def _get_login_attempt_row(client_ip: str, now_ts: float) -> Dict[str, Any]:
+    if _use_redis_state():
+        try:
+            row = redis_client.hgetall(_redis_admin_login_attempt_key(client_ip))
+            if row:
+                return {
+                    "count": int(row.get("count", 0) or 0),
+                    "window_start": float(row.get("window_start", now_ts) or now_ts),
+                    "locked_until": float(row.get("locked_until", 0.0) or 0.0),
+                }
+        except Exception as exc:
+            if REDIS_REQUIRED:
+                raise HTTPException(status_code=503, detail="Redis admin login-attempt store is unavailable") from exc
+            logger.warning("Could not read admin login attempts from Redis; using in-memory fallback: %s", exc)
+
+    return ADMIN_LOGIN_ATTEMPTS.get(client_ip, _default_login_attempt_row(now_ts))
+
+
+def _save_login_attempt_row(client_ip: str, row: Dict[str, Any]) -> None:
+    ADMIN_LOGIN_ATTEMPTS[client_ip] = row
+
+    if _use_redis_state():
+        try:
+            redis_client.hset(_redis_admin_login_attempt_key(client_ip), mapping={
+                "count": int(row.get("count", 0)),
+                "window_start": float(row.get("window_start", 0.0)),
+                "locked_until": float(row.get("locked_until", 0.0)),
+            })
+            ttl = max(ADMIN_LOGIN_WINDOW_SECONDS, ADMIN_LOGIN_LOCKOUT_SECONDS)
+            redis_client.expire(_redis_admin_login_attempt_key(client_ip), ttl)
+        except Exception as exc:
+            if REDIS_REQUIRED:
+                raise HTTPException(status_code=503, detail="Redis admin login-attempt store is unavailable") from exc
+            logger.warning("Could not write admin login attempts to Redis; using in-memory fallback: %s", exc)
+
+
+def _delete_login_attempt_row(client_ip: str) -> None:
+    ADMIN_LOGIN_ATTEMPTS.pop(client_ip, None)
+
+    if _use_redis_state():
+        try:
+            redis_client.delete(_redis_admin_login_attempt_key(client_ip))
+        except Exception as exc:
+            if REDIS_REQUIRED:
+                raise HTTPException(status_code=503, detail="Redis admin login-attempt store is unavailable") from exc
+            logger.warning("Could not delete admin login attempts from Redis: %s", exc)
+
+
 def _check_login_rate_limit(request: Request) -> None:
     key = _client_ip(request)
     now_ts = datetime.now(timezone.utc).timestamp()
-    row = ADMIN_LOGIN_ATTEMPTS.get(
-        key,
-        {"count": 0, "window_start": now_ts, "locked_until": 0.0},
-    )
+    row = _get_login_attempt_row(key, now_ts)
 
     if float(row.get("locked_until", 0.0)) > now_ts:
         raise HTTPException(status_code=429, detail="Too many failed login attempts. Try again later.")
 
     if now_ts - float(row.get("window_start", now_ts)) > ADMIN_LOGIN_WINDOW_SECONDS:
-        row = {"count": 0, "window_start": now_ts, "locked_until": 0.0}
+        row = _default_login_attempt_row(now_ts)
 
-    ADMIN_LOGIN_ATTEMPTS[key] = row
+    _save_login_attempt_row(key, row)
 
 
 def _record_login_failure(request: Request) -> None:
     key = _client_ip(request)
     now_ts = datetime.now(timezone.utc).timestamp()
-    row = ADMIN_LOGIN_ATTEMPTS.get(
-        key,
-        {"count": 0, "window_start": now_ts, "locked_until": 0.0},
-    )
+    row = _get_login_attempt_row(key, now_ts)
+
+    if now_ts - float(row.get("window_start", now_ts)) > ADMIN_LOGIN_WINDOW_SECONDS:
+        row = _default_login_attempt_row(now_ts)
+
     row["count"] = int(row.get("count", 0)) + 1
     if row["count"] >= ADMIN_LOGIN_MAX_ATTEMPTS:
         row["locked_until"] = now_ts + ADMIN_LOGIN_LOCKOUT_SECONDS
-    ADMIN_LOGIN_ATTEMPTS[key] = row
+    _save_login_attempt_row(key, row)
 
 
 def _record_login_success(request: Request) -> None:
-    ADMIN_LOGIN_ATTEMPTS.pop(_client_ip(request), None)
+    _delete_login_attempt_row(_client_ip(request))
 
 
 def _hash_wizard_secret(secret: str) -> str:
@@ -1296,8 +1415,7 @@ async def admin_auth_setup(payload: CredentialPayload):
             raise HTTPException(status_code=401, detail="Current credential incorrect")
     hashed = bcrypt.hashpw(cred.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
     _save_auth_db({"password_hash": hashed, "updated_at": _now_iso()})
-    session = secrets.token_urlsafe(24)
-    ADMIN_SESSIONS[session] = datetime.now(timezone.utc).timestamp()
+    session = _create_admin_session()
     audit("admin_auth_setup", detail="Admin credential configured")
     return {"status": "ok", "session": session}
 
@@ -1315,8 +1433,7 @@ async def admin_auth_login(payload: CredentialPayload, request: Request):
         audit("admin_auth_failed", detail="Incorrect admin credential", status="warn")
         raise HTTPException(status_code=401, detail="Incorrect credential")
     _record_login_success(request)
-    session = secrets.token_urlsafe(24)
-    ADMIN_SESSIONS[session] = datetime.now(timezone.utc).timestamp()
+    session = _create_admin_session()
     audit("admin_auth_login", detail="Admin session opened")
     return {"status": "ok", "session": session}
 
@@ -1324,7 +1441,7 @@ async def admin_auth_login(payload: CredentialPayload, request: Request):
 @app.post("/admin/auth/logout")
 async def admin_auth_logout(x_admin_session: Optional[str] = Header(default=None)):
     if x_admin_session:
-        ADMIN_SESSIONS.pop(x_admin_session, None)
+        _delete_admin_session(x_admin_session)
     return {"status": "ok"}
 
 
