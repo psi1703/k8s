@@ -90,6 +90,40 @@ REDIS_REQUIRED = os.getenv("REDIS_REQUIRED", "0").strip() == "1"
 users: Dict[str, Dict[str, str]] = {}
 claim_queue: deque = deque()
 
+USER_IMPORT_HEADER_ALIASES = {
+    "token": "token",
+    "user token": "token",
+    "username": "token",
+    "name": "name",
+    "display name": "name",
+    "email": "email",
+    "email address": "email",
+    "mail": "email",
+    "test_env": "test_env",
+    "test env": "test_env",
+    "test environment": "test_env",
+    "test_environment": "test_env",
+    "testenv": "test_env",
+    "prod_env": "prod_env",
+    "prod env": "prod_env",
+    "prod environment": "prod_env",
+    "prod_environment": "prod_env",
+    "production env": "prod_env",
+    "production environment": "prod_env",
+    "prodenv": "prod_env",
+}
+
+
+def _normalize_user_import_header(value: Any) -> str:
+    clean = re.sub(r"\s+", " ", str(value or "").strip().lower().replace("-", " ").replace("_", " "))
+    return USER_IMPORT_HEADER_ALIASES.get(clean, clean.replace(" ", "_"))
+
+
+def _xlsx_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
 # Delivered OTPs held in memory only - never written to disk or logs.
 # Structure: { token: { "otp": str, "arrived_at": datetime } }
 pending_otps: Dict[str, Dict[str, Any]] = {}
@@ -551,8 +585,8 @@ def _default_wizard_record(token: str) -> Dict[str, Any]:
         "iits_pw_date": None,
         "adm_pw_date": None,
         "vpn_date": None,
-        "test_env": "",
-        "prod_env": "",
+        "test_env": users[token].get("test_env", ""),
+        "prod_env": users[token].get("prod_env", ""),
     }
 
 
@@ -587,18 +621,25 @@ class ConfigPayload(BaseModel):
 def load_users_from_excel(path: str, replace_existing: bool = True) -> int:
     """
     Reads users.xlsx. Expected columns (row 1 = headers):
-      token - 2 or 3 character unique string, e.g. AH or AHM
-      name  - display name
-      email - company email address
-    Column names are case-insensitive.
+      token    - 2 or 3 character unique string, e.g. AH or AHM
+      name     - display name
+      email    - company email address
+    Optional columns:
+      test_env - test environment assignment shown in the admin wizard
+      prod_env - production environment assignment shown in the admin wizard
+    Column names are case-insensitive. Spaces, dashes, and underscores are tolerated.
     Skipped rows are written to the audit log so IT can fix them.
     """
     wb = openpyxl.load_workbook(path)
     ws = wb.active
     raw_headers = [
-        str(cell.value).strip().lower() if cell.value else ""
+        _normalize_user_import_header(cell.value)
         for cell in next(ws.iter_rows(min_row=1, max_row=1))
     ]
+
+    duplicate_headers = sorted({header for header in raw_headers if header and raw_headers.count(header) > 1})
+    if duplicate_headers:
+        raise ValueError(f"users.xlsx has duplicate column(s): {', '.join(duplicate_headers)}")
 
     required_headers = {"token", "name", "email"}
     missing_headers = sorted(required_headers - set(raw_headers))
@@ -615,9 +656,11 @@ def load_users_from_excel(path: str, replace_existing: bool = True) -> int:
             continue
 
         row_dict = dict(zip(raw_headers, row))
-        token = str(row_dict.get("token", "") or "").strip().upper()
-        name = str(row_dict.get("name", "") or "").strip()
-        email = str(row_dict.get("email", "") or "").strip()
+        token = _xlsx_text(row_dict.get("token")).upper()
+        name = _xlsx_text(row_dict.get("name"))
+        email = _xlsx_text(row_dict.get("email"))
+        test_env = _xlsx_text(row_dict.get("test_env"))
+        prod_env = _xlsx_text(row_dict.get("prod_env"))
 
         if len(token) == 0:
             audit("import_skipped", detail=f"Row {row_num}: empty token - name={repr(name)} email={repr(email)}", status="warn")
@@ -650,7 +693,13 @@ def load_users_from_excel(path: str, replace_existing: bool = True) -> int:
             continue
 
         seen_tokens[token] = row_num
-        imported_users[token] = {"token": token, "name": name, "email": email}
+        imported_users[token] = {
+            "token": token,
+            "name": name,
+            "email": email,
+            "test_env": test_env,
+            "prod_env": prod_env,
+        }
         loaded += 1
 
     if replace_existing:
@@ -826,6 +875,8 @@ async def user_login(payload: UserLoginPayload):
         "token": user["token"],
         "name": user["name"],
         "email": user["email"],
+        "test_env": user.get("test_env", ""),
+        "prod_env": user.get("prod_env", ""),
     }
 
 
@@ -1126,7 +1177,16 @@ async def list_users(x_admin_session: Optional[str] = Header(default=None)):
     _require_admin(x_admin_session)
     return {
         "count": len(users),
-        "users": [{"token": user["token"], "name": user["name"], "email": user["email"]} for user in users.values()],
+        "users": [
+            {
+                "token": user["token"],
+                "name": user["name"],
+                "email": user["email"],
+                "test_env": user.get("test_env", ""),
+                "prod_env": user.get("prod_env", ""),
+            }
+            for user in users.values()
+        ],
     }
 
 
@@ -1382,8 +1442,8 @@ async def admin_wizard(x_admin_session: Optional[str] = Header(default=None)):
             "iits_pw_date": rec.get("iits_pw_date"),
             "adm_pw_date": rec.get("adm_pw_date"),
             "vpn_date": rec.get("vpn_date"),
-            "test_env": rec.get("test_env", ""),
-            "prod_env": rec.get("prod_env", ""),
+            "test_env": rec.get("test_env") or user.get("test_env", ""),
+            "prod_env": rec.get("prod_env") or user.get("prod_env", ""),
             "updated_at": rec.get("updated_at"),
         })
     return {"users": merged}
