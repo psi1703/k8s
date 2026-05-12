@@ -17,6 +17,10 @@ set -Eeuo pipefail
 #   SERVICE_NODE_PORT=30080
 #   LOADBALANCER_IP=172.31.x.x
 #   INGRESS_ENABLED=0|1
+#   TLS_ENABLED=0|1
+#   TLS_HOST=srvotptest26.init-db.lan
+#   TLS_SECRET_NAME=otp-relay-tls
+#   TLS_SELF_SIGNED=0|1
 #   PVC_STORAGE_CLASS=<storage-class-name>
 #   PVC_SIZE=1Gi
 #   REPLICA_COUNT=1
@@ -63,6 +67,10 @@ SERVICE_TYPE="${SERVICE_TYPE:-NodePort}"
 SERVICE_NODE_PORT="${SERVICE_NODE_PORT:-30080}"
 LOADBALANCER_IP="${LOADBALANCER_IP:-}"
 INGRESS_ENABLED="${INGRESS_ENABLED:-1}"
+TLS_ENABLED="${TLS_ENABLED:-0}"
+TLS_HOST="${TLS_HOST:-}"
+TLS_SECRET_NAME="${TLS_SECRET_NAME:-otp-relay-tls}"
+TLS_SELF_SIGNED="${TLS_SELF_SIGNED:-0}"
 PVC_STORAGE_CLASS="${PVC_STORAGE_CLASS:-}"
 PVC_SIZE="${PVC_SIZE:-1Gi}"
 REPLICA_COUNT="${REPLICA_COUNT:-1}"
@@ -87,6 +95,9 @@ if [ -n "${PORTAL_URL:-}" ]; then
   PORTAL_URL_EXPLICIT=1
 fi
 PORTAL_URL="${PORTAL_URL:-http://$SERVER_IP}"
+if [ "$PORTAL_URL_EXPLICIT" = "0" ] && [ "${TLS_ENABLED:-0}" = "1" ] && [ -n "${TLS_HOST:-}" ]; then
+  PORTAL_URL="https://$TLS_HOST"
+fi
 ASSIGNED_LOADBALANCER_ADDRESS=""
 PHONE_IP="${PHONE_IP:-172.31.10.161}"
 PHONE_INTERFACE="${PHONE_INTERFACE:-$(ip route show default 2>/dev/null | awk '{print $5; exit}') }"
@@ -309,6 +320,22 @@ validate_k8s_topology_settings() {
     *) fatal "unsupported REDIS_REQUIRED=$REDIS_REQUIRED. Use 0 or 1." ;;
   esac
 
+  case "$TLS_ENABLED" in
+    0|1) ;;
+    *) fatal "unsupported TLS_ENABLED=$TLS_ENABLED. Use 0 or 1." ;;
+  esac
+
+  case "$TLS_SELF_SIGNED" in
+    0|1) ;;
+    *) fatal "unsupported TLS_SELF_SIGNED=$TLS_SELF_SIGNED. Use 0 or 1." ;;
+  esac
+
+  if [ "$TLS_ENABLED" = "1" ]; then
+    [ "$INGRESS_ENABLED" = "1" ] || fatal "TLS_ENABLED=1 requires INGRESS_ENABLED=1"
+    [ -n "$TLS_HOST" ] || fatal "TLS_ENABLED=1 requires TLS_HOST"
+    [ -n "$TLS_SECRET_NAME" ] || fatal "TLS_ENABLED=1 requires TLS_SECRET_NAME"
+  fi
+
   if [ "$SERVICE_TYPE" = "NodePort" ]; then
     case "$SERVICE_NODE_PORT" in
       ''|*[!0-9]*) fatal "SERVICE_NODE_PORT must be numeric for SERVICE_TYPE=NodePort" ;;
@@ -419,6 +446,29 @@ check_loadbalancer_prereqs() {
     warn "MetalLB namespace was not found. LoadBalancer service may stay pending unless another load balancer is installed."
   fi
 }
+
+ensure_tls_secret_if_requested() {
+  [ "$TLS_ENABLED" = "1" ] || return 0
+  [ "$TLS_SELF_SIGNED" = "1" ] || return 0
+
+  log "creating/updating self-signed TLS secret $TLS_SECRET_NAME for $TLS_HOST"
+  tls_tmp_dir="$(mktemp -d /tmp/otp-relay-tls.XXXXXX)"
+  openssl req -x509 -nodes -newkey rsa:2048 \
+    -keyout "$tls_tmp_dir/tls.key" \
+    -out "$tls_tmp_dir/tls.crt" \
+    -days 825 \
+    -subj "/CN=$TLS_HOST" \
+    -addext "subjectAltName=DNS:$TLS_HOST"
+
+  k3s kubectl create secret tls "$TLS_SECRET_NAME" \
+    --namespace "$NAMESPACE" \
+    --cert="$tls_tmp_dir/tls.crt" \
+    --key="$tls_tmp_dir/tls.key" \
+    --dry-run=client -o yaml | k3s kubectl apply -f -
+
+  rm -rf "$tls_tmp_dir"
+}
+
 
 apply_runtime_configmap() {
   if [ -n "${MANIFEST_DIR:-}" ] && [ -f "$MANIFEST_DIR/configmap.yaml" ]; then
@@ -644,7 +694,7 @@ fi
 log "installing base OS packages required for repository sync and optional runner setup with apt-get"
 apt-get update
 apt-get install -y --no-install-recommends \
-  ca-certificates curl git tar gzip sudo python3
+  ca-certificates curl git tar gzip sudo python3 openssl
 
 install_github_runner
 
@@ -820,6 +870,9 @@ MONITOR_IMAGE="$MONITOR_IMAGE" \
 SERVICE_TYPE="$SERVICE_TYPE" \
 SERVICE_NODE_PORT="$SERVICE_NODE_PORT" \
 LOADBALANCER_IP="$LOADBALANCER_IP" \
+TLS_ENABLED="$TLS_ENABLED" \
+TLS_HOST="$TLS_HOST" \
+TLS_SECRET_NAME="$TLS_SECRET_NAME" \
 PVC_STORAGE_CLASS="$PVC_STORAGE_CLASS" \
 PVC_SIZE="$PVC_SIZE" \
 REPLICA_COUNT="$REPLICA_COUNT" \
@@ -1010,6 +1063,24 @@ for name in ["redis-service.yaml", "redis-statefulset.yaml", "redis-pdb.yaml"]:
 # Ingress
 if (manifest_dir / "ingress.yaml").exists():
     text = replace_namespace(read("ingress.yaml"))
+    tls_enabled = os.environ.get("TLS_ENABLED") == "1"
+    tls_host = os.environ.get("TLS_HOST", "")
+    tls_secret_name = os.environ.get("TLS_SECRET_NAME", "otp-relay-tls")
+
+    if tls_enabled:
+        text = re.sub(r"host: .*", f"host: {tls_host}", text)
+        if "tls:" not in text:
+            text += (
+                "  tls:\n"
+                "    - hosts:\n"
+                f"        - {tls_host}\n"
+                f"      secretName: {tls_secret_name}\n"
+            )
+        else:
+            text = re.sub(r"secretName: .*", f"secretName: {tls_secret_name}", text)
+    else:
+        text = re.sub(r"\n  tls:\n(?:    .+\n)+", "\n", text)
+
     write("ingress.yaml", text)
 PY_RENDER_MANIFESTS
 
@@ -1022,6 +1093,7 @@ if requires_monitor_image; then
 fi
 k3s kubectl apply --dry-run=client -f "$MANIFEST_DIR/namespace.yaml" >/dev/null
 k3s kubectl apply -f "$MANIFEST_DIR/namespace.yaml"
+ensure_tls_secret_if_requested
 k3s kubectl apply --dry-run=client \
   -f "$MANIFEST_DIR/configmap.yaml" \
   -f "$MANIFEST_DIR/pvc.yaml" \
@@ -1161,6 +1233,7 @@ Portal URL:   $PORTAL_URL/
 NodePort URL: http://$SERVER_IP:$SERVICE_NODE_PORT/
 Service type: $SERVICE_TYPE
 LoadBalancer: ${ASSIGNED_LOADBALANCER_ADDRESS:-${LOADBALANCER_IP:-auto/none}}
+Ingress:      enabled=$INGRESS_ENABLED tls=$TLS_ENABLED host=${TLS_HOST:-none} secret=${TLS_SECRET_NAME:-none} self_signed=$TLS_SELF_SIGNED
 MetalLB:      install=$INSTALL_METALLB range=${METALLB_IP_RANGE:-none}
 Namespace:    $NAMESPACE
 Repo path:    $INSTALL_DIR
@@ -1181,6 +1254,7 @@ Useful commands:
   k3s kubectl logs -n $NAMESPACE deployment/otp-relay
   k3s kubectl logs -n $NAMESPACE deployment/otp-monitor
   k3s kubectl get svc,ingress -n $NAMESPACE
+  curl -k --resolve ${TLS_HOST:-srvotptest26.init-db.lan}:443:172.31.11.120 https://${TLS_HOST:-srvotptest26.init-db.lan}/
   curl -i http://127.0.0.1/
   curl -i http://127.0.0.1:$SERVICE_NODE_PORT/
 
