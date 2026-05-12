@@ -26,11 +26,37 @@ on:
       ingress_enabled:
         description: "Enable Traefik ingress"
         required: true
-        default: "0"
+        default: "1"
         type: choice
         options:
           - "1"
           - "0"
+      tls_enabled:
+        description: "Enable HTTPS/TLS on Traefik Ingress"
+        required: true
+        default: "1"
+        type: choice
+        options:
+          - "0"
+          - "1"
+      tls_host:
+        description: "HTTPS hostname for OTP Relay Ingress"
+        required: true
+        default: "srvotptest26.init-db.lan"
+        type: string
+      tls_secret_name:
+        description: "Kubernetes TLS secret name for OTP Relay Ingress"
+        required: true
+        default: "otp-relay-tls"
+        type: string
+      tls_self_signed:
+        description: "Generate/update a self-signed TLS certificate in the installer"
+        required: true
+        default: "1"
+        type: choice
+        options:
+          - "0"
+          - "1"
       install_metallb:
         description: "Install/configure MetalLB before deploying"
         required: true
@@ -266,7 +292,11 @@ jobs:
           # Phase 3 placement/exposure defaults. Manual workflow runs can override these inputs.
           SERVICE_TYPE: ${{ github.event.inputs.service_type || 'LoadBalancer' }}
           SERVICE_NODE_PORT: "30080"
-          INGRESS_ENABLED: ${{ github.event.inputs.ingress_enabled || '0' }}
+          INGRESS_ENABLED: ${{ github.event.inputs.ingress_enabled || '1' }}
+          TLS_ENABLED: ${{ github.event.inputs.tls_enabled || '1' }}
+          TLS_HOST: ${{ github.event.inputs.tls_host || 'srvotptest26.init-db.lan' }}
+          TLS_SECRET_NAME: ${{ github.event.inputs.tls_secret_name || 'otp-relay-tls' }}
+          TLS_SELF_SIGNED: ${{ github.event.inputs.tls_self_signed || '1' }}
           LOADBALANCER_IP: ${{ github.event.inputs.loadbalancer_ip || '' }}
           INSTALL_METALLB: ${{ github.event.inputs.install_metallb || '0' }}
           REQUIRE_METALLB: ${{ github.event.inputs.require_metallb || '1' }}
@@ -294,6 +324,6 @@ jobs:
           PHONE_INTERFACE: ${{ secrets.PHONE_INTERFACE }}
           WHATSAPP_API_KEY: ${{ secrets.WHATSAPP_API_KEY }}
           WHATSAPP_RECIPIENT: ${{ secrets.WHATSAPP_RECIPIENT }}
-          PORTAL_URL: ${{ secrets.PORTAL_URL }}
+          PORTAL_URL: ${{ secrets.PORTAL_URL || 'https://srvotptest26.init-db.lan' }}
         run: |
           sudo -n -E /usr/bin/bash "$GITHUB_WORKSPACE/install-otp-relay-k8s.sh"
