@@ -57,15 +57,35 @@ on:
         required: false
         default: ""
         type: string
-      app_node:
-        description: "Optional hostname for app pod nodeSelector"
-        required: false
-        default: ""
+      app_node_selector_key:
+        description: "App pod nodeSelector key"
+        required: true
+        default: "otp-relay/storage-node"
         type: string
-      monitor_node:
-        description: "Optional hostname for monitor pod nodeSelector"
-        required: false
-        default: ""
+      app_node_selector_value:
+        description: "App pod nodeSelector value"
+        required: true
+        default: "true"
+        type: string
+      monitor_node_selector_key:
+        description: "Monitor pod nodeSelector key"
+        required: true
+        default: "otp-relay/monitor-node"
+        type: string
+      monitor_node_selector_value:
+        description: "Monitor pod nodeSelector value"
+        required: true
+        default: "true"
+        type: string
+      redis_node_selector_key:
+        description: "Redis pod nodeSelector key"
+        required: true
+        default: "otp-relay/storage-node"
+        type: string
+      redis_node_selector_value:
+        description: "Redis pod nodeSelector value"
+        required: true
+        default: "true"
         type: string
       pvc_storage_class:
         description: "Optional PVC storageClassName; use local-path for default K3s storage"
@@ -243,7 +263,7 @@ jobs:
           APP_IMAGE: otp-relay:latest
           MONITOR_IMAGE: otp-monitor:latest
 
-          # Phase 2 defaults. Manual workflow runs can override these inputs.
+          # Phase 3 placement/exposure defaults. Manual workflow runs can override these inputs.
           SERVICE_TYPE: ${{ github.event.inputs.service_type || 'LoadBalancer' }}
           SERVICE_NODE_PORT: "30080"
           INGRESS_ENABLED: ${{ github.event.inputs.ingress_enabled || '0' }}
@@ -253,10 +273,12 @@ jobs:
           METALLB_IP_RANGE: ${{ github.event.inputs.metallb_ip_range || '' }}
 
           REPLICA_COUNT: "1"
-          APP_NODE_SELECTOR_KEY: ${{ github.event.inputs.app_node && 'kubernetes.io/hostname' || '' }}
-          APP_NODE_SELECTOR_VALUE: ${{ github.event.inputs.app_node || '' }}
-          MONITOR_NODE_SELECTOR_KEY: ${{ github.event.inputs.monitor_node && 'kubernetes.io/hostname' || '' }}
-          MONITOR_NODE_SELECTOR_VALUE: ${{ github.event.inputs.monitor_node || '' }}
+          APP_NODE_SELECTOR_KEY: ${{ github.event.inputs.app_node_selector_key || 'otp-relay/storage-node' }}
+          APP_NODE_SELECTOR_VALUE: ${{ github.event.inputs.app_node_selector_value || 'true' }}
+          MONITOR_NODE_SELECTOR_KEY: ${{ github.event.inputs.monitor_node_selector_key || 'otp-relay/monitor-node' }}
+          MONITOR_NODE_SELECTOR_VALUE: ${{ github.event.inputs.monitor_node_selector_value || 'true' }}
+          REDIS_NODE_SELECTOR_KEY: ${{ github.event.inputs.redis_node_selector_key || 'otp-relay/storage-node' }}
+          REDIS_NODE_SELECTOR_VALUE: ${{ github.event.inputs.redis_node_selector_value || 'true' }}
           PVC_STORAGE_CLASS: ${{ github.event.inputs.pvc_storage_class || 'local-path' }}
           PVC_SIZE: ${{ github.event.inputs.pvc_size || '1Gi' }}
 
