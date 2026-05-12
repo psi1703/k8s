@@ -6,7 +6,8 @@ metadata:
 spec:
   ingressClassName: traefik
   rules:
-    - http:
+    - host: srvotptest26.init-db.lan
+      http:
         paths:
           - path: /
             pathType: Prefix
@@ -15,3 +16,7 @@ spec:
                 name: otp-relay
                 port:
                   number: 80
+  tls:
+    - hosts:
+        - srvotptest26.init-db.lan
+      secretName: otp-relay-tls
