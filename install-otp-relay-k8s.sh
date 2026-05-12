@@ -24,6 +24,8 @@ set -Eeuo pipefail
 #   APP_NODE_SELECTOR_VALUE=<node-name>
 #   MONITOR_NODE_SELECTOR_KEY=kubernetes.io/hostname
 #   MONITOR_NODE_SELECTOR_VALUE=<node-name>
+#   REDIS_NODE_SELECTOR_KEY=kubernetes.io/hostname
+#   REDIS_NODE_SELECTOR_VALUE=<node-name>
 #   REQUIRE_METALLB=0|1
 #   INSTALL_METALLB=0|1
 #   METALLB_VERSION=v0.15.3
@@ -68,6 +70,8 @@ APP_NODE_SELECTOR_KEY="${APP_NODE_SELECTOR_KEY:-}"
 APP_NODE_SELECTOR_VALUE="${APP_NODE_SELECTOR_VALUE:-}"
 MONITOR_NODE_SELECTOR_KEY="${MONITOR_NODE_SELECTOR_KEY:-}"
 MONITOR_NODE_SELECTOR_VALUE="${MONITOR_NODE_SELECTOR_VALUE:-}"
+REDIS_NODE_SELECTOR_KEY="${REDIS_NODE_SELECTOR_KEY:-}"
+REDIS_NODE_SELECTOR_VALUE="${REDIS_NODE_SELECTOR_VALUE:-}"
 REQUIRE_METALLB="${REQUIRE_METALLB:-0}"
 INSTALL_METALLB="${INSTALL_METALLB:-0}"
 METALLB_VERSION="${METALLB_VERSION:-v0.15.3}"
@@ -328,6 +332,10 @@ validate_k8s_topology_settings() {
 
   if { [ -n "$MONITOR_NODE_SELECTOR_KEY" ] && [ -z "$MONITOR_NODE_SELECTOR_VALUE" ]; } || { [ -z "$MONITOR_NODE_SELECTOR_KEY" ] && [ -n "$MONITOR_NODE_SELECTOR_VALUE" ]; }; then
     fatal "MONITOR_NODE_SELECTOR_KEY and MONITOR_NODE_SELECTOR_VALUE must be set together"
+  fi
+
+  if { [ -n "$REDIS_NODE_SELECTOR_KEY" ] && [ -z "$REDIS_NODE_SELECTOR_VALUE" ]; } || { [ -z "$REDIS_NODE_SELECTOR_KEY" ] && [ -n "$REDIS_NODE_SELECTOR_VALUE" ]; }; then
+    fatal "REDIS_NODE_SELECTOR_KEY and REDIS_NODE_SELECTOR_VALUE must be set together"
   fi
 }
 
@@ -690,6 +698,7 @@ log "cluster storage classes"
 k3s kubectl get storageclass 2>/dev/null || true
 validate_selected_node "$APP_NODE_SELECTOR_KEY" "$APP_NODE_SELECTOR_VALUE" "app"
 validate_selected_node "$MONITOR_NODE_SELECTOR_KEY" "$MONITOR_NODE_SELECTOR_VALUE" "monitor"
+validate_selected_node "$REDIS_NODE_SELECTOR_KEY" "$REDIS_NODE_SELECTOR_VALUE" "redis"
 install_metallb_if_requested
 check_loadbalancer_prereqs
 
@@ -818,6 +827,8 @@ APP_NODE_SELECTOR_KEY="$APP_NODE_SELECTOR_KEY" \
 APP_NODE_SELECTOR_VALUE="$APP_NODE_SELECTOR_VALUE" \
 MONITOR_NODE_SELECTOR_KEY="$MONITOR_NODE_SELECTOR_KEY" \
 MONITOR_NODE_SELECTOR_VALUE="$MONITOR_NODE_SELECTOR_VALUE" \
+REDIS_NODE_SELECTOR_KEY="$REDIS_NODE_SELECTOR_KEY" \
+REDIS_NODE_SELECTOR_VALUE="$REDIS_NODE_SELECTOR_VALUE" \
 PHONE_IP="$PHONE_IP" \
 PHONE_INTERFACE="$PHONE_INTERFACE" \
 PHONE_PING_INTERVAL="$PHONE_PING_INTERVAL" \
@@ -984,6 +995,7 @@ for name in ["redis-service.yaml", "redis-statefulset.yaml", "redis-pdb.yaml"]:
     if path.exists():
         text = replace_namespace(read(name))
         if name == "redis-statefulset.yaml":
+            text = add_nodesel(text, os.environ.get("REDIS_NODE_SELECTOR_KEY", ""), os.environ.get("REDIS_NODE_SELECTOR_VALUE", ""))
             text = re.sub(r"\n        storageClassName: .*", "", text)
             redis_storage_class = os.environ.get("REDIS_STORAGE_CLASS", "")
             if redis_storage_class:
@@ -1159,6 +1171,7 @@ Runner only:  $RUNNER_ONLY
 Deploy mode:  $DEPLOY_MODE
 App node selector:     ${APP_NODE_SELECTOR_KEY:-none}=${APP_NODE_SELECTOR_VALUE:-}
 Monitor node selector: ${MONITOR_NODE_SELECTOR_KEY:-none}=${MONITOR_NODE_SELECTOR_VALUE:-}
+Redis node selector:   ${REDIS_NODE_SELECTOR_KEY:-none}=${REDIS_NODE_SELECTOR_VALUE:-}
 PVC storage:           ${PVC_STORAGE_CLASS:-default} / $PVC_SIZE
 Redis:                enabled=$REDIS_ENABLED required=$REDIS_REQUIRED url=${REDIS_URL:-none} storage=${REDIS_STORAGE_CLASS:-default}/$REDIS_SIZE
 
