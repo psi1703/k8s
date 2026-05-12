@@ -30,3 +30,30 @@ Do not move the app or Redis workloads to worker nodes unless storage is intenti
 
 - `debian`: control-plane, storage anchor, monitor node.
 - Future worker nodes may be added, but storage-bound workloads should remain pinned until storage migration is planned.
+
+## Summary
+
+Documents the completed Phase 3 resilience checkpoint for the OTP Relay K3s cluster.
+
+## Confirmed state
+
+- 3-node K3s cluster is healthy:
+  - debian control-plane
+  - otp-worker-1
+  - otp-worker-2
+- K3s ServiceLB/Klipper is disabled.
+- MetalLB is active and serving the OTP Relay LoadBalancer IP.
+- MetalLB speakers are running on all three nodes.
+- OTP Relay app, Redis, and monitor remain pinned to debian.
+- Local-path PVCs remain bound to debian.
+- `/readyz` reports Redis healthy and required.
+
+## Validation completed
+
+- App pod restart test passed.
+- Redis pod restart test passed.
+- Monitor pod restart test passed.
+- Worker scheduling test passed on both workers.
+- otp-worker-1 drain/uncordon test passed.
+- otp-worker-2 drain/uncordon test passed.
+- No OTP Relay service disruption observed.
