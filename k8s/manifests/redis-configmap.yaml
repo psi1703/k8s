@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otp-redis-config
+  namespace: otp-relay
+data:
+  redis.conf: |
+    port 6379
+    bind 0.0.0.0
+    protected-mode no
+    appendonly yes
+    dir /data
+    replica-announce-ip ${POD_NAME}.otp-redis-headless.otp-relay.svc.cluster.local
+    replica-announce-port 6379
+  redis-entrypoint.sh: |
+    #!/bin/sh
+    set -eu
+
+    ordinal="${HOSTNAME##*-}"
+
+    if [ "$ordinal" = "0" ]; then
+      exec redis-server /etc/redis/redis.conf
+    fi
+
+    exec redis-server /etc/redis/redis.conf --replicaof otp-redis-0.otp-redis-headless.otp-relay.svc.cluster.local 6379

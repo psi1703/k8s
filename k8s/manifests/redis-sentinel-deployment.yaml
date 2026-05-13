@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otp-redis-sentinel
+  namespace: otp-relay
+  labels:
+    app: otp-redis-sentinel
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: otp-redis-sentinel
+  template:
+    metadata:
+      labels:
+        app: otp-redis-sentinel
+    spec:
+      containers:
+        - name: sentinel
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - /etc/redis-sentinel/sentinel-entrypoint.sh
+          ports:
+            - containerPort: 26379
+              name: sentinel
+          readinessProbe:
+            tcpSocket:
+              port: 26379
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 26379
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 150m
+              memory: 128Mi
+          volumeMounts:
+            - name: sentinel-config
+              mountPath: /etc/redis-sentinel
+      volumes:
+        - name: sentinel-config
+          configMap:
+            name: otp-redis-sentinel-config
+            defaultMode: 0755
