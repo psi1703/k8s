@@ -59,8 +59,12 @@ INSTALL_METALLB=0
 REQUIRE_METALLB=1
 METALLB_IP_RANGE=
 
-PVC_STORAGE_CLASS=local-path
+PVC_STORAGE_CLASS=
 PVC_SIZE=1Gi
+NFS_ENABLED=0
+NFS_SERVER=
+NFS_PATH=
+NFS_STORAGE_CLASS=otp-relay-nfs
 
 APP_NODE_SELECTOR_KEY=otp-relay/storage-node
 APP_NODE_SELECTOR_VALUE=true
@@ -114,7 +118,7 @@ Do not present the direct HTTP service path as the final user-facing production 
 The app runtime state has been moved to Redis, but two production blockers remain:
 
 ```text
-app PVC is still local-path/ReadWriteOnce
+app PVC must be migrated to NFS/RWX before app HA is claimed
 Redis is still a single StatefulSet pod
 ```
 
@@ -129,12 +133,13 @@ Do not raise the app replica count until shared storage, Redis HA, and final OTP
 
 ## Storage status
 
-Current app storage:
+Current app storage path:
 
 ```text
 PVC: otp-relay-data
-storageClassName: local-path
-accessModes: ReadWriteOnce
+pre-migration storageClassName: local-path
+NFS target storageClassName: otp-relay-nfs
+NFS target accessModes: ReadWriteMany
 ```
 
 Current Redis storage:
@@ -145,7 +150,7 @@ storageClassName: local-path
 accessModes: ReadWriteOnce
 ```
 
-This is acceptable for validation. It is not SCH's final production target. The target requires shared/RWX/network storage for app data and a Redis storage model appropriate for HA Redis.
+The repo now supports static NFS storage for app data. Existing local-path PVCs must be migrated during a maintenance window. Redis still needs a separate HA storage/design decision.
 
 ## Redis status
 

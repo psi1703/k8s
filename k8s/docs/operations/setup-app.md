@@ -1,6 +1,6 @@
 # OTP Relay — setup and operations guide
 
-> Current status note: the repo is now in a Phase 3 SCH-alignment validation baseline. Redis-backed OTP/admin runtime state is enabled and required, Traefik HTTPS is the current validation path, and the app remains at one replica because storage is still `local-path`/`ReadWriteOnce` and Redis is still single-instance. See `docs/operations/sch-target-vs-current.md` for the current target/current gap table.
+> Current status note: the repo is now in a Phase 3 SCH-alignment validation baseline. Redis-backed OTP/admin runtime state is enabled and required, Traefik HTTPS is the current validation path, and the app remains at one replica until the live app PVC is migrated to NFS/RWX and Redis is still single-instance. See `docs/operations/sch-target-vs-current.md` for the current target/current gap table.
 
 
 **For:** Jathin

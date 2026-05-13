@@ -56,18 +56,18 @@ Keep these constraints until SCH target gaps are closed:
 REPLICA_COUNT=1
 strategy: Recreate
 REDIS_REQUIRED=1
-PVC_STORAGE_CLASS=local-path unless an approved shared storage class is supplied
+PVC_STORAGE_CLASS=otp-relay-nfs when NFS_ENABLED=1; local-path only before migration
 REDIS_STORAGE_CLASS=local-path unless an approved Redis storage design is supplied
 TLS_SELF_SIGNED=1; TLS remains enabled and IT will distribute/trust the certificate by Group Policy
 ```
 
 ## Storage note
 
-The current app and Redis persistent volumes default to K3s `local-path` storage with `ReadWriteOnce` access.
+The repo now supports a static NFS `PersistentVolume` and `ReadWriteMany` app PVC when `NFS_ENABLED=1`. Existing clusters that already have `otp-relay-data` on K3s `local-path` must be migrated during a maintenance window because Kubernetes cannot change a PVC storage class in place.
 
-That is acceptable for validation, but it is not SCH's final target. SCH's target design expects shared or network-backed persistent storage so that workloads can move between nodes safely.
+Redis still uses the current Redis PVC until the separate Redis HA/Sentinel/approved Redis design is implemented.
 
-Do not scale the app above one replica or move storage-bound workloads freely across workers until `/app/data` storage is migrated to an approved shared/RWX/network storage backend.
+Do not scale the app above one replica until `/app/data` is actually migrated to NFS, Redis behavior is revalidated, and final two-replica OTP validation is complete.
 
 ## Redis note
 
@@ -87,7 +87,7 @@ internal DNS hostname -> self-signed certificate trusted by IT Group Policy -> T
 
 1. Confirm final LB/VIP model with SCH.
 2. Confirm self-signed TLS certificate trust distribution through IT Group Policy.
-3. Replace app `local-path`/RWO storage with approved shared RWX/network storage.
+3. Provision the NFS export and migrate app `/app/data` from `local-path`/RWO to NFS/RWX storage.
 4. Replace single Redis pod with HA Redis/Sentinel/Cluster or managed Redis.
 5. Re-run pending OTP restart-survival test.
 6. Re-run manager live OTP trigger test.

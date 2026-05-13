@@ -28,7 +28,7 @@ Current validated characteristics:
 | App runtime state | OTP queue, pending OTPs, admin sessions, and login attempts are Redis-backed | Good |
 | Redis | Single Redis StatefulSet, one pod | Functional but not HA |
 | App replicas | `REPLICA_COUNT=1` | Safe current setting, not final target |
-| App storage | PVC using `local-path`, `ReadWriteOnce` by default | Functional but not shared/RWX production storage |
+| App storage | Supports static NFS `ReadWriteMany` PV/PVC when `NFS_ENABLED=1`; existing clusters may still be on `local-path` until migrated | NFS support added; live migration requires NFS server/export and PVC migration |
 | Redis storage | Redis PVC using `local-path`, `ReadWriteOnce` by default | Functional but not HA production storage |
 | Monitor | Required pod, `hostNetwork: true`, `NET_RAW`, no Service/Ingress | Aligned |
 | Rollout strategy | `Recreate` | Correct while app PVC is RWO |
@@ -57,7 +57,7 @@ Target characteristics:
 | External access | DNS plus approved LB/VIP path such as F5, HAProxy, Keepalived, or confirmed MetalLB equivalent | Confirm final production LB/VIP model |
 | TLS | HTTPS using certificate trusted on user machines | Keep self-signed TLS enabled; IT distributes/trusts the certificate via Group Policy |
 | App replicas | Multiple FastAPI app pods | Requires shared storage and final OTP multi-replica validation |
-| App storage | Shared RWX/network persistent storage | Replace `local-path`/RWO with approved RWX/network storage |
+| App storage | Shared RWX/network persistent storage | Implemented as static NFS PV/PVC for app data; migrate existing local-path PVC during maintenance |
 | Redis | HA Redis/Sentinel/Cluster or managed Redis | Replace single Redis pod with HA Redis design |
 | Redis persistence | Resilient storage appropriate for Redis HA design | Replace local single-PVC assumption |
 | Failover | Pod kill, node drain, and app movement tests with real state survival | Run after shared storage and Redis HA are implemented |
@@ -67,7 +67,7 @@ Target characteristics:
 
 These are expected gaps between the current validated implementation and SCH's production target:
 
-1. **Storage gap:** app and Redis PVCs are `local-path`/`ReadWriteOnce`, not shared RWX/network storage.
+1. **Storage gap:** app PVC now has an NFS/RWX path available, but any live `local-path` PVC must still be migrated. Redis PVC remains `local-path`/`ReadWriteOnce` until the Redis HA design is implemented.
 2. **Redis HA gap:** Redis is currently a single StatefulSet replica, not Sentinel/Cluster/managed HA Redis.
 3. **App HA gap:** app replicas remain forced to `1`; this is intentional until storage and HA state are ready.
 4. **TLS trust gap:** self-signed TLS stays enabled. IT must distribute/trust the certificate by Group Policy. Users may see a browser warning until policy reaches their machines.
@@ -86,14 +86,14 @@ strategy: Recreate
 REDIS_REQUIRED=1
 monitor has no Service or Ingress
 self-signed TLS stays enabled; IT will distribute/trust the certificate by Group Policy
-local-path storage is documented as temporary validation storage
+NFS shared app storage is the target path; local-path remains validation-only or pre-migration storage
 ```
 
 ## Recommended next engineering order
 
 1. Confirm the final production LB/VIP model with SCH.
 2. Confirm IT Group Policy distribution/trust of the self-signed TLS certificate on user machines.
-3. Choose and implement shared RWX/network storage for `/app/data`.
+3. Provision the NFS export and migrate `/app/data` from local-path to the NFS-backed RWX PVC.
 4. Replace single Redis with HA Redis/Sentinel/Cluster or a managed Redis endpoint.
 5. Re-test pending OTP survival, admin sessions, and queue behavior during app pod restart.
 6. Run controlled `REPLICA_COUNT=2` OTP validation.
@@ -105,5 +105,5 @@ local-path storage is documented as temporary validation storage
 Use this wording when reporting project status:
 
 ```text
-The current repo has a validated Phase 3 baseline on K3s with MetalLB, Traefik HTTPS, Redis-required shared runtime state, and an isolated monitor pod. It is not yet the final SCH production architecture. Remaining production gaps are shared RWX/network storage, HA Redis, TLS trust via IT Group Policy and VIP alignment, and safe multi-replica app validation.
+The current repo has a validated Phase 3 baseline on K3s with MetalLB, Traefik HTTPS, Redis-required shared runtime state, an isolated monitor pod, and repo support for NFS-backed RWX app storage. It is not yet the final SCH production architecture until the live PVC is migrated to NFS, Redis is made HA, TLS trust is distributed by IT Group Policy, VIP alignment is confirmed, and safe multi-replica app validation is complete.
 ```
