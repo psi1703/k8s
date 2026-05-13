@@ -1,5 +1,8 @@
 # OTP Relay → Kubernetes: The Actual Plan
 
+> Current status note: the repo is now in a Phase 3 SCH-alignment validation baseline. Redis-backed OTP/admin runtime state is enabled and required, Traefik HTTPS is the current validation path, and the app remains at one replica because storage is still `local-path`/`ReadWriteOnce` and Redis is still single-instance. See `docs/operations/sch-target-vs-current.md` for the current target/current gap table.
+
+
 **Audience:** Christian, the IT guy, and whoever else is coming along for the ride.  
 **TL;DR:** We are not building a dual-DC HA cloud platform. We are learning Kubernetes by containerising a tool we already use, in phases, without blowing ourselves up.
 
