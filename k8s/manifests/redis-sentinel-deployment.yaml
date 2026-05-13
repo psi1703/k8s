@@ -15,6 +15,25 @@ spec:
       labels:
         app: otp-redis-sentinel
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - otp-redis-sentinel
+                topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: otp-redis-sentinel
       containers:
         - name: sentinel
           image: redis:7-alpine
@@ -27,7 +46,7 @@ spec:
               name: sentinel
           env:
             - name: SENTINEL_CONFIG_VERSION
-              value: "2026-05-13-redis-announce-fix"
+              value: "2026-05-13-redis-node-spread"
           readinessProbe:
             tcpSocket:
               port: 26379
