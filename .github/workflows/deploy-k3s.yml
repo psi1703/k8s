@@ -235,7 +235,7 @@ jobs:
                 MANIFESTS_CHANGED=1
                 ;;
 
-              README.md|LICENSE|.gitignore|docs/*|docs/**|k8s/docs/*|k8s/docs/**|scripts/generate_sample_users.py)
+              README.md|LICENSE|.gitignore|docs/*|docs/**|scripts/generate_sample_users.py)
                 DOCS_ONLY_CHANGED=1
                 ;;
 
