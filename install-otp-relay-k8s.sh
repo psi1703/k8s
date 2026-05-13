@@ -828,7 +828,16 @@ for required_manifest in namespace.yaml pvc.yaml deployment.yaml service.yaml de
   [ -f "k8s/manifests/$required_manifest" ] || fatal "k8s/manifests/$required_manifest is missing"
 done
 if [ "$REDIS_ENABLED" = "1" ]; then
-  for required_manifest in redis-service.yaml redis-statefulset.yaml redis-pdb.yaml; do
+  for required_manifest in \
+    redis-service.yaml \
+    redis-configmap.yaml \
+    redis-statefulset.yaml \
+    redis-sentinel-configmap.yaml \
+    redis-sentinel-deployment.yaml \
+    redis-sentinel-service.yaml \
+    redis-haproxy-configmap.yaml \
+    redis-haproxy-deployment.yaml \
+    redis-pdb.yaml; do
     [ -f "k8s/manifests/$required_manifest" ] || fatal "k8s/manifests/$required_manifest is missing"
   done
 fi
@@ -918,6 +927,23 @@ else
     && [ "$PVC_STORAGE_CLASS" != "$existing_pvc_storage_class" ]; then
     fatal "PVC otp-relay-data already exists with storageClassName=$existing_pvc_storage_class; refusing to change immutable storageClassName to $PVC_STORAGE_CLASS"
   fi
+fi
+
+existing_redis_service_name="$(
+  k3s kubectl get statefulset otp-redis \
+    -n "$NAMESPACE" \
+    -o jsonpath='{.spec.serviceName}' 2>/dev/null || true
+)"
+existing_redis_service_name="$(printf '%s' "$existing_redis_service_name" | xargs)"
+
+MIGRATE_REDIS_TO_HA=0
+if [ "$REDIS_ENABLED" = "1" ] \
+  && [ -n "$existing_redis_service_name" ] \
+  && [ "$existing_redis_service_name" != "otp-redis-headless" ]; then
+  warn "Existing Redis StatefulSet uses serviceName=$existing_redis_service_name"
+  warn "Redis HA/Sentinel requires recreating StatefulSet otp-redis with serviceName=otp-redis-headless."
+  warn "Redis PVC data for otp-redis-0 will be preserved; active Redis runtime state may be interrupted during migration."
+  MIGRATE_REDIS_TO_HA=1
 fi
 
 log "rendering runtime values into staged repository manifests"
@@ -1132,8 +1158,22 @@ if (manifest_dir / "service.yaml").exists():
         text = text.replace("      targetPort: 8000\n", f"      targetPort: 8000\n      nodePort: {os.environ['SERVICE_NODE_PORT']}\n", 1)
     write("service.yaml", text)
 
-# Redis manifests
-for name in ["redis-service.yaml", "redis-statefulset.yaml", "redis-pdb.yaml"]:
+# Redis HA manifests.
+# The app continues to use REDIS_URL=redis://otp-redis:6379/0.
+# service/otp-redis points at HAProxy, and HAProxy routes traffic to the
+# current Redis master selected by Sentinel failover.
+redis_manifests = [
+    "redis-service.yaml",
+    "redis-configmap.yaml",
+    "redis-statefulset.yaml",
+    "redis-sentinel-configmap.yaml",
+    "redis-sentinel-deployment.yaml",
+    "redis-sentinel-service.yaml",
+    "redis-haproxy-configmap.yaml",
+    "redis-haproxy-deployment.yaml",
+    "redis-pdb.yaml",
+]
+for name in redis_manifests:
     path = manifest_dir / name
     if path.exists():
         text = replace_namespace(read(name))
@@ -1148,6 +1188,8 @@ for name in ["redis-service.yaml", "redis-statefulset.yaml", "redis-pdb.yaml"]:
                     1,
                 )
             text = re.sub(r"(\n            storage: ).*", rf"\g<1>{os.environ['REDIS_SIZE']}", text)
+        elif name in ["redis-sentinel-deployment.yaml", "redis-haproxy-deployment.yaml"]:
+            text = add_nodesel(text, os.environ.get("REDIS_NODE_SELECTOR_KEY", ""), os.environ.get("REDIS_NODE_SELECTOR_VALUE", ""))
         write(name, text)
 
 # Ingress
@@ -1200,7 +1242,13 @@ fi
 if [ "$REDIS_ENABLED" = "1" ]; then
   k3s kubectl apply --dry-run=client \
     -f "$MANIFEST_DIR/redis-service.yaml" \
+    -f "$MANIFEST_DIR/redis-configmap.yaml" \
     -f "$MANIFEST_DIR/redis-statefulset.yaml" \
+    -f "$MANIFEST_DIR/redis-sentinel-configmap.yaml" \
+    -f "$MANIFEST_DIR/redis-sentinel-deployment.yaml" \
+    -f "$MANIFEST_DIR/redis-sentinel-service.yaml" \
+    -f "$MANIFEST_DIR/redis-haproxy-configmap.yaml" \
+    -f "$MANIFEST_DIR/redis-haproxy-deployment.yaml" \
     -f "$MANIFEST_DIR/redis-pdb.yaml" >/dev/null
 fi
 
@@ -1318,11 +1366,50 @@ if requires_manifests_apply; then
   k3s kubectl apply -f "$MANIFEST_DIR/pvc.yaml"
 
   if [ "$REDIS_ENABLED" = "1" ]; then
-    log "applying Redis shared-state resources"
+    if [ "${MIGRATE_REDIS_TO_HA:-0}" = "1" ]; then
+      log "migrating Redis from single StatefulSet service to Sentinel/HAProxy topology"
+      warn "Active Redis-backed sessions and pending OTP runtime state may be interrupted during this migration."
+
+      if k3s kubectl get deployment otp-relay -n "$NAMESPACE" >/dev/null 2>&1; then
+        log "scaling deployment/otp-relay to 0 before Redis HA migration"
+        k3s kubectl scale deployment otp-relay -n "$NAMESPACE" --replicas=0
+      fi
+
+      log "deleting old StatefulSet otp-redis so immutable serviceName can change to otp-redis-headless"
+      k3s kubectl delete statefulset otp-redis -n "$NAMESPACE" --ignore-not-found=true --wait=false
+
+      log "waiting for old Redis pods to terminate before applying HA Redis StatefulSet"
+      for i in $(seq 1 180); do
+        old_redis_pods="$({
+          k3s kubectl get pods -n "$NAMESPACE" -l app=otp-redis -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null || true
+        })"
+        old_redis_pods="$(printf '%s' "$old_redis_pods" | xargs || true)"
+        if [ -z "$old_redis_pods" ]; then
+          break
+        fi
+        warn "Old Redis pod(s) still terminating: $old_redis_pods"
+        sleep 2
+        [ "$i" -lt 180 ] || fatal "old Redis pod(s) did not terminate before HA migration: $old_redis_pods"
+      done
+    fi
+
+    log "applying Redis HA shared-state resources"
+    k3s kubectl apply -f "$MANIFEST_DIR/redis-configmap.yaml"
     k3s kubectl apply -f "$MANIFEST_DIR/redis-service.yaml"
     k3s kubectl apply -f "$MANIFEST_DIR/redis-statefulset.yaml"
+    k3s kubectl apply -f "$MANIFEST_DIR/redis-sentinel-configmap.yaml"
+    k3s kubectl apply -f "$MANIFEST_DIR/redis-sentinel-service.yaml"
+    k3s kubectl apply -f "$MANIFEST_DIR/redis-sentinel-deployment.yaml"
+    k3s kubectl apply -f "$MANIFEST_DIR/redis-haproxy-configmap.yaml"
+    k3s kubectl apply -f "$MANIFEST_DIR/redis-haproxy-deployment.yaml"
     k3s kubectl apply -f "$MANIFEST_DIR/redis-pdb.yaml"
-    k3s kubectl rollout status statefulset/otp-redis -n "$NAMESPACE" --timeout=180s
+
+    log "waiting for Redis StatefulSet rollout"
+    k3s kubectl rollout status statefulset/otp-redis -n "$NAMESPACE" --timeout=300s
+    log "waiting for Redis Sentinel rollout"
+    k3s kubectl rollout status deployment/otp-redis-sentinel -n "$NAMESPACE" --timeout=240s
+    log "waiting for Redis HAProxy rollout"
+    k3s kubectl rollout status deployment/otp-redis-haproxy -n "$NAMESPACE" --timeout=240s
   fi
 
   if [ "$DEPLOY_MODE" = "full" ] || [ "$DEPLOY_MODE" = "app" ] || [ "$DEPLOY_MODE" = "manifests" ]; then
@@ -1423,6 +1510,9 @@ Useful commands:
   k3s kubectl logs -n $NAMESPACE deployment/otp-relay
   k3s kubectl logs -n $NAMESPACE deployment/otp-monitor
   k3s kubectl get svc,ingress -n $NAMESPACE
+  k3s kubectl get pods -n $NAMESPACE -l app=otp-redis -o wide
+  k3s kubectl get pods -n $NAMESPACE -l app=otp-redis-sentinel -o wide
+  k3s kubectl get pods -n $NAMESPACE -l app=otp-redis-haproxy -o wide
   curl -k --resolve ${TLS_HOST:-srvotptest26.init-db.lan}:443:172.31.11.120 https://${TLS_HOST:-srvotptest26.init-db.lan}/
   curl -i http://127.0.0.1/
   curl -i http://127.0.0.1:$SERVICE_NODE_PORT/
