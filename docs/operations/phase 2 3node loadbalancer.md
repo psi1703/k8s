@@ -1,22 +1,26 @@
-# Phase 2: 3-node, LoadBalancer, and Redis foundation alignment
+# Phase 2 and Phase 3: 3-node, LoadBalancer, Traefik HTTPS, and Redis alignment
 
-Phase 2 keeps the Phase 1 source-of-truth model:
+This document keeps the historical Phase 2 work visible, but the current repository state has moved into the Phase 3 validation baseline.
+
+For SCH target/current alignment, see:
+
+```text
+docs/operations/sch-target-vs-current.md
+```
+
+## Deployment source of truth
+
+The deployment source of truth remains the GitHub repository:
 
 ```text
 GitHub main -> GitHub Actions -> installer -> K3s
 ```
 
-The deployment source of truth remains the GitHub repository. The installer runs from the checked-out commit, syncs `/opt/otp-relay-k8s` to `origin/main`, stages the committed Dockerfiles and Kubernetes manifests, renders runtime values, and applies them to K3s.
+The installer runs from the checked-out commit, syncs `/opt/otp-relay-k8s` to `origin/main`, stages the committed Dockerfiles and Kubernetes manifests, renders runtime values, and applies them to K3s.
 
-Phase 2 adds cluster deployment options and prepares the application for Redis-backed shared state.
+## Historical Phase 2 status
 
-## Phase 2 status
-
-Phase 2 is being implemented in two parts.
-
-### Phase 2A: deployment and platform alignment
-
-Completed:
+Phase 2 completed the foundation needed before SCH-style cluster validation:
 
 ```text
 GitHub Actions deployment through self-hosted runner
@@ -29,312 +33,194 @@ PVC persistence
 nodeSelector support
 single replica enforcement
 automatic PORTAL_URL update from assigned LoadBalancer IP
-```
-
-### Phase 2B: Redis shared-state foundation
-
-In progress:
-
-```text
-Redis service and StatefulSet
-Redis PVC
-Redis PDB
+Redis service, StatefulSet, PVC, and PDB
 REDIS_URL passed to app
 /readyz Redis connectivity check
+Redis-backed OTP queue
+Redis-backed pending OTP display state
+Redis-backed admin sessions
+Redis-backed admin login-attempt and lockout state
+REDIS_REQUIRED=1 validation/default posture
 ```
 
-Pending after Redis foundation:
+## Current Phase 3 validation values
 
-```text
-move claim_queue to Redis
-move pending_otps to Redis
-move admin sessions to Redis
-then allow REPLICA_COUNT=2
-```
-
-Until queue, OTP, and session state are moved to Redis, the app must remain:
-
-```text
-REPLICA_COUNT=1
-```
-
-## Supported Phase 2 options
-
-```text
-SERVICE_TYPE=NodePort|LoadBalancer
-INGRESS_ENABLED=0|1
-LOADBALANCER_IP=
-INSTALL_METALLB=0|1
-REQUIRE_METALLB=0|1
-METALLB_IP_RANGE=
-METALLB_POOL_NAME=otp-relay-pool
-
-PVC_STORAGE_CLASS=local-path
-PVC_SIZE=1Gi
-
-APP_NODE_SELECTOR_KEY=
-APP_NODE_SELECTOR_VALUE=
-MONITOR_NODE_SELECTOR_KEY=
-MONITOR_NODE_SELECTOR_VALUE=
-
-REDIS_ENABLED=0|1
-REDIS_URL=redis://otp-redis:6379/0
-REDIS_REQUIRED=0|1
-REDIS_STORAGE_CLASS=local-path
-REDIS_SIZE=1Gi
-
-REPLICA_COUNT=1
-```
-
-## Recommended Phase 2A / current production values
+The current SCH-alignment validation path is:
 
 ```text
 SERVICE_TYPE=LoadBalancer
-INGRESS_ENABLED=0
+LOADBALANCER_IP=
+INGRESS_ENABLED=1
+TLS_ENABLED=1
+TLS_HOST=srvotptest26.init-db.lan
+TLS_SECRET_NAME=otp-relay-tls
+TLS_SELF_SIGNED=1
 INSTALL_METALLB=0
 REQUIRE_METALLB=1
 METALLB_IP_RANGE=
-LOADBALANCER_IP=
-
-APP_NODE_SELECTOR_KEY=kubernetes.io/hostname
-APP_NODE_SELECTOR_VALUE=<app-node>
-
-MONITOR_NODE_SELECTOR_KEY=kubernetes.io/hostname
-MONITOR_NODE_SELECTOR_VALUE=<phone-network-node>
 
 PVC_STORAGE_CLASS=local-path
 PVC_SIZE=1Gi
 
+APP_NODE_SELECTOR_KEY=otp-relay/storage-node
+APP_NODE_SELECTOR_VALUE=true
+REDIS_NODE_SELECTOR_KEY=otp-relay/storage-node
+REDIS_NODE_SELECTOR_VALUE=true
+MONITOR_NODE_SELECTOR_KEY=otp-relay/monitor-node
+MONITOR_NODE_SELECTOR_VALUE=true
+
 REDIS_ENABLED=1
 REDIS_URL=redis://otp-redis:6379/0
-REDIS_REQUIRED=0
+REDIS_REQUIRED=1
 REDIS_STORAGE_CLASS=local-path
 REDIS_SIZE=1Gi
 
 REPLICA_COUNT=1
 ```
 
-Use `INSTALL_METALLB=1` only when the installer should install/configure MetalLB. If MetalLB is already installed and the address pool already exists, keep:
+Current SCH/IT runs keep TLS enabled and generate/update the self-signed secret:
 
 ```text
-INSTALL_METALLB=0
-REQUIRE_METALLB=1
+TLS_ENABLED=1
+TLS_SELF_SIGNED=1
 ```
 
-Keep `LOADBALANCER_IP=` blank so MetalLB auto-assigns an available IP from the configured pool.
+IT will distribute/trust the certificate by Group Policy. Users may see a browser warning until that policy lands on their machine.
 
-## MetalLB model
+## Exposure model
 
-Phase 2 exposes the portal directly through a Kubernetes `LoadBalancer` Service:
+The current Phase 3 exposure model is:
 
 ```text
 Client
-  ↓
-MetalLB-assigned VIP
-  ↓
-Service/otp-relay type LoadBalancer
-  ↓
-otp-relay pod port 8000
+  -> DNS: srvotptest26.init-db.lan
+  -> Traefik Ingress HTTPS
+  -> Service/otp-relay
+  -> otp-relay app pod port 8000
 ```
 
-Current Phase 2 does not require Traefik Ingress:
+The `LoadBalancer` service and MetalLB remain part of the bare-metal implementation. SCH still needs to confirm whether the final production LB/VIP model is MetalLB, F5, HAProxy, Keepalived, or another company-managed VIP.
+
+The older Phase 2 direct service model is retained only as historical context:
 
 ```text
-INGRESS_ENABLED=0
+Client -> MetalLB-assigned service IP -> Service/otp-relay -> app pod
 ```
 
-Traefik may still be installed by K3s, but OTP Relay should use the MetalLB LoadBalancer service as the primary exposure path for this phase.
+Do not present the direct HTTP service path as the final user-facing production path unless SCH explicitly approves it.
 
 ## Why replicas remain 1
 
-The app currently keeps these in process memory:
+The app runtime state has been moved to Redis, but two production blockers remain:
 
 ```text
-claim_queue
-pending_otps
-ADMIN_SESSIONS
-ADMIN_LOGIN_ATTEMPTS
+app PVC is still local-path/ReadWriteOnce
+Redis is still a single StatefulSet pod
 ```
 
-Multiple app replicas would create multiple independent queues, OTP display states, and admin sessions. Redis is being introduced first as a shared-state backend, but Redis readiness alone is not enough to increase replicas.
-
-`REPLICA_COUNT` must stay at `1` until these states are actually migrated to Redis:
+Because of those blockers, the repository intentionally keeps:
 
 ```text
-claim_queue -> Redis
-pending_otps -> Redis
-ADMIN_SESSIONS -> Redis
+REPLICA_COUNT=1
+strategy: Recreate
 ```
 
-After that migration is complete and tested, `REPLICA_COUNT=2` can be enabled with anti-affinity and PodDisruptionBudget support.
+Do not raise the app replica count until shared storage, Redis HA, and final OTP flow validation are complete.
 
-## Redis foundation
+## Storage status
 
-Redis is introduced in Phase 2B as infrastructure first.
-
-The first Redis step deploys:
+Current app storage:
 
 ```text
-k8s/manifests/redis-service.yaml
-k8s/manifests/redis-statefulset.yaml
-k8s/manifests/redis-pdb.yaml
+PVC: otp-relay-data
+storageClassName: local-path
+accessModes: ReadWriteOnce
 ```
 
-The app receives:
+Current Redis storage:
 
 ```text
-REDIS_URL=redis://otp-redis:6379/0
+PVC: redis-data-otp-redis-0
+storageClassName: local-path
+accessModes: ReadWriteOnce
 ```
 
-The `/readyz` endpoint reports Redis connectivity:
+This is acceptable for validation. It is not SCH's final production target. The target requires shared/RWX/network storage for app data and a Redis storage model appropriate for HA Redis.
 
-```json
-{
-  "status": "ok",
-  "users_loaded": 123,
-  "redis": "ok",
-  "redis_required": false
-}
-```
+## Redis status
 
-For the first Redis foundation deployment, keep:
+Redis is required and used by the app, but the current manifest is still single-instance Redis:
 
 ```text
-REDIS_REQUIRED=0
+StatefulSet: otp-redis
+replicas: 1
+Service: otp-redis ClusterIP
 ```
 
-After Redis is confirmed healthy, this can be changed to:
-
-```text
-REDIS_REQUIRED=1
-```
-
-Do not increase replicas until Redis is used by the application state code.
+SCH target expects Redis HA/Sentinel/Cluster or an approved managed/internal Redis service.
 
 ## Verify MetalLB and LoadBalancer
-
-Check MetalLB:
 
 ```bash
 sudo k3s kubectl get pods -n metallb-system -o wide
 sudo k3s kubectl get ipaddresspool -n metallb-system
 sudo k3s kubectl get l2advertisement -n metallb-system
-```
-
-Check the OTP Relay LoadBalancer service:
-
-```bash
 sudo k3s kubectl describe svc otp-relay -n otp-relay
 sudo k3s kubectl get svc otp-relay -n otp-relay -o wide
 ```
 
-Expected:
+Expected current service shape:
 
 ```text
 Type: LoadBalancer
 LoadBalancer Ingress: <assigned-ip>
-metallb.io/ip-allocated-from-pool: otp-relay-pool
+metallb.io/ip-allocated-from-pool: <pool-name>
 ```
 
-Check only the assigned IP:
+## Verify Traefik HTTPS
 
 ```bash
-sudo k3s kubectl get svc otp-relay -n otp-relay -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; echo
+sudo k3s kubectl get ingress otp-relay -n otp-relay -o wide
+sudo k3s kubectl describe ingress otp-relay -n otp-relay
+curl -k -s https://srvotptest26.init-db.lan/readyz
 ```
 
-Check the portal URL in ConfigMap:
+Expected Redis-required readiness:
 
-```bash
-sudo k3s kubectl get configmap otp-relay-config -n otp-relay -o jsonpath='{.data.PORTAL_URL}'; echo
+```json
+{
+  "status": "ok",
+  "redis": "ok",
+  "redis_required": true
+}
 ```
 
-Expected:
-
-```text
-http://<assigned-loadbalancer-ip>
-```
-
-## Verify Redis foundation
-
-Check Redis resources:
+## Verify Redis
 
 ```bash
 sudo k3s kubectl get svc otp-redis -n otp-relay
 sudo k3s kubectl get statefulset otp-redis -n otp-relay
 sudo k3s kubectl get pods -n otp-relay -l app=otp-redis -o wide
 sudo k3s kubectl get pdb otp-redis-pdb -n otp-relay
-```
-
-Check Redis rollout:
-
-```bash
 sudo k3s kubectl rollout status statefulset/otp-redis -n otp-relay --timeout=180s
 ```
 
-Check app readiness through the portal:
+## Verify monitor isolation
 
 ```bash
-curl -s http://<loadbalancer-ip>/readyz
+sudo k3s kubectl get deploy otp-monitor -n otp-relay -o wide
+sudo k3s kubectl get svc -n otp-relay
+sudo k3s kubectl get ingress -n otp-relay
 ```
 
-Expected Redis foundation result:
+There should be no Service or Ingress for `otp-monitor`.
 
-```json
-{
-  "status": "ok",
-  "redis": "ok",
-  "redis_required": false
-}
-```
+## Next SCH-alignment work
 
-## GitHub source of truth
-
-Phase 2 deployments use the committed Dockerfiles and manifests as source.
-
-Source files:
-
-```text
-k8s/Dockerfile
-k8s/Dockerfile.monitor
-k8s/manifests/*.yaml
-```
-
-The installer only stages these files into a temporary render directory and injects runtime values such as:
-
-```text
-namespace
-service type
-PVC size and storage class
-node selectors
-LoadBalancer IP
-PORTAL_URL
-Redis settings
-image names
-```
-
-Do not edit files under `/opt/otp-relay-k8s` for normal deployment changes. Commit changes to GitHub and deploy through Actions.
-
-## Phase 2 completion criteria
-
-Phase 2A is complete when:
-
-```text
-LoadBalancer service receives a MetalLB IP
-PORTAL_URL matches the assigned IP
-repo Dockerfiles and manifests are source of truth
-PVC remains bound and preserved
-app and monitor deploy successfully from Actions
-```
-
-Phase 2B is complete when:
-
-```text
-Redis deploys successfully
-app /readyz reports redis=ok
-claim queue is Redis-backed
-pending OTPs are Redis-backed
-admin sessions are Redis-backed
-REPLICA_COUNT=2 works safely
-```
-
-Only after Phase 2B should Phase 3 resilience testing begin.
+1. Confirm final LB/VIP model.
+2. Confirm IT Group Policy distribution/trust of the self-signed TLS certificate.
+3. Move app data to approved shared RWX/network storage.
+4. Move Redis to HA Redis/Sentinel/Cluster or approved managed Redis.
+5. Re-run restart-survival and OTP flow validation.
+6. Run controlled two-replica app validation.
+7. Only then consider changing the replica default.
