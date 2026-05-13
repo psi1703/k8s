@@ -891,15 +891,33 @@ existing_pvc_storage_class="$(
 )"
 existing_pvc_storage_class="$(printf '%s' "$existing_pvc_storage_class" | xargs)"
 
-if [ -n "$existing_pvc_storage_class" ] && [ -z "$PVC_STORAGE_CLASS" ]; then
-  warn "PVC otp-relay-data already exists with storageClassName=$existing_pvc_storage_class; preserving it"
-  PVC_STORAGE_CLASS="$existing_pvc_storage_class"
-fi
+existing_pvc_access_modes="$(
+  k3s kubectl get pvc otp-relay-data \
+    -n "$NAMESPACE" \
+    -o jsonpath='{.spec.accessModes[*]}' 2>/dev/null || true
+)"
+existing_pvc_access_modes="$(printf '%s' "$existing_pvc_access_modes" | xargs)"
 
-if [ -n "$existing_pvc_storage_class" ] \
-  && [ -n "$PVC_STORAGE_CLASS" ] \
-  && [ "$PVC_STORAGE_CLASS" != "$existing_pvc_storage_class" ]; then
-  fatal "PVC otp-relay-data already exists with storageClassName=$existing_pvc_storage_class; refusing to change immutable storageClassName to $PVC_STORAGE_CLASS"
+MIGRATE_APP_PVC_TO_NFS=0
+
+if [ "$NFS_ENABLED" = "1" ]; then
+  if [ -n "$existing_pvc_storage_class" ] \
+    && { [ "$existing_pvc_storage_class" != "$NFS_STORAGE_CLASS" ] || ! printf '%s' "$existing_pvc_access_modes" | grep -qw ReadWriteMany; }; then
+    warn "PVC otp-relay-data currently uses storageClassName=$existing_pvc_storage_class accessModes=$existing_pvc_access_modes"
+    warn "NFS_ENABLED=1 requires recreating only the app PVC as RWX/NFS. Redis PVC will not be touched."
+    MIGRATE_APP_PVC_TO_NFS=1
+  fi
+else
+  if [ -n "$existing_pvc_storage_class" ] && [ -z "$PVC_STORAGE_CLASS" ]; then
+    warn "PVC otp-relay-data already exists with storageClassName=$existing_pvc_storage_class; preserving it"
+    PVC_STORAGE_CLASS="$existing_pvc_storage_class"
+  fi
+
+  if [ -n "$existing_pvc_storage_class" ] \
+    && [ -n "$PVC_STORAGE_CLASS" ] \
+    && [ "$PVC_STORAGE_CLASS" != "$existing_pvc_storage_class" ]; then
+    fatal "PVC otp-relay-data already exists with storageClassName=$existing_pvc_storage_class; refusing to change immutable storageClassName to $PVC_STORAGE_CLASS"
+  fi
 fi
 
 log "rendering runtime values into staged repository manifests"
