@@ -86,7 +86,7 @@ on:
       pvc_storage_class:
         description: "App PVC storageClassName; use otp-relay-nfs when NFS is enabled"
         required: false
-        default: ""
+        default: "otp-relay-nfs"
         type: string
       pvc_size:
         description: "App PVC size"
@@ -96,7 +96,7 @@ on:
       nfs_enabled:
         description: "Use a static NFS PersistentVolume for app data"
         required: true
-        default: "0"
+        default: "1"
         type: choice
         options:
           - "0"
@@ -104,12 +104,12 @@ on:
       nfs_server:
         description: "NFS server IP or DNS name for app data; required when nfs_enabled=1"
         required: false
-        default: ""
+        default: "172.31.11.108"
         type: string
       nfs_path:
         description: "NFS export path for app data; required when nfs_enabled=1"
         required: false
-        default: ""
+        default: "/export/otp-relay-data"
         type: string
       redis_enabled:
         description: "Deploy Redis shared-state service"
@@ -302,8 +302,7 @@ jobs:
           PVC_STORAGE_CLASS: ${{ github.event.inputs.pvc_storage_class || 'otp-relay-nfs' }}
           PVC_SIZE: ${{ github.event.inputs.pvc_size || '1Gi' }}
 
-          # SCH Phase 3 storage posture:
-          # normal push deployments use the dedicated NFS VM automatically.
+          # SCH Phase 3 storage posture: push deployments use the dedicated NFS VM automatically.
           # Manual workflow dispatch can still override these values if needed.
           NFS_ENABLED: ${{ github.event.inputs.nfs_enabled || '1' }}
           NFS_SERVER: ${{ github.event.inputs.nfs_server || secrets.NFS_SERVER || '172.31.11.108' }}
