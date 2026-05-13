@@ -1244,7 +1244,33 @@ if requires_manifests_apply; then
   if [ "$NFS_ENABLED" = "1" ]; then
     log "applying static NFS PersistentVolume for app data"
     k3s kubectl apply -f "$MANIFEST_DIR/pv-nfs.yaml"
+
+    if [ "$MIGRATE_APP_PVC_TO_NFS" = "1" ]; then
+      log "migrating app PVC otp-relay-data from local/non-RWX storage to NFS/RWX"
+      warn "This deletes only PVC/$NAMESPACE/otp-relay-data after scaling the app down. Redis PVC is not touched."
+      warn "App data must already exist on NFS path $NFS_SERVER:$NFS_PATH before this migration."
+
+      if k3s kubectl get deployment otp-relay -n "$NAMESPACE" >/dev/null 2>&1; then
+        log "scaling deployment/otp-relay to 0 before app PVC migration"
+        k3s kubectl scale deployment otp-relay -n "$NAMESPACE" --replicas=0
+        k3s kubectl rollout status deployment/otp-relay -n "$NAMESPACE" --timeout=180s || true
+        k3s kubectl wait --for=delete pod -l app=otp-relay -n "$NAMESPACE" --timeout=180s || true
+      fi
+
+      log "deleting old app PVC otp-relay-data so it can be recreated as NFS/RWX"
+      k3s kubectl delete pvc otp-relay-data -n "$NAMESPACE" --ignore-not-found=false --timeout=120s
+
+      log "waiting for old app PVC otp-relay-data to disappear"
+      for i in $(seq 1 60); do
+        if ! k3s kubectl get pvc otp-relay-data -n "$NAMESPACE" >/dev/null 2>&1; then
+          break
+        fi
+        sleep 2
+        [ "$i" -lt 60 ] || fatal "old app PVC otp-relay-data did not delete within timeout"
+      done
+    fi
   fi
+
   k3s kubectl apply -f "$MANIFEST_DIR/pvc.yaml"
 
   if [ "$REDIS_ENABLED" = "1" ]; then
