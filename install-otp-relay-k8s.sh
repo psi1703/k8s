@@ -23,6 +23,12 @@ set -Eeuo pipefail
 #   TLS_SELF_SIGNED=0|1  # 0 expects an existing TLS secret; 1 creates/updates the self-signed secret that IT will distribute/trust by Group Policy
 #   PVC_STORAGE_CLASS=<storage-class-name>
 #   PVC_SIZE=1Gi
+#   NFS_ENABLED=0|1
+#   NFS_SERVER=<nfs-server-ip-or-dns>
+#   NFS_PATH=/export/otp-relay-data
+#   NFS_STORAGE_CLASS=otp-relay-nfs
+#   NFS_PV_NAME=otp-relay-data-nfs-pv
+#   NFS_MOUNT_OPTIONS=nfsvers=4.1
 #   REPLICA_COUNT=1
 #   APP_NODE_SELECTOR_KEY=kubernetes.io/hostname
 #   APP_NODE_SELECTOR_VALUE=<node-name>
@@ -73,6 +79,12 @@ TLS_SECRET_NAME="${TLS_SECRET_NAME:-otp-relay-tls}"
 TLS_SELF_SIGNED="${TLS_SELF_SIGNED:-1}"
 PVC_STORAGE_CLASS="${PVC_STORAGE_CLASS:-}"
 PVC_SIZE="${PVC_SIZE:-1Gi}"
+NFS_ENABLED="${NFS_ENABLED:-0}"
+NFS_SERVER="${NFS_SERVER:-}"
+NFS_PATH="${NFS_PATH:-}"
+NFS_STORAGE_CLASS="${NFS_STORAGE_CLASS:-otp-relay-nfs}"
+NFS_PV_NAME="${NFS_PV_NAME:-otp-relay-data-nfs-pv}"
+NFS_MOUNT_OPTIONS="${NFS_MOUNT_OPTIONS:-nfsvers=4.1}"
 REPLICA_COUNT="${REPLICA_COUNT:-1}"
 APP_NODE_SELECTOR_KEY="${APP_NODE_SELECTOR_KEY:-}"
 APP_NODE_SELECTOR_VALUE="${APP_NODE_SELECTOR_VALUE:-}"
@@ -126,6 +138,21 @@ REDIS_URL="${REDIS_URL:-redis://otp-redis:6379/0}"
 REDIS_REQUIRED="${REDIS_REQUIRED:-1}"
 REDIS_STORAGE_CLASS="${REDIS_STORAGE_CLASS:-local-path}"
 REDIS_SIZE="${REDIS_SIZE:-1Gi}"
+
+case "$NFS_ENABLED" in
+  0|1) ;;
+  *) fatal "NFS_ENABLED must be 0 or 1" ;;
+esac
+if [ "$NFS_ENABLED" = "1" ]; then
+  [ -n "$NFS_SERVER" ] || fatal "NFS_ENABLED=1 requires NFS_SERVER"
+  [ -n "$NFS_PATH" ] || fatal "NFS_ENABLED=1 requires NFS_PATH"
+  if [ -z "$PVC_STORAGE_CLASS" ]; then
+    PVC_STORAGE_CLASS="$NFS_STORAGE_CLASS"
+  fi
+  if [ "$PVC_STORAGE_CLASS" != "$NFS_STORAGE_CLASS" ]; then
+    fatal "NFS_ENABLED=1 requires PVC_STORAGE_CLASS=$NFS_STORAGE_CLASS or an empty PVC_STORAGE_CLASS"
+  fi
+fi
 RESTART_APP_REQUIRED=0
 RESTART_MONITOR_REQUIRED=0
 
@@ -909,6 +936,12 @@ REDIS_URL="$REDIS_URL" \
 REDIS_REQUIRED="$REDIS_REQUIRED" \
 REDIS_STORAGE_CLASS="$REDIS_STORAGE_CLASS" \
 REDIS_SIZE="$REDIS_SIZE" \
+NFS_ENABLED="$NFS_ENABLED" \
+NFS_SERVER="$NFS_SERVER" \
+NFS_PATH="$NFS_PATH" \
+NFS_STORAGE_CLASS="$NFS_STORAGE_CLASS" \
+NFS_PV_NAME="$NFS_PV_NAME" \
+NFS_MOUNT_OPTIONS="$NFS_MOUNT_OPTIONS" \
 python3 - <<'PY_RENDER_MANIFESTS'
 import os
 import re
@@ -989,15 +1022,41 @@ if (manifest_dir / "configmap.yaml").exists():
         text = set_data_value(text, key, os.environ.get(key, defaults.get(key, "")))
     write("configmap.yaml", text)
 
-# PVC
+# App PVC and optional static NFS PV
 if (manifest_dir / "pvc.yaml").exists():
     text = replace_namespace(read("pvc.yaml"))
     text = re.sub(r"\n  storageClassName: .*", "", text)
     storage_class = os.environ.get("PVC_STORAGE_CLASS", "")
+    text = re.sub(r"(\n      storage: ).*", rf"\g<1>{os.environ['PVC_SIZE']}", text)
+
+    if os.environ.get("NFS_ENABLED") == "1":
+        text = re.sub(r"    - ReadWriteOnce", "    - ReadWriteMany", text)
+        text = re.sub(r"\n  volumeName: .*", "", text)
+        text = text.replace("spec:\n", f"spec:\n  volumeName: {os.environ['NFS_PV_NAME']}\n", 1)
+    else:
+        text = re.sub(r"    - ReadWriteMany", "    - ReadWriteOnce", text)
+        text = re.sub(r"\n  volumeName: .*", "", text)
+
     if storage_class:
         text = text.replace("  accessModes:\n", f"  storageClassName: {storage_class}\n  accessModes:\n", 1)
-    text = re.sub(r"(\n      storage: ).*", rf"\g<1>{os.environ['PVC_SIZE']}", text)
     write("pvc.yaml", text)
+
+if (manifest_dir / "pv-nfs.yaml").exists():
+    if os.environ.get("NFS_ENABLED") == "1":
+        text = read("pv-nfs.yaml")
+        text = re.sub(r"^  name: .*$", f"  name: {os.environ['NFS_PV_NAME']}", text, flags=re.MULTILINE)
+        text = re.sub(r"(\n    storage: ).*", rf"\g<1>{os.environ['PVC_SIZE']}", text)
+        text = re.sub(r"(\n  storageClassName: ).*", rf"\g<1>{os.environ['NFS_STORAGE_CLASS']}", text)
+        opts = [x.strip() for x in os.environ.get("NFS_MOUNT_OPTIONS", "").split(",") if x.strip()]
+        mount_block = ""
+        if opts:
+            mount_block = "  mountOptions:\n" + "".join(f"    - {opt}\n" for opt in opts)
+        text = re.sub(r"\n  mountOptions:\n(?:    - .*\n)+", "\n" + mount_block, text)
+        text = re.sub(r"(\n    server: ).*", rf"\g<1>{os.environ['NFS_SERVER']}", text)
+        text = re.sub(r"(\n    path: ).*", rf"\g<1>{os.environ['NFS_PATH']}", text)
+        write("pv-nfs.yaml", text)
+    else:
+        (manifest_dir / "pv-nfs.yaml").unlink()
 
 # App deployment
 if (manifest_dir / "deployment.yaml").exists():
@@ -1105,6 +1164,9 @@ if requires_monitor_image; then
   python3 -m py_compile monitor.py
 fi
 k3s kubectl apply --dry-run=client -f "$MANIFEST_DIR/namespace.yaml" >/dev/null
+if [ "$NFS_ENABLED" = "1" ]; then
+  k3s kubectl apply --dry-run=client -f "$MANIFEST_DIR/pv-nfs.yaml" >/dev/null
+fi
 k3s kubectl apply -f "$MANIFEST_DIR/namespace.yaml"
 ensure_tls_secret_if_requested
 ensure_tls_secret_available_if_required
@@ -1161,6 +1223,10 @@ fi
 if requires_manifests_apply; then
   log "applying Kubernetes resources"
   apply_runtime_configmap
+  if [ "$NFS_ENABLED" = "1" ]; then
+    log "applying static NFS PersistentVolume for app data"
+    k3s kubectl apply -f "$MANIFEST_DIR/pv-nfs.yaml"
+  fi
   k3s kubectl apply -f "$MANIFEST_DIR/pvc.yaml"
 
   if [ "$REDIS_ENABLED" = "1" ]; then
@@ -1260,6 +1326,7 @@ App node selector:     ${APP_NODE_SELECTOR_KEY:-none}=${APP_NODE_SELECTOR_VALUE:
 Monitor node selector: ${MONITOR_NODE_SELECTOR_KEY:-none}=${MONITOR_NODE_SELECTOR_VALUE:-}
 Redis node selector:   ${REDIS_NODE_SELECTOR_KEY:-none}=${REDIS_NODE_SELECTOR_VALUE:-}
 PVC storage:           ${PVC_STORAGE_CLASS:-default} / $PVC_SIZE
+NFS app storage:       enabled=$NFS_ENABLED server=${NFS_SERVER:-none} path=${NFS_PATH:-none} class=$NFS_STORAGE_CLASS pv=$NFS_PV_NAME
 Redis:                enabled=$REDIS_ENABLED required=$REDIS_REQUIRED url=${REDIS_URL:-none} storage=${REDIS_STORAGE_CLASS:-default}/$REDIS_SIZE
 
 Useful commands:
