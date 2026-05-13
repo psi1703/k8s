@@ -15,6 +15,25 @@ spec:
       labels:
         app: otp-redis-haproxy
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - otp-redis-haproxy
+                topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: otp-redis-haproxy
       containers:
         - name: haproxy
           image: haproxy:2.9-alpine
@@ -22,6 +41,9 @@ spec:
           ports:
             - containerPort: 6379
               name: redis
+          env:
+            - name: HAPROXY_CONFIG_VERSION
+              value: "2026-05-13-redis-node-spread"
           readinessProbe:
             tcpSocket:
               port: 6379
