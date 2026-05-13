@@ -13,7 +13,7 @@ REPLICA_COUNT=1
 REDIS_REQUIRED=1
 strategy: Recreate
 self-signed TLS stays enabled; IT will distribute/trust the certificate by Group Policy
-local-path/RWO storage is validation storage, not final shared production storage
+NFS/RWX is the target app storage path; local-path is validation/pre-migration storage only
 ```
 
 
@@ -106,8 +106,12 @@ TLS_ENABLED=1
 TLS_SELF_SIGNED=1
 INSTALL_METALLB=0
 REQUIRE_METALLB=1
-PVC_STORAGE_CLASS=local-path
+PVC_STORAGE_CLASS=
 PVC_SIZE=1Gi
+NFS_ENABLED=0
+NFS_SERVER=
+NFS_PATH=
+NFS_STORAGE_CLASS=otp-relay-nfs
 REDIS_ENABLED=1
 REDIS_URL=redis://otp-redis:6379/0
 REDIS_REQUIRED=1
@@ -153,18 +157,19 @@ REQUIRE_METALLB=1
 REDIS_ENABLED=1
 REDIS_REQUIRED=1
 REPLICA_COUNT=1
-PVC_STORAGE_CLASS=local-path
+NFS_ENABLED=1 after NFS export is ready
+PVC_STORAGE_CLASS=otp-relay-nfs after migration
 REDIS_STORAGE_CLASS=local-path
 ```
 
 Important distinction:
 
 ```text
-Current:  MetalLB + Traefik HTTPS + single app replica + single Redis + local-path/RWO PVCs
-Target:   approved LB/VIP + TLS trusted by IT Group Policy + multiple app replicas + HA Redis + shared RWX/network storage
+Current:  MetalLB + Traefik HTTPS + single app replica + single Redis + NFS-capable app storage path
+Target:   approved LB/VIP + TLS trusted by IT Group Policy + multiple app replicas + HA Redis + NFS/RWX app storage migrated live
 ```
 
-Phase 3 intentionally keeps `REPLICA_COUNT=1` and `strategy: Recreate`. Those controls prevent the deployment from pretending to be highly available while storage is still `local-path`/`ReadWriteOnce` and Redis is still single-instance.
+Phase 3 intentionally keeps `REPLICA_COUNT=1` and `strategy: Recreate`. Those controls prevent the deployment from pretending to be highly available until the live app PVC is migrated to NFS/RWX and Redis is no longer a single-instance dependency.
 
 Self-signed TLS can still be used for validation by setting:
 
@@ -175,6 +180,21 @@ TLS_SELF_SIGNED=1
 The current SCH/IT path keeps self-signed TLS on and relies on IT distributing/trusting the certificate via Group Policy. Users may see a browser warning until that trust policy reaches their machines.
 
 See `docs/operations/sch-target-vs-current.md` for the active gap table and next engineering order.
+
+### NFS shared app storage
+
+The repo now supports SCH's shared-storage direction for app data using a static NFS `PersistentVolume`. Enable it only after the NFS server/export exists:
+
+```text
+NFS_ENABLED=1
+NFS_SERVER=<nfs-server-ip-or-dns>
+NFS_PATH=/export/otp-relay-data
+NFS_STORAGE_CLASS=otp-relay-nfs
+PVC_STORAGE_CLASS=otp-relay-nfs
+```
+
+This changes the app PVC to `ReadWriteMany` and binds it to `otp-relay-data-nfs-pv`. Existing `local-path` PVCs cannot be changed in place; follow `docs/operations/nfs-shared-storage.md` for backup and migration.
+
 
 ---
 
@@ -242,7 +262,7 @@ Redis readiness                Required with REDIS_REQUIRED=1
 
 A temporary two-replica validation has already confirmed that two app pods can become `Running 1/1` on the current single-node K3s cluster with the app PVC mounted. The live setting remains one replica because final OTP acceptance still requires the manager-led OTP trigger test, pending-OTP restart test, and final two-replica OTP flow validation.
 
-A multi-node cluster is supported for placement and LoadBalancer exposure, but the app PVC is currently `ReadWriteOnce` with K3s `local-path` storage. Any future multi-node/two-replica mode must account for PVC placement and file-backed runtime data.
+A multi-node cluster is supported for placement and LoadBalancer exposure. The repo now supports NFS/RWX app storage for `/app/data`; any existing `local-path` PVC must be migrated before the app is treated as movable across workers or scaled beyond one replica.
 
 ---
 
@@ -439,8 +459,12 @@ TLS_ENABLED=1
 TLS_SELF_SIGNED=1
 INSTALL_METALLB=0
 REQUIRE_METALLB=1
-PVC_STORAGE_CLASS=local-path
+PVC_STORAGE_CLASS=
 PVC_SIZE=1Gi
+NFS_ENABLED=0
+NFS_SERVER=
+NFS_PATH=
+NFS_STORAGE_CLASS=otp-relay-nfs
 REDIS_ENABLED=1
 REDIS_URL=redis://otp-redis:6379/0
 REDIS_REQUIRED=1
@@ -466,12 +490,12 @@ MONITOR_NODE_SELECTOR_KEY=kubernetes.io/hostname
 MONITOR_NODE_SELECTOR_VALUE=<phone-network-node-name>
 ```
 
-With K3s `local-path` storage, pin the app pod to the node where the PVC should live. The monitor should be pinned to the node that can see the phone network/interface used by `arping`.
+Before NFS migration, pin the app pod to the node where the local-path PVC lives. After NFS migration, the app PVC is RWX-capable, but keep `REPLICA_COUNT=1` until OTP and Redis validation are complete. The monitor should be pinned to the node that can see the phone network/interface used by `arping`.
 
 Current production-alignment gaps are deliberate and documented:
 
 ```text
-local-path/RWO storage -> replace with shared RWX/network storage
+local-path/RWO app storage -> migrate to NFS/RWX app storage
 single Redis pod       -> replace with HA Redis/Sentinel/Cluster or managed Redis
 self-signed TLS        -> keep enabled; IT trusts/distributes certificate by Group Policy
 MetalLB-only VIP       -> confirm final SCH LB/VIP model
@@ -644,7 +668,7 @@ WHATSAPP_RECIPIENT
 
 `PORTAL_URL` should normally be left unset for Phase 2 auto-detection. If `PORTAL_URL` is explicitly supplied, the installer preserves that value and does not replace it with the MetalLB-assigned IP.
 
-Manual workflow dispatch can override service type, MetalLB install, LoadBalancer IP, node selectors, PVC storage class, PVC size, Redis settings, ingress, and deployment mode.
+Manual workflow dispatch can override service type, MetalLB install, LoadBalancer IP, node selectors, PVC storage class, PVC size, NFS app storage settings, Redis settings, ingress, and deployment mode.
 
 Deployment mode behavior:
 
@@ -848,7 +872,7 @@ Redis admin session key disappears after admin logout
 Redis login-attempt key appears after failed admin login
 Redis login-attempt key clears after successful admin login
 Deployment strategy is Recreate
-otp-relay-data PVC is Bound with local-path storage
+otp-relay-data PVC is Bound; migrate from local-path to NFS/RWX before app HA
 redis-data-otp-redis-0 PVC is Bound with local-path storage
 Temporary scale to 2 app replicas succeeded
 Both app pods reached Running 1/1
