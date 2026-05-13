@@ -25,6 +25,9 @@ spec:
           ports:
             - containerPort: 26379
               name: sentinel
+          env:
+            - name: SENTINEL_CONFIG_VERSION
+              value: "2026-05-13-redis-announce-fix"
           readinessProbe:
             tcpSocket:
               port: 26379
