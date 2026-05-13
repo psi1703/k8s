@@ -138,6 +138,7 @@ REDIS_URL="${REDIS_URL:-redis://otp-redis:6379/0}"
 REDIS_REQUIRED="${REDIS_REQUIRED:-1}"
 REDIS_STORAGE_CLASS="${REDIS_STORAGE_CLASS:-local-path}"
 REDIS_SIZE="${REDIS_SIZE:-1Gi}"
+REDIS_SPREAD_RECREATE_PVCS="${REDIS_SPREAD_RECREATE_PVCS:-auto}"
 
 case "$NFS_ENABLED" in
   0|1) ;;
@@ -153,6 +154,11 @@ if [ "$NFS_ENABLED" = "1" ]; then
     fatal "NFS_ENABLED=1 requires PVC_STORAGE_CLASS=$NFS_STORAGE_CLASS or an empty PVC_STORAGE_CLASS"
   fi
 fi
+case "$REDIS_SPREAD_RECREATE_PVCS" in
+  auto|0|1) ;;
+  *) fatal "REDIS_SPREAD_RECREATE_PVCS must be auto, 0, or 1" ;;
+esac
+
 RESTART_APP_REQUIRED=0
 RESTART_MONITOR_REQUIRED=0
 
@@ -946,6 +952,53 @@ if [ "$REDIS_ENABLED" = "1" ] \
   MIGRATE_REDIS_TO_HA=1
 fi
 
+redis_schedulable_node_count=0
+if [ "$REDIS_ENABLED" = "1" ]; then
+  if [ -n "$REDIS_NODE_SELECTOR_KEY" ]; then
+    redis_schedulable_node_count="$({
+      k3s kubectl get nodes \
+        -l "$REDIS_NODE_SELECTOR_KEY=$REDIS_NODE_SELECTOR_VALUE" \
+        --no-headers 2>/dev/null | wc -l || true
+    })"
+  else
+    redis_schedulable_node_count="$({
+      k3s kubectl get nodes \
+        --no-headers 2>/dev/null | awk '$2 == "Ready" {count++} END {print count+0}' || true
+    })"
+  fi
+fi
+redis_schedulable_node_count="$(printf '%s' "$redis_schedulable_node_count" | xargs)"
+redis_schedulable_node_count="${redis_schedulable_node_count:-0}"
+
+existing_redis_pod_node_count="$({
+  k3s kubectl get pods -n "$NAMESPACE" -l app=otp-redis \
+    -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' 2>/dev/null \
+    | awk 'NF {nodes[$1]=1} END {count=0; for (node in nodes) count++; print count+0}' || true
+})"
+existing_redis_pod_node_count="$(printf '%s' "$existing_redis_pod_node_count" | xargs)"
+existing_redis_pod_node_count="${existing_redis_pod_node_count:-0}"
+
+MIGRATE_REDIS_FOR_NODE_SPREAD=0
+if [ "$REDIS_ENABLED" = "1" ]; then
+  case "$REDIS_SPREAD_RECREATE_PVCS" in
+    1)
+      warn "REDIS_SPREAD_RECREATE_PVCS=1 set; Redis runtime PVCs will be recreated to allow node spread."
+      MIGRATE_REDIS_FOR_NODE_SPREAD=1
+      ;;
+    auto)
+      if [ "$existing_redis_service_name" = "otp-redis-headless" ] \
+        && [ "$redis_schedulable_node_count" -ge 2 ] \
+        && [ "$existing_redis_pod_node_count" -eq 1 ]; then
+        warn "Redis HA pods currently run on one node, but $redis_schedulable_node_count Redis-capable nodes are available."
+        warn "Recreating Redis runtime PVCs once so local-path volumes can be provisioned across nodes."
+        MIGRATE_REDIS_FOR_NODE_SPREAD=1
+      fi
+      ;;
+    0)
+      ;;
+  esac
+fi
+
 log "rendering runtime values into staged repository manifests"
 MANIFEST_DIR="$MANIFEST_DIR" \
 NAMESPACE="$NAMESPACE" \
@@ -1366,19 +1419,35 @@ if requires_manifests_apply; then
   k3s kubectl apply -f "$MANIFEST_DIR/pvc.yaml"
 
   if [ "$REDIS_ENABLED" = "1" ]; then
-    if [ "${MIGRATE_REDIS_TO_HA:-0}" = "1" ]; then
-      log "migrating Redis from single StatefulSet service to Sentinel/HAProxy topology"
+    if [ "${MIGRATE_REDIS_TO_HA:-0}" = "1" ] || [ "${MIGRATE_REDIS_FOR_NODE_SPREAD:-0}" = "1" ]; then
+      if [ "${MIGRATE_REDIS_TO_HA:-0}" = "1" ]; then
+        log "migrating Redis from single StatefulSet service to Sentinel/HAProxy topology"
+      fi
+      if [ "${MIGRATE_REDIS_FOR_NODE_SPREAD:-0}" = "1" ]; then
+        log "migrating Redis runtime PVCs so Redis HA pods can spread across Redis-capable nodes"
+      fi
       warn "Active Redis-backed sessions and pending OTP runtime state may be interrupted during this migration."
+      warn "App file PVC otp-relay-data is not touched."
 
       if k3s kubectl get deployment otp-relay -n "$NAMESPACE" >/dev/null 2>&1; then
-        log "scaling deployment/otp-relay to 0 before Redis HA migration"
+        log "scaling deployment/otp-relay to 0 before Redis migration"
         k3s kubectl scale deployment otp-relay -n "$NAMESPACE" --replicas=0
       fi
 
-      log "deleting old StatefulSet otp-redis so immutable serviceName can change to otp-redis-headless"
+      if k3s kubectl get deployment otp-redis-haproxy -n "$NAMESPACE" >/dev/null 2>&1; then
+        log "scaling deployment/otp-redis-haproxy to 0 before Redis migration"
+        k3s kubectl scale deployment otp-redis-haproxy -n "$NAMESPACE" --replicas=0
+      fi
+
+      if k3s kubectl get deployment otp-redis-sentinel -n "$NAMESPACE" >/dev/null 2>&1; then
+        log "scaling deployment/otp-redis-sentinel to 0 before Redis migration"
+        k3s kubectl scale deployment otp-redis-sentinel -n "$NAMESPACE" --replicas=0
+      fi
+
+      log "deleting StatefulSet otp-redis before Redis migration"
       k3s kubectl delete statefulset otp-redis -n "$NAMESPACE" --ignore-not-found=true --wait=false
 
-      log "waiting for old Redis pods to terminate before applying HA Redis StatefulSet"
+      log "waiting for Redis pods to terminate before applying Redis StatefulSet"
       for i in $(seq 1 180); do
         old_redis_pods="$({
           k3s kubectl get pods -n "$NAMESPACE" -l app=otp-redis -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null || true
@@ -1387,10 +1456,36 @@ if requires_manifests_apply; then
         if [ -z "$old_redis_pods" ]; then
           break
         fi
-        warn "Old Redis pod(s) still terminating: $old_redis_pods"
+        warn "Redis pod(s) still terminating: $old_redis_pods"
         sleep 2
-        [ "$i" -lt 180 ] || fatal "old Redis pod(s) did not terminate before HA migration: $old_redis_pods"
+        [ "$i" -lt 180 ] || fatal "Redis pod(s) did not terminate before migration: $old_redis_pods"
       done
+
+      if [ "${MIGRATE_REDIS_FOR_NODE_SPREAD:-0}" = "1" ]; then
+        log "deleting Redis runtime PVCs so local-path can reprovision them across nodes"
+        for redis_pvc in redis-data-otp-redis-0 redis-data-otp-redis-1 redis-data-otp-redis-2; do
+          if k3s kubectl get pvc "$redis_pvc" -n "$NAMESPACE" >/dev/null 2>&1; then
+            warn "Deleting Redis runtime PVC $redis_pvc. This does not touch app PVC otp-relay-data."
+            k3s kubectl delete pvc "$redis_pvc" -n "$NAMESPACE" --ignore-not-found=true --wait=false
+          fi
+        done
+
+        log "waiting for Redis runtime PVCs to disappear"
+        for i in $(seq 1 180); do
+          remaining_redis_pvcs="$({
+            k3s kubectl get pvc -n "$NAMESPACE" \
+              -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+              | grep -E '^redis-data-otp-redis-[0-9]+$' || true
+          })"
+          remaining_redis_pvcs="$(printf '%s' "$remaining_redis_pvcs" | xargs || true)"
+          if [ -z "$remaining_redis_pvcs" ]; then
+            break
+          fi
+          warn "Redis runtime PVC(s) still deleting: $remaining_redis_pvcs"
+          sleep 2
+          [ "$i" -lt 180 ] || fatal "Redis runtime PVC(s) did not disappear before node-spread migration: $remaining_redis_pvcs"
+        done
+      fi
     fi
 
     log "applying Redis HA shared-state resources"
@@ -1502,7 +1597,7 @@ Monitor node selector: ${MONITOR_NODE_SELECTOR_KEY:-none}=${MONITOR_NODE_SELECTO
 Redis node selector:   ${REDIS_NODE_SELECTOR_KEY:-none}=${REDIS_NODE_SELECTOR_VALUE:-}
 PVC storage:           ${PVC_STORAGE_CLASS:-default} / $PVC_SIZE
 NFS app storage:       enabled=$NFS_ENABLED server=${NFS_SERVER:-none} path=${NFS_PATH:-none} class=$NFS_STORAGE_CLASS pv=$NFS_PV_NAME
-Redis:                enabled=$REDIS_ENABLED required=$REDIS_REQUIRED url=${REDIS_URL:-none} storage=${REDIS_STORAGE_CLASS:-default}/$REDIS_SIZE
+Redis:                enabled=$REDIS_ENABLED required=$REDIS_REQUIRED url=${REDIS_URL:-none} storage=${REDIS_STORAGE_CLASS:-default}/$REDIS_SIZE spread_recreate_pvcs=$REDIS_SPREAD_RECREATE_PVCS
 
 Useful commands:
   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
