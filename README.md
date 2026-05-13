@@ -4,6 +4,19 @@ Kubernetes/K3s deployment for the OTP Relay Portal.
 
 This repository contains the FastAPI portal, the required monitor service, the React frontend source, help-documentation source, Kubernetes manifests, Dockerfiles, and the installer used by GitHub Actions to deploy onto a K3s server or cluster.
 
+Current status: the repository has a validated Phase 3 K3s baseline with MetalLB, Traefik HTTPS, Redis-required runtime state, and an isolated monitor pod. It is not yet the final SCH production architecture. The remaining production-alignment gaps are tracked in `docs/operations/sch-target-vs-current.md`.
+
+Current safe posture:
+
+```text
+REPLICA_COUNT=1
+REDIS_REQUIRED=1
+strategy: Recreate
+self-signed TLS stays enabled; IT will distribute/trust the certificate by Group Policy
+local-path/RWO storage is validation storage, not final shared production storage
+```
+
+
 ---
 
 ## Deployment phases
@@ -88,7 +101,9 @@ Phase 2 exposure model:
 ```text
 SERVICE_TYPE=LoadBalancer
 LOADBALANCER_IP=
-INGRESS_ENABLED=0
+INGRESS_ENABLED=1
+TLS_ENABLED=1
+TLS_SELF_SIGNED=1
 INSTALL_METALLB=0
 REQUIRE_METALLB=1
 PVC_STORAGE_CLASS=local-path
@@ -104,10 +119,10 @@ REPLICA_COUNT=1
 Notes:
 
 - `LOADBALANCER_IP` is intentionally blank so MetalLB auto-assigns an address from its configured pool.
-- `INGRESS_ENABLED=0` means OTP Relay does not use Traefik in Phase 2. Traefik may still exist in K3s, but it is not the OTP Relay exposure path.
+- `INGRESS_ENABLED=1` enables the current Phase 3 Traefik HTTPS validation path. Earlier Phase 2 direct LoadBalancer-only notes are retained for history but are not the current SCH-alignment default.
 - `REQUIRE_METALLB=1` makes deployment fail fast if LoadBalancer mode is selected but MetalLB is not available.
 - `REDIS_ENABLED=1` deploys Redis and passes `REDIS_URL` to the app.
-- `REDIS_REQUIRED=1` is now the Phase 2 validation/default posture. Readiness fails if Redis is unavailable.
+- `REDIS_REQUIRED=1` is now the validation/default posture. Readiness fails if Redis is unavailable.
 - `REPLICA_COUNT=1` remains the normal live setting until the manager-led OTP trigger test and final two-replica OTP validation are complete.
 
 Phase 2 changed the deployment source-of-truth model:
@@ -121,6 +136,45 @@ install-otp-relay-k8s.sh        # orchestrates, renders runtime values, applies
 ```
 
 The installer no longer owns hidden Dockerfile/YAML definitions. It stages committed repo files into `/tmp`, renders runtime values there, applies them, and cleans up the temporary staging directory.
+
+---
+
+### Phase 3 - current validated SCH-alignment baseline
+
+Phase 3 validates the 3-node K3s implementation against SCH's target architecture. The current repository default is now a production-style validation path:
+
+```text
+SERVICE_TYPE=LoadBalancer
+INGRESS_ENABLED=1
+TLS_ENABLED=1
+TLS_SELF_SIGNED=1
+TLS_HOST=srvotptest26.init-db.lan
+REQUIRE_METALLB=1
+REDIS_ENABLED=1
+REDIS_REQUIRED=1
+REPLICA_COUNT=1
+PVC_STORAGE_CLASS=local-path
+REDIS_STORAGE_CLASS=local-path
+```
+
+Important distinction:
+
+```text
+Current:  MetalLB + Traefik HTTPS + single app replica + single Redis + local-path/RWO PVCs
+Target:   approved LB/VIP + TLS trusted by IT Group Policy + multiple app replicas + HA Redis + shared RWX/network storage
+```
+
+Phase 3 intentionally keeps `REPLICA_COUNT=1` and `strategy: Recreate`. Those controls prevent the deployment from pretending to be highly available while storage is still `local-path`/`ReadWriteOnce` and Redis is still single-instance.
+
+Self-signed TLS can still be used for validation by setting:
+
+```text
+TLS_SELF_SIGNED=1
+```
+
+The current SCH/IT path keeps self-signed TLS on and relies on IT distributing/trusting the certificate via Group Policy. Users may see a browser warning until that trust policy reaches their machines.
+
+See `docs/operations/sch-target-vs-current.md` for the active gap table and next engineering order.
 
 ---
 
@@ -254,6 +308,7 @@ otp-relay-k8s/
 │   │   └── phase1-architecture.svg
 │   ├── help/
 │   ├── operations/
+│   │   └── sch-target-vs-current.md
 │   └── k8s-plan.md
 ├── frontend/
 │   ├── app.jsx
@@ -379,7 +434,9 @@ Recommended Phase 2 values:
 ```text
 SERVICE_TYPE=LoadBalancer
 LOADBALANCER_IP=
-INGRESS_ENABLED=0
+INGRESS_ENABLED=1
+TLS_ENABLED=1
+TLS_SELF_SIGNED=1
 INSTALL_METALLB=0
 REQUIRE_METALLB=1
 PVC_STORAGE_CLASS=local-path
@@ -410,6 +467,16 @@ MONITOR_NODE_SELECTOR_VALUE=<phone-network-node-name>
 ```
 
 With K3s `local-path` storage, pin the app pod to the node where the PVC should live. The monitor should be pinned to the node that can see the phone network/interface used by `arping`.
+
+Current production-alignment gaps are deliberate and documented:
+
+```text
+local-path/RWO storage -> replace with shared RWX/network storage
+single Redis pod       -> replace with HA Redis/Sentinel/Cluster or managed Redis
+self-signed TLS        -> keep enabled; IT trusts/distributes certificate by Group Policy
+MetalLB-only VIP       -> confirm final SCH LB/VIP model
+single app replica     -> keep until storage and HA Redis are solved
+```
 
 ---
 

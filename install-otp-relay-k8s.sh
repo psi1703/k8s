@@ -20,7 +20,7 @@ set -Eeuo pipefail
 #   TLS_ENABLED=0|1
 #   TLS_HOST=srvotptest26.init-db.lan
 #   TLS_SECRET_NAME=otp-relay-tls
-#   TLS_SELF_SIGNED=0|1
+#   TLS_SELF_SIGNED=0|1  # 0 expects an existing TLS secret; 1 creates/updates the self-signed secret that IT will distribute/trust by Group Policy
 #   PVC_STORAGE_CLASS=<storage-class-name>
 #   PVC_SIZE=1Gi
 #   REPLICA_COUNT=1
@@ -70,7 +70,7 @@ INGRESS_ENABLED="${INGRESS_ENABLED:-1}"
 TLS_ENABLED="${TLS_ENABLED:-0}"
 TLS_HOST="${TLS_HOST:-}"
 TLS_SECRET_NAME="${TLS_SECRET_NAME:-otp-relay-tls}"
-TLS_SELF_SIGNED="${TLS_SELF_SIGNED:-0}"
+TLS_SELF_SIGNED="${TLS_SELF_SIGNED:-1}"
 PVC_STORAGE_CLASS="${PVC_STORAGE_CLASS:-}"
 PVC_SIZE="${PVC_SIZE:-1Gi}"
 REPLICA_COUNT="${REPLICA_COUNT:-1}"
@@ -447,11 +447,24 @@ check_loadbalancer_prereqs() {
   fi
 }
 
+
+ensure_tls_secret_available_if_required() {
+  [ "$TLS_ENABLED" = "1" ] || return 0
+  [ "$TLS_SELF_SIGNED" = "0" ] || return 0
+
+  if k3s kubectl get secret "$TLS_SECRET_NAME" -n "$NAMESPACE" >/dev/null 2>&1; then
+    log "TLS secret $TLS_SECRET_NAME already exists in namespace $NAMESPACE"
+    return 0
+  fi
+
+  fatal "TLS_ENABLED=1 with TLS_SELF_SIGNED=0 requires an existing Kubernetes TLS secret named $TLS_SECRET_NAME in namespace $NAMESPACE. Create the TLS secret first, or use the current default TLS_SELF_SIGNED=1 so the installer creates/updates the self-signed secret for IT Group Policy distribution."
+}
+
 ensure_tls_secret_if_requested() {
   [ "$TLS_ENABLED" = "1" ] || return 0
   [ "$TLS_SELF_SIGNED" = "1" ] || return 0
 
-  log "creating/updating self-signed TLS secret $TLS_SECRET_NAME for $TLS_HOST"
+  log "creating/updating self-signed TLS secret $TLS_SECRET_NAME for $TLS_HOST; IT Group Policy must trust/distribute this cert for users"
   tls_tmp_dir="$(mktemp -d /tmp/otp-relay-tls.XXXXXX)"
   openssl req -x509 -nodes -newkey rsa:2048 \
     -keyout "$tls_tmp_dir/tls.key" \
@@ -1094,6 +1107,7 @@ fi
 k3s kubectl apply --dry-run=client -f "$MANIFEST_DIR/namespace.yaml" >/dev/null
 k3s kubectl apply -f "$MANIFEST_DIR/namespace.yaml"
 ensure_tls_secret_if_requested
+ensure_tls_secret_available_if_required
 k3s kubectl apply --dry-run=client \
   -f "$MANIFEST_DIR/configmap.yaml" \
   -f "$MANIFEST_DIR/pvc.yaml" \
