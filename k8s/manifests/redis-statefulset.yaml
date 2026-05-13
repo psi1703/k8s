@@ -27,6 +27,8 @@ spec:
             - containerPort: 6379
               name: redis
           env:
+            - name: REDIS_CONFIG_VERSION
+              value: "2026-05-13-redis-announce-fix"
             - name: POD_NAME
               valueFrom:
                 fieldRef:
