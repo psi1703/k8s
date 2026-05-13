@@ -6,8 +6,8 @@ metadata:
   labels:
     app: otp-redis
 spec:
-  serviceName: otp-redis
-  replicas: 1
+  serviceName: otp-redis-headless
+  replicas: 3
   selector:
     matchLabels:
       app: otp-redis
@@ -21,32 +21,49 @@ spec:
           image: redis:7-alpine
           imagePullPolicy: IfNotPresent
           command:
-            - redis-server
-            - --appendonly
-            - "yes"
+            - sh
+            - /etc/redis/redis-entrypoint.sh
           ports:
             - containerPort: 6379
               name: redis
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           readinessProbe:
-            tcpSocket:
-              port: 6379
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli ping | grep -q PONG
             initialDelaySeconds: 5
             periodSeconds: 5
           livenessProbe:
-            tcpSocket:
-              port: 6379
-            initialDelaySeconds: 15
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli ping | grep -q PONG
+            initialDelaySeconds: 20
             periodSeconds: 20
           resources:
             requests:
               cpu: 50m
               memory: 128Mi
             limits:
-              cpu: 250m
-              memory: 256Mi
+              cpu: 300m
+              memory: 384Mi
           volumeMounts:
             - name: redis-data
               mountPath: /data
+            - name: redis-config
+              mountPath: /etc/redis
+      volumes:
+        - name: redis-config
+          configMap:
+            name: otp-redis-config
+            defaultMode: 0755
   volumeClaimTemplates:
     - metadata:
         name: redis-data
