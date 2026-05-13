@@ -114,14 +114,47 @@ on:
         default: "true"
         type: string
       pvc_storage_class:
-        description: "Optional PVC storageClassName; use local-path for default K3s storage"
+        description: "App PVC storageClassName; use otp-relay-nfs when NFS is enabled"
         required: false
-        default: "local-path"
+        default: ""
         type: string
       pvc_size:
-        description: "PVC size"
+        description: "App PVC size"
         required: true
         default: 1Gi
+        type: string
+      nfs_enabled:
+        description: "Use a static NFS PersistentVolume for app data"
+        required: true
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
+      nfs_server:
+        description: "NFS server IP or DNS name for app data; required when nfs_enabled=1"
+        required: false
+        default: ""
+        type: string
+      nfs_path:
+        description: "NFS export path for app data; required when nfs_enabled=1"
+        required: false
+        default: ""
+        type: string
+      nfs_storage_class:
+        description: "Static NFS storageClassName for the app PVC"
+        required: true
+        default: "otp-relay-nfs"
+        type: string
+      nfs_pv_name:
+        description: "Static NFS PersistentVolume name for app data"
+        required: true
+        default: "otp-relay-data-nfs-pv"
+        type: string
+      nfs_mount_options:
+        description: "Comma-separated NFS mount options"
+        required: false
+        default: "nfsvers=4.1"
         type: string
       redis_enabled:
         description: "Deploy Redis shared-state service"
@@ -311,8 +344,14 @@ jobs:
           MONITOR_NODE_SELECTOR_VALUE: ${{ github.event.inputs.monitor_node_selector_value || 'true' }}
           REDIS_NODE_SELECTOR_KEY: ${{ github.event.inputs.redis_node_selector_key || 'otp-relay/storage-node' }}
           REDIS_NODE_SELECTOR_VALUE: ${{ github.event.inputs.redis_node_selector_value || 'true' }}
-          PVC_STORAGE_CLASS: ${{ github.event.inputs.pvc_storage_class || 'local-path' }}
+          PVC_STORAGE_CLASS: ${{ github.event.inputs.pvc_storage_class || '' }}
           PVC_SIZE: ${{ github.event.inputs.pvc_size || '1Gi' }}
+          NFS_ENABLED: ${{ github.event.inputs.nfs_enabled || '0' }}
+          NFS_SERVER: ${{ github.event.inputs.nfs_server || secrets.NFS_SERVER || '' }}
+          NFS_PATH: ${{ github.event.inputs.nfs_path || secrets.NFS_PATH || '' }}
+          NFS_STORAGE_CLASS: ${{ github.event.inputs.nfs_storage_class || 'otp-relay-nfs' }}
+          NFS_PV_NAME: ${{ github.event.inputs.nfs_pv_name || 'otp-relay-data-nfs-pv' }}
+          NFS_MOUNT_OPTIONS: ${{ github.event.inputs.nfs_mount_options || 'nfsvers=4.1' }}
 
           REDIS_ENABLED: ${{ github.event.inputs.redis_enabled || '1' }}
           REDIS_URL: redis://otp-redis:6379/0
