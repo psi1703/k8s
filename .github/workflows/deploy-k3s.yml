@@ -50,7 +50,7 @@ on:
         default: "otp-relay-tls"
         type: string
       tls_self_signed:
-        description: "Generate/update a self-signed TLS certificate in the installer"
+        description: "Generate/update a self-signed TLS certificate in the installer (default; IT will distribute/trust it by Group Policy)"
         required: true
         default: "1"
         type: choice
@@ -296,6 +296,8 @@ jobs:
           TLS_ENABLED: ${{ github.event.inputs.tls_enabled || '1' }}
           TLS_HOST: ${{ github.event.inputs.tls_host || 'srvotptest26.init-db.lan' }}
           TLS_SECRET_NAME: ${{ github.event.inputs.tls_secret_name || 'otp-relay-tls' }}
+          # Current approved posture: keep TLS enabled and generate/update the self-signed cert.
+          # IT will distribute/trust the certificate via Group Policy for users.
           TLS_SELF_SIGNED: ${{ github.event.inputs.tls_self_signed || '1' }}
           LOADBALANCER_IP: ${{ github.event.inputs.loadbalancer_ip || '' }}
           INSTALL_METALLB: ${{ github.event.inputs.install_metallb || '0' }}
