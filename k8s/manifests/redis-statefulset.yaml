@@ -1,3 +1,6 @@
+# `k8s/manifests/redis-statefulset.yaml`
+
+```yaml
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -16,6 +19,25 @@ spec:
       labels:
         app: otp-redis
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - otp-redis
+                topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: otp-redis
       containers:
         - name: redis
           image: redis:7-alpine
@@ -28,7 +50,7 @@ spec:
               name: redis
           env:
             - name: REDIS_CONFIG_VERSION
-              value: "2026-05-13-redis-announce-fix"
+              value: "2026-05-13-redis-node-spread"
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -76,3 +98,4 @@ spec:
         resources:
           requests:
             storage: 1Gi
+```
