@@ -1253,20 +1253,55 @@ if requires_manifests_apply; then
       if k3s kubectl get deployment otp-relay -n "$NAMESPACE" >/dev/null 2>&1; then
         log "scaling deployment/otp-relay to 0 before app PVC migration"
         k3s kubectl scale deployment otp-relay -n "$NAMESPACE" --replicas=0
-        k3s kubectl rollout status deployment/otp-relay -n "$NAMESPACE" --timeout=180s || true
-        k3s kubectl wait --for=delete pod -l app=otp-relay -n "$NAMESPACE" --timeout=180s || true
+
+        log "waiting for old app pods to terminate before deleting app PVC"
+        for i in $(seq 1 120); do
+          app_pods="$({
+            k3s kubectl get pods -n "$NAMESPACE" -l app=otp-relay               -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true
+          })"
+          app_pods="$(printf '%s' "$app_pods" | xargs || true)"
+          if [ -z "$app_pods" ]; then
+            break
+          fi
+          sleep 2
+          [ "$i" -lt 120 ] || fatal "app pods did not terminate before PVC migration: $app_pods"
+        done
       fi
 
-      log "deleting old app PVC otp-relay-data so it can be recreated as NFS/RWX"
-      k3s kubectl delete pvc otp-relay-data -n "$NAMESPACE" --ignore-not-found=false --timeout=120s
+      log "requesting deletion of old app PVC otp-relay-data so it can be recreated as NFS/RWX"
+      k3s kubectl delete pvc otp-relay-data         -n "$NAMESPACE"         --ignore-not-found=true         --wait=false
 
       log "waiting for old app PVC otp-relay-data to disappear"
-      for i in $(seq 1 60); do
+      for i in $(seq 1 180); do
         if ! k3s kubectl get pvc otp-relay-data -n "$NAMESPACE" >/dev/null 2>&1; then
           break
         fi
+
+        deletion_timestamp="$({
+          k3s kubectl get pvc otp-relay-data             -n "$NAMESPACE"             -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || true
+        })"
+        deletion_timestamp="$(printf '%s' "$deletion_timestamp" | xargs)"
+
+        pods_using_claim="$({
+          k3s kubectl get pods -n "$NAMESPACE" -o json 2>/dev/null             | jq -r '.items[] | select(any(.spec.volumes[]?; .persistentVolumeClaim.claimName == "otp-relay-data")) | .metadata.name' 2>/dev/null || true
+        })"
+        pods_using_claim="$(printf '%s' "$pods_using_claim" | xargs || true)"
+
+        if [ -n "$pods_using_claim" ]; then
+          warn "PVC otp-relay-data is still referenced by pod(s): $pods_using_claim; waiting"
+        elif [ -n "$deletion_timestamp" ]; then
+          warn "PVC otp-relay-data is terminating; waiting"
+        else
+          warn "PVC otp-relay-data still exists; waiting"
+        fi
+
+        if [ "$i" = "150" ] && [ -n "$deletion_timestamp" ] && [ -z "$pods_using_claim" ]; then
+          warn "PVC otp-relay-data is stuck terminating with no pods using it; clearing PVC finalizers to complete migration"
+          k3s kubectl patch pvc otp-relay-data             -n "$NAMESPACE"             --type=merge             -p '{"metadata":{"finalizers":[]}}' || true
+        fi
+
         sleep 2
-        [ "$i" -lt 60 ] || fatal "old app PVC otp-relay-data did not delete within timeout"
+        [ "$i" -lt 180 ] || fatal "old app PVC otp-relay-data did not disappear within timeout. Check for stuck pods still using the claim. Redis PVC was not touched."
       done
     fi
   fi
