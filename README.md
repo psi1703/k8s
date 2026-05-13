@@ -4,7 +4,9 @@ Kubernetes/K3s deployment for the OTP Relay Portal.
 
 This repository contains the FastAPI portal, the required monitor service, the React frontend source, help-documentation source, Kubernetes manifests, Dockerfiles, and the installer used by GitHub Actions to deploy onto a K3s server or cluster.
 
-Current status: the repository has a validated Phase 3 K3s baseline with MetalLB, Traefik HTTPS, Redis-required runtime state, and an isolated monitor pod. It is not yet the final SCH production architecture. The remaining production-alignment gaps are tracked in `docs/operations/sch-target-vs-current.md`.
+Current status: the repository has a validated Phase 3 K3s baseline with MetalLB, Traefik HTTPS, Redis-required runtime state, and an isolated monitor pod. It is not yet the final SCH production architecture. The remaining production-alignment gaps are tracked in `docs/architecture/sch-target-architecture-gap-analysis.md`.
+
+For the consolidated documentation index, see `docs/README.md`.
 
 Current safe posture:
 
@@ -179,7 +181,7 @@ TLS_SELF_SIGNED=1
 
 The current SCH/IT path keeps self-signed TLS on and relies on IT distributing/trusting the certificate via Group Policy. Users may see a browser warning until that trust policy reaches their machines.
 
-See `docs/operations/sch-target-vs-current.md` for the active gap table and next engineering order.
+See `docs/architecture/sch-target-architecture-gap-analysis.md` for the active gap table and next engineering order.
 
 ### NFS shared app storage
 
@@ -193,7 +195,7 @@ NFS_STORAGE_CLASS=otp-relay-nfs
 PVC_STORAGE_CLASS=otp-relay-nfs
 ```
 
-This changes the app PVC to `ReadWriteMany` and binds it to `otp-relay-data-nfs-pv`. Existing `local-path` PVCs cannot be changed in place; follow `docs/operations/nfs-shared-storage.md` for backup and migration.
+This changes the app PVC to `ReadWriteMany` and binds it to `otp-relay-data-nfs-pv`. Existing `local-path` PVCs cannot be changed in place; follow `docs/deployment/nfs-shared-storage-migration-guide.md` for backup and migration.
 
 
 ---
@@ -323,13 +325,26 @@ otp-relay-k8s/
 │   └── workflows/
 │       └── deploy-k3s.yml
 ├── docs/
-│   ├── diagrams/
-│   │   ├── phase-map.svg
-│   │   └── phase1-architecture.svg
+│   ├── README.md
+│   ├── architecture/
+│   │   ├── diagrams/
+│   │   ├── kubernetes-architecture-plan.md
+│   │   └── sch-target-architecture-gap-analysis.md
+│   ├── archive/
+│   │   └── historical-phase-notes/
+│   ├── deployment/
+│   │   ├── github-actions-deployment-guide.md
+│   │   ├── k3s-setup-and-operations-guide.md
+│   │   ├── manual-image-build-and-deployment-fallback.md
+│   │   └── nfs-shared-storage-migration-guide.md
+│   ├── development/
+│   │   ├── docker-image-build-guide.md
+│   │   └── dockerfile-design-background-notes.md
 │   ├── help/
 │   ├── operations/
-│   │   └── sch-target-vs-current.md
-│   └── k8s-plan.md
+│   │   └── phase-3-resilience-validation-report.md
+│   └── validation/
+│       └── phase-2-loadbalancer-and-redis-alignment-report.md
 ├── frontend/
 │   ├── app.jsx
 │   ├── guide.html
@@ -338,18 +353,7 @@ otp-relay-k8s/
 ├── k8s/
 │   ├── Dockerfile
 │   ├── Dockerfile.monitor
-│   ├── docs/
 │   └── manifests/
-│       ├── configmap.yaml
-│       ├── deployment-monitor.yaml
-│       ├── deployment.yaml
-│       ├── namespace.yaml
-│       ├── pvc.yaml
-│       ├── redis-pdb.yaml
-│       ├── redis-service.yaml
-│       ├── redis-statefulset.yaml
-│       ├── secret-example.env
-│       └── service.yaml
 ├── scripts/
 │   ├── build_help_docs.py
 │   └── generate_sample_users.py
