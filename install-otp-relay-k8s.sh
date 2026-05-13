@@ -1250,23 +1250,32 @@ if requires_manifests_apply; then
       warn "This deletes only PVC/$NAMESPACE/otp-relay-data after scaling the app down. Redis PVC is not touched."
       warn "App data must already exist on NFS path $NFS_SERVER:$NFS_PATH before this migration."
 
+      # Both the web app and monitor mount otp-relay-data. The monitor tails
+      # /app/data/audit.log, so it must also be stopped before Kubernetes can
+      # release and delete the old RWO/local-path claim.
       if k3s kubectl get deployment otp-relay -n "$NAMESPACE" >/dev/null 2>&1; then
         log "scaling deployment/otp-relay to 0 before app PVC migration"
         k3s kubectl scale deployment otp-relay -n "$NAMESPACE" --replicas=0
-
-        log "waiting for old app pods to terminate before deleting app PVC"
-        for i in $(seq 1 120); do
-          app_pods="$({
-            k3s kubectl get pods -n "$NAMESPACE" -l app=otp-relay               -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true
-          })"
-          app_pods="$(printf '%s' "$app_pods" | xargs || true)"
-          if [ -z "$app_pods" ]; then
-            break
-          fi
-          sleep 2
-          [ "$i" -lt 120 ] || fatal "app pods did not terminate before PVC migration: $app_pods"
-        done
       fi
+
+      if k3s kubectl get deployment otp-monitor -n "$NAMESPACE" >/dev/null 2>&1; then
+        log "scaling deployment/otp-monitor to 0 before app PVC migration because it also mounts otp-relay-data"
+        k3s kubectl scale deployment otp-monitor -n "$NAMESPACE" --replicas=0
+      fi
+
+      log "waiting for all pods using PVC otp-relay-data to terminate before deleting app PVC"
+      for i in $(seq 1 180); do
+        pods_using_claim="$({
+          k3s kubectl get pods -n "$NAMESPACE" -o json 2>/dev/null             | jq -r '.items[] | select(any(.spec.volumes[]?; .persistentVolumeClaim.claimName == "otp-relay-data")) | .metadata.name' 2>/dev/null || true
+        })"
+        pods_using_claim="$(printf '%s' "$pods_using_claim" | xargs || true)"
+        if [ -z "$pods_using_claim" ]; then
+          break
+        fi
+        warn "PVC otp-relay-data is still referenced by pod(s): $pods_using_claim; waiting"
+        sleep 2
+        [ "$i" -lt 180 ] || fatal "pods still reference otp-relay-data before PVC migration: $pods_using_claim"
+      done
 
       log "requesting deletion of old app PVC otp-relay-data so it can be recreated as NFS/RWX"
       k3s kubectl delete pvc otp-relay-data         -n "$NAMESPACE"         --ignore-not-found=true         --wait=false
@@ -1327,7 +1336,7 @@ if requires_manifests_apply; then
     fi
   fi
 
-  if [ "$DEPLOY_MODE" = "full" ] || [ "$DEPLOY_MODE" = "monitor" ] || [ "$DEPLOY_MODE" = "manifests" ]; then
+  if [ "$DEPLOY_MODE" = "full" ] || [ "$DEPLOY_MODE" = "monitor" ] || [ "$DEPLOY_MODE" = "manifests" ] || [ "${MIGRATE_APP_PVC_TO_NFS:-0}" = "1" ]; then
     k3s kubectl apply -f "$MANIFEST_DIR/deployment-monitor.yaml"
   fi
 
