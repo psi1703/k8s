@@ -21,4 +21,4 @@ data:
   ALERT_LEVEL: "error"
   SERVER_HOSTNAME: "otp-relay-k8s"
   SERVER_IP: "127.0.0.1"
-  PORTAL_URL: "http://127.0.0.1"
+  PORTAL_URL: "https://svotptest26.init-db.lan"
