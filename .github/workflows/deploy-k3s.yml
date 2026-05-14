@@ -137,6 +137,7 @@ on:
         required: true
         default: 1Gi
         type: string
+
   push:
     branches:
       - main
@@ -207,8 +208,12 @@ jobs:
             [ -n "$file" ] || continue
 
             case "$file" in
-              install-otp-relay-k8s.sh|.github/workflows/deploy-k3s.yml)
+              install-otp-relay-k8s.sh)
                 MANIFESTS_CHANGED=1
+                ;;
+
+              .github/workflows/deploy-k3s.yml)
+                DOCS_ONLY_CHANGED=1
                 ;;
 
               package.json|package-lock.json|.dockerignore)
@@ -255,6 +260,8 @@ jobs:
             MODE=monitor
           elif [ "$MANIFESTS_CHANGED" = "1" ]; then
             MODE=manifests
+          elif [ "$DOCS_ONLY_CHANGED" = "1" ]; then
+            MODE=none
           else
             MODE=none
           fi
@@ -312,7 +319,7 @@ jobs:
           NFS_MOUNT_OPTIONS: nfsvers=4.1
 
           REDIS_ENABLED: ${{ github.event.inputs.redis_enabled || '1' }}
-          REDIS_URL: redis://otp-redis:6379/0
+          REDIS_URL: redis://otp-redis-haproxy:6379/0
           REDIS_REQUIRED: ${{ github.event.inputs.redis_required || '1' }}
           REDIS_STORAGE_CLASS: ${{ github.event.inputs.redis_storage_class || 'local-path' }}
           REDIS_SIZE: ${{ github.event.inputs.redis_size || '1Gi' }}
