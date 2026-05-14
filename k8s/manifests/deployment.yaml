@@ -6,7 +6,7 @@ metadata:
   labels:
     app: otp-relay
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: otp-relay
