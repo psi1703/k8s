@@ -152,6 +152,14 @@ REDIS_STORAGE_CLASS="${REDIS_STORAGE_CLASS:-local-path}"
 REDIS_SIZE="${REDIS_SIZE:-1Gi}"
 REDIS_SPREAD_RECREATE_PVCS="${REDIS_SPREAD_RECREATE_PVCS:-auto}"
 
+# Non-registry multi-node image distribution. The installer builds images on
+# the runner/control-plane node, then imports the saved image tar into every
+# K3s node through a temporary privileged DaemonSet. This avoids external
+# registries and avoids SSH/SCP access to worker nodes.
+DISTRIBUTE_IMAGES_TO_NODES="${DISTRIBUTE_IMAGES_TO_NODES:-1}"
+IMAGE_DISTRIBUTION_PORT="${IMAGE_DISTRIBUTION_PORT:-18080}"
+IMAGE_IMPORTER_IMAGE="${IMAGE_IMPORTER_IMAGE:-redis:7-alpine}"
+
 RESTART_APP_REQUIRED=0
 RESTART_MONITOR_REQUIRED=0
 
@@ -372,6 +380,19 @@ validate_k8s_topology_settings() {
     *) fatal "REDIS_SPREAD_RECREATE_PVCS must be auto, 0, or 1" ;;
   esac
 
+  case "$DISTRIBUTE_IMAGES_TO_NODES" in
+    0|1) ;;
+    *) fatal "DISTRIBUTE_IMAGES_TO_NODES must be 0 or 1" ;;
+  esac
+
+  case "$IMAGE_DISTRIBUTION_PORT" in
+    ''|*[!0-9]*) fatal "IMAGE_DISTRIBUTION_PORT must be numeric" ;;
+  esac
+
+  if [ "$IMAGE_DISTRIBUTION_PORT" -lt 1024 ] || [ "$IMAGE_DISTRIBUTION_PORT" -gt 65535 ]; then
+    fatal "IMAGE_DISTRIBUTION_PORT must be between 1024 and 65535"
+  fi
+
   if [ "$NFS_ENABLED" = "1" ]; then
     [ -n "$NFS_SERVER" ] || fatal "NFS_ENABLED=1 requires NFS_SERVER"
     [ -n "$NFS_PATH" ] || fatal "NFS_ENABLED=1 requires NFS_PATH"
@@ -535,6 +556,13 @@ ensure_tls_secret_if_requested() {
 }
 
 apply_runtime_configmap() {
+  if [ -n "${MANIFEST_DIR:-}" ] && [ -f "$MANIFEST_DIR/configmap.yaml" ]; then
+    log "applying rendered ConfigMap manifest from repository template"
+    k3s kubectl apply -f "$MANIFEST_DIR/configmap.yaml"
+    return 0
+  fi
+
+  warn "rendered configmap.yaml is not available; falling back to generated live ConfigMap"
   k3s kubectl create configmap otp-relay-config \
     --namespace "$NAMESPACE" \
     --from-literal=CLAIM_EXPIRY_SEC="90" \
@@ -554,7 +582,6 @@ apply_runtime_configmap() {
     --from-literal=PORTAL_URL="$PORTAL_URL" \
     --dry-run=client -o yaml | k3s kubectl apply -f -
 }
-
 mark_deployment_restart_required() {
   local deployment_name="$1"
   case "$deployment_name" in
@@ -938,6 +965,185 @@ apply_if_exists() {
   fi
 }
 
+image_distribution_server_ip() {
+  if [ -n "${IMAGE_DISTRIBUTION_HOST:-}" ]; then
+    printf '%s\n' "$IMAGE_DISTRIBUTION_HOST"
+    return 0
+  fi
+
+  if [ -n "${SERVER_IP:-}" ] && [ "$SERVER_IP" != "127.0.0.1" ]; then
+    printf '%s\n' "$SERVER_IP"
+    return 0
+  fi
+
+  hostname -I 2>/dev/null | awk '{print $1}'
+}
+
+sanitize_k8s_name() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's/[^a-z0-9-]/-/g; s/--*/-/g; s/^-//; s/-$//' \
+    | cut -c1-48
+}
+
+wait_for_importer_logs() {
+  local namespace="$1"
+  local selector="$2"
+  local expected="$3"
+  local timeout_seconds="$4"
+  local start_ts
+  local now_ts
+  local done_count
+
+  start_ts="$(date +%s)"
+  while true; do
+    done_count="$(k3s kubectl logs -n "$namespace" -l "$selector" --tail=-1 --prefix=false 2>/dev/null | grep -c 'IMAGE_IMPORT_DONE' || true)"
+    done_count="$(printf '%s' "$done_count" | xargs)"
+    done_count="${done_count:-0}"
+
+    if [ "$done_count" -ge "$expected" ]; then
+      return 0
+    fi
+
+    now_ts="$(date +%s)"
+    if [ $((now_ts - start_ts)) -ge "$timeout_seconds" ]; then
+      warn "image importer logs show $done_count/$expected completed imports"
+      return 1
+    fi
+
+    sleep 3
+  done
+}
+
+distribute_image_tar_to_all_nodes() {
+  local image_name="$1"
+  local tar_path="$2"
+  local label_suffix="$3"
+
+  [ "$DISTRIBUTE_IMAGES_TO_NODES" = "1" ] || return 0
+  [ -f "$tar_path" ] || fatal "image tar does not exist: $tar_path"
+
+  local node_count
+  node_count="$(k3s kubectl get nodes --no-headers 2>/dev/null | awk '$2 == "Ready" {count++} END {print count+0}')"
+  node_count="$(printf '%s' "$node_count" | xargs)"
+  node_count="${node_count:-0}"
+
+  if [ "$node_count" -le 1 ]; then
+    log "single ready node detected; no cross-node image distribution needed for $image_name"
+    return 0
+  fi
+
+  local serve_ip
+  serve_ip="$(image_distribution_server_ip | xargs)"
+  [ -n "$serve_ip" ] || fatal "could not determine image distribution host IP"
+
+  local serve_dir
+  local tar_name
+  local ds_name
+  local app_label
+  local http_pid
+  local http_log
+
+  serve_dir="$(dirname "$tar_path")"
+  tar_name="$(basename "$tar_path")"
+  ds_name="image-importer-$(sanitize_k8s_name "$label_suffix")"
+  app_label="otp-relay-image-importer-${label_suffix}"
+  http_log="$GENERATED_DIR/${ds_name}-http.log"
+
+  log "distributing image $image_name to $node_count K3s node(s) without a registry"
+  log "starting temporary image tar server on ${serve_ip}:${IMAGE_DISTRIBUTION_PORT}"
+
+  python3 -m http.server "$IMAGE_DISTRIBUTION_PORT" --bind 0.0.0.0 --directory "$serve_dir" >"$http_log" 2>&1 &
+  http_pid="$!"
+  sleep 2
+  if ! kill -0 "$http_pid" >/dev/null 2>&1; then
+    cat "$http_log" >&2 || true
+    fatal "failed to start temporary image distribution server on port $IMAGE_DISTRIBUTION_PORT"
+  fi
+
+  cleanup_image_importer() {
+    k3s kubectl delete daemonset "$ds_name" -n "$NAMESPACE" --ignore-not-found=true >/dev/null 2>&1 || true
+    if [ -n "${http_pid:-}" ]; then
+      kill "$http_pid" >/dev/null 2>&1 || true
+      wait "$http_pid" >/dev/null 2>&1 || true
+    fi
+  }
+
+  k3s kubectl delete daemonset "$ds_name" -n "$NAMESPACE" --ignore-not-found=true >/dev/null 2>&1 || true
+
+  cat <<EOF_IMPORTER | k3s kubectl apply -f -
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: $ds_name
+  namespace: $NAMESPACE
+  labels:
+    app: $app_label
+spec:
+  selector:
+    matchLabels:
+      app: $app_label
+  template:
+    metadata:
+      labels:
+        app: $app_label
+    spec:
+      hostNetwork: true
+      tolerations:
+        - operator: Exists
+      restartPolicy: Always
+      containers:
+        - name: importer
+          image: $IMAGE_IMPORTER_IMAGE
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              echo "Downloading image tar for $image_name from http://$serve_ip:$IMAGE_DISTRIBUTION_PORT/$tar_name"
+              wget -O /tmp/image.tar "http://$serve_ip:$IMAGE_DISTRIBUTION_PORT/$tar_name"
+              /host-bin/k3s ctr images import /tmp/image.tar
+              rm -f /tmp/image.tar
+              echo IMAGE_IMPORT_DONE
+              sleep 3600
+          volumeMounts:
+            - name: k3s-bin
+              mountPath: /host-bin/k3s
+              readOnly: true
+            - name: containerd-sock
+              mountPath: /run/k3s/containerd/containerd.sock
+      volumes:
+        - name: k3s-bin
+          hostPath:
+            path: /usr/local/bin/k3s
+            type: File
+        - name: containerd-sock
+          hostPath:
+            path: /run/k3s/containerd/containerd.sock
+            type: Socket
+EOF_IMPORTER
+
+  if ! k3s kubectl rollout status daemonset/"$ds_name" -n "$NAMESPACE" --timeout=180s; then
+    k3s kubectl get pods -n "$NAMESPACE" -l "app=$app_label" -o wide || true
+    k3s kubectl describe daemonset "$ds_name" -n "$NAMESPACE" || true
+    cleanup_image_importer
+    fatal "image importer DaemonSet did not become ready"
+  fi
+
+  if ! wait_for_importer_logs "$NAMESPACE" "app=$app_label" "$node_count" 180; then
+    k3s kubectl get pods -n "$NAMESPACE" -l "app=$app_label" -o wide || true
+    k3s kubectl logs -n "$NAMESPACE" -l "app=$app_label" --tail=100 --prefix=true || true
+    cleanup_image_importer
+    fatal "image import did not complete on every ready node for $image_name"
+  fi
+
+  cleanup_image_importer
+  log "image $image_name imported on all ready K3s nodes"
+}
+
 # Optional runner prompt before validation, matching the existing installer behavior.
 if [ -z "$INSTALL_GITHUB_RUNNER" ]; then
   if prompt_yes_no "Install a GitHub Actions self-hosted runner for CI/CD deployments from GitHub? [y/N]" "N"; then
@@ -1185,11 +1391,12 @@ fi
 if requires_app_image; then
   log "building app image with Docker"
   "$DOCKER_BIN" build -t "$APP_IMAGE" -f "$APP_DOCKERFILE" .
-  log "importing app image into K3s containerd"
-  tmp_app_tar="$(mktemp --suffix=.tar)"
+  log "saving app image for K3s import/distribution"
+  tmp_app_tar="$(mktemp -p "$GENERATED_DIR" otp-relay-app-image.XXXXXX.tar)"
   "$DOCKER_BIN" save "$APP_IMAGE" -o "$tmp_app_tar"
+  log "importing app image into local K3s containerd"
   k3s ctr images import "$tmp_app_tar"
-  rm -f "$tmp_app_tar"
+  distribute_image_tar_to_all_nodes "$APP_IMAGE" "$tmp_app_tar" "app"
 else
   log "DEPLOY_MODE=$DEPLOY_MODE skips app image build/import"
 fi
@@ -1197,11 +1404,12 @@ fi
 if requires_monitor_image; then
   log "building required monitor image with Docker"
   "$DOCKER_BIN" build -t "$MONITOR_IMAGE" -f "$MONITOR_DOCKERFILE" .
-  log "importing required monitor image into K3s containerd"
-  tmp_monitor_tar="$(mktemp --suffix=.tar)"
+  log "saving monitor image for K3s import/distribution"
+  tmp_monitor_tar="$(mktemp -p "$GENERATED_DIR" otp-relay-monitor-image.XXXXXX.tar)"
   "$DOCKER_BIN" save "$MONITOR_IMAGE" -o "$tmp_monitor_tar"
+  log "importing required monitor image into local K3s containerd"
   k3s ctr images import "$tmp_monitor_tar"
-  rm -f "$tmp_monitor_tar"
+  distribute_image_tar_to_all_nodes "$MONITOR_IMAGE" "$tmp_monitor_tar" "monitor"
 else
   log "DEPLOY_MODE=$DEPLOY_MODE skips monitor image build/import"
 fi
@@ -1331,6 +1539,7 @@ Redis node selector:   ${REDIS_NODE_SELECTOR_KEY:-none}=${REDIS_NODE_SELECTOR_VA
 PVC storage:           ${PVC_STORAGE_CLASS:-default} / $PVC_SIZE
 NFS app storage:       enabled=$NFS_ENABLED server=${NFS_SERVER:-none} path=${NFS_PATH:-none} class=$NFS_STORAGE_CLASS pv=$NFS_PV_NAME
 Redis:                 enabled=$REDIS_ENABLED required=$REDIS_REQUIRED url=${REDIS_URL:-none} storage=${REDIS_STORAGE_CLASS:-default}/$REDIS_SIZE spread_recreate_pvcs=$REDIS_SPREAD_RECREATE_PVCS
+Image distribution:    enabled=$DISTRIBUTE_IMAGES_TO_NODES importer=$IMAGE_IMPORTER_IMAGE port=$IMAGE_DISTRIBUTION_PORT
 
 Useful commands:
   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
