@@ -15,14 +15,17 @@ on:
           - monitor
           - manifests
           - none
+
       service_type:
-        description: "Kubernetes service exposure"
+        description: "Kubernetes app service exposure. Official production path is ClusterIP behind Traefik Ingress."
         required: true
-        default: LoadBalancer
+        default: ClusterIP
         type: choice
         options:
+          - ClusterIP
           - NodePort
           - LoadBalancer
+
       ingress_enabled:
         description: "Enable Traefik ingress"
         required: true
@@ -31,6 +34,7 @@ on:
         options:
           - "1"
           - "0"
+
       tls_enabled:
         description: "Enable HTTPS/TLS on Traefik Ingress"
         required: true
@@ -39,24 +43,28 @@ on:
         options:
           - "0"
           - "1"
+
       tls_host:
         description: "HTTPS hostname for OTP Relay Ingress"
         required: true
         default: "srvotptest26.init-db.lan"
         type: string
+
       tls_secret_name:
         description: "Kubernetes TLS secret name for OTP Relay Ingress"
         required: true
         default: "otp-relay-tls"
         type: string
+
       tls_self_signed:
-        description: "Generate/update a self-signed TLS certificate in the installer (default; IT will distribute/trust it by Group Policy)"
+        description: "Generate/update a self-signed TLS certificate in the installer. IT should distribute/trust it by Group Policy."
         required: true
         default: "1"
         type: choice
         options:
           - "0"
           - "1"
+
       install_metallb:
         description: "Install/configure MetalLB before deploying"
         required: true
@@ -65,34 +73,50 @@ on:
         options:
           - "0"
           - "1"
+
       require_metallb:
         description: "Fail if LoadBalancer mode cannot find MetalLB"
         required: true
-        default: "1"
+        default: "0"
         type: choice
         options:
           - "0"
           - "1"
+
       loadbalancer_ip:
-        description: "Optional fixed LoadBalancer IP"
+        description: "Optional fixed app LoadBalancer IP. Not used for official ClusterIP + Ingress mode."
         required: false
         default: ""
         type: string
+
       metallb_ip_range:
         description: "MetalLB IP pool, for example 172.31.11.120-172.31.11.130"
         required: false
         default: ""
         type: string
+
+      replica_count:
+        description: "OTP Relay app replica count"
+        required: true
+        default: "2"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+
       pvc_storage_class:
         description: "App PVC storageClassName; use otp-relay-nfs when NFS is enabled"
         required: false
         default: "otp-relay-nfs"
         type: string
+
       pvc_size:
         description: "App PVC size"
         required: true
         default: 1Gi
         type: string
+
       nfs_enabled:
         description: "Use a static NFS PersistentVolume for app data"
         required: true
@@ -101,16 +125,19 @@ on:
         options:
           - "0"
           - "1"
+
       nfs_server:
         description: "NFS server IP or DNS name for app data; required when nfs_enabled=1"
         required: false
         default: "172.31.11.108"
         type: string
+
       nfs_path:
         description: "NFS export path for app data; required when nfs_enabled=1"
         required: false
         default: "/export/otp-relay-data"
         type: string
+
       redis_enabled:
         description: "Deploy Redis shared-state service"
         required: true
@@ -119,6 +146,7 @@ on:
         options:
           - "0"
           - "1"
+
       redis_required:
         description: "Fail readiness if Redis is not reachable"
         required: true
@@ -127,11 +155,13 @@ on:
         options:
           - "0"
           - "1"
+
       redis_storage_class:
         description: "Redis PVC storageClassName"
         required: false
         default: "local-path"
         type: string
+
       redis_size:
         description: "Redis PVC size"
         required: true
@@ -213,7 +243,7 @@ jobs:
                 ;;
 
               .github/workflows/deploy-k3s.yml)
-                DOCS_ONLY_CHANGED=1
+                MANIFESTS_CHANGED=1
                 ;;
 
               package.json|package-lock.json|.dockerignore)
@@ -284,28 +314,28 @@ jobs:
           APP_IMAGE: otp-relay:latest
           MONITOR_IMAGE: otp-monitor:latest
 
-          # Phase 3 placement/exposure defaults. Manual workflow runs can override these inputs.
-          SERVICE_TYPE: ${{ github.event.inputs.service_type || 'LoadBalancer' }}
+          # Official exposure model:
+          # Client -> Traefik HTTPS Ingress -> otp-relay ClusterIP Service -> app pods.
+          SERVICE_TYPE: ${{ github.event.inputs.service_type || 'ClusterIP' }}
           SERVICE_NODE_PORT: "30080"
           INGRESS_ENABLED: ${{ github.event.inputs.ingress_enabled || '1' }}
           TLS_ENABLED: ${{ github.event.inputs.tls_enabled || '1' }}
           TLS_HOST: ${{ github.event.inputs.tls_host || 'srvotptest26.init-db.lan' }}
           TLS_SECRET_NAME: ${{ github.event.inputs.tls_secret_name || 'otp-relay-tls' }}
-          # Current approved posture: keep TLS enabled and generate/update the self-signed cert.
-          # IT will distribute/trust the certificate via Group Policy for users.
           TLS_SELF_SIGNED: ${{ github.event.inputs.tls_self_signed || '1' }}
           LOADBALANCER_IP: ${{ github.event.inputs.loadbalancer_ip || '' }}
           INSTALL_METALLB: ${{ github.event.inputs.install_metallb || '0' }}
-          REQUIRE_METALLB: ${{ github.event.inputs.require_metallb || '1' }}
+          REQUIRE_METALLB: ${{ github.event.inputs.require_metallb || '0' }}
           METALLB_IP_RANGE: ${{ github.event.inputs.metallb_ip_range || '' }}
 
-          REPLICA_COUNT: "1"
+          REPLICA_COUNT: ${{ github.event.inputs.replica_count || '2' }}
           APP_NODE_SELECTOR_KEY: otp-relay/storage-node
           APP_NODE_SELECTOR_VALUE: "true"
           MONITOR_NODE_SELECTOR_KEY: otp-relay/monitor-node
           MONITOR_NODE_SELECTOR_VALUE: "true"
           REDIS_NODE_SELECTOR_KEY: otp-relay/storage-node
           REDIS_NODE_SELECTOR_VALUE: "true"
+
           PVC_STORAGE_CLASS: ${{ github.event.inputs.pvc_storage_class || 'otp-relay-nfs' }}
           PVC_SIZE: ${{ github.event.inputs.pvc_size || '1Gi' }}
 
