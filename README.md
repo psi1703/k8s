@@ -62,20 +62,32 @@ Start here:
 
 ```text
 .
-├── .github/workflows/           # GitHub Actions deployment workflow
-├── docs/                        # Active documentation and portal help source
-├── frontend/                    # Portal frontend source/static files
-├── k8s/                         # Dockerfiles and Kubernetes manifests only
+├── .github/
+│   └── workflows/
+│       └── deploy-k3s.yml        # GitHub Actions deployment workflow
+├── docs/                         # Active documentation and portal help source
+│   ├── README.md                 # Documentation index
+│   ├── architecture/             # Architecture and SCH gap analysis
+│   ├── deployment/               # Deployment and storage guide
+│   ├── development/              # Build and development guide
+│   ├── help/                     # Portal help source markdown/assets
+│   └── operations/               # Operations and validation runbook
+├── frontend/                     # Portal frontend source/static files
+├── k8s/                          # Dockerfiles and Kubernetes manifests only
 │   ├── Dockerfile
 │   ├── Dockerfile.monitor
 │   └── manifests/
-├── scripts/                     # Help-doc and sample-user utilities
-├── install-otp-relay-k8s.sh     # Main K3s installer/deployer
-├── main.py                      # FastAPI portal
-├── monitor.py                   # Required monitor service
-├── package.json
-├── requirements.txt
-└── README.md
+├── scripts/                      # Help-doc and sample-user utilities
+├── .dockerignore                 # Docker build-context exclusions
+├── .gitignore                    # Git ignore rules
+├── LICENSE
+├── install-otp-relay-k8s.sh      # Main K3s installer/deployer
+├── main.py                       # FastAPI portal
+├── monitor.py                    # Required monitor service
+├── package.json                  # Frontend/build tooling package metadata
+├── package-lock.json             # Locked frontend/build dependencies
+├── requirements.txt              # Python runtime dependencies
+└── README.md                     # Project overview
 ```
 
 `k8s/` must remain deployment assets only. Do not put documentation under `k8s/docs/`.
