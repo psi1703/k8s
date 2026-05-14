@@ -11,7 +11,7 @@ spec:
     matchLabels:
       app: otp-relay
   strategy:
-    type: Recreate
+    type: RollingUpdate
   template:
     metadata:
       labels:
