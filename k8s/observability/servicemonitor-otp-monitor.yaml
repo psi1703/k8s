@@ -12,8 +12,9 @@ spec:
   selector:
     matchLabels:
       app: otp-monitor
+      metrics: enabled
   endpoints:
-    - port: metrics       # the named port on the otp-monitor Service
+    - port: metrics
       path: /metrics
       interval: 15s
       scrapeTimeout: 10s
