@@ -4,7 +4,7 @@ Kubernetes/K3s deployment for the OTP Relay Portal.
 
 This repository contains the FastAPI portal, required monitor service, React frontend source, help-documentation source, Kubernetes manifests, Dockerfiles, and installer used by GitHub Actions to deploy onto a K3s server or cluster.
 
-This README is the single operational documentation file for the repository. It combines the root README, architecture notes, deployment guide, storage guide, development guide, operations runbook, validation notes, and help-documentation map into one SCH-style document.
+This README is the single operational documentation file for the repository. It combines the root README, architecture notes, deployment guide, storage guide, development guide, operations runbook, validation notes, and help-documentation map into one document.
 
 ---
 
