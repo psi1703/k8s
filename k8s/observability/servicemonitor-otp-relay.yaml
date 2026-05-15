@@ -6,7 +6,6 @@ metadata:
   labels:
     app: otp-relay
 spec:
-  # Match the Service in the otp-relay namespace
   namespaceSelector:
     matchNames:
       - otp-relay
@@ -14,7 +13,7 @@ spec:
     matchLabels:
       app: otp-relay
   endpoints:
-    - port: http          # the named port on the otp-relay Service
+    - port: http
       path: /metrics
       interval: 15s
       scrapeTimeout: 10s
