@@ -993,21 +993,49 @@ wait_for_importer_logs() {
   local timeout_seconds="$4"
   local start_ts
   local now_ts
-  local done_count
 
   start_ts="$(date +%s)"
   while true; do
-    done_count="$(k3s kubectl logs -n "$namespace" -l "$selector" --tail=-1 --prefix=false 2>/dev/null | grep -c 'IMAGE_IMPORT_DONE' || true)"
-    done_count="$(printf '%s' "$done_count" | xargs)"
-    done_count="${done_count:-0}"
+    local pod_rows=""
+    local completed_nodes=""
+    local completed_count=0
 
-    if [ "$done_count" -ge "$expected" ]; then
+    pod_rows="$(
+      k3s kubectl get pods -n "$namespace" -l "$selector"         -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.nodeName}{" "}{.status.phase}{"\n"}{end}' 2>/dev/null || true
+    )"
+
+    while read -r pod node phase; do
+      [ -n "$pod" ] || continue
+      if k3s kubectl logs -n "$namespace" "$pod" -c importer --tail=-1 2>/dev/null | grep -q 'IMAGE_IMPORT_DONE'; then
+        completed_nodes="${completed_nodes}${node} "
+        completed_count=$((completed_count + 1))
+      fi
+    done <<EOF_IMPORTER_ROWS
+$pod_rows
+EOF_IMPORTER_ROWS
+
+    completed_nodes="$(printf '%s' "$completed_nodes" | xargs || true)"
+
+    if [ "$completed_count" -ge "$expected" ]; then
+      log "image importer completed on $completed_count/$expected node(s): ${completed_nodes:-unknown}"
       return 0
     fi
 
     now_ts="$(date +%s)"
     if [ $((now_ts - start_ts)) -ge "$timeout_seconds" ]; then
-      warn "image importer logs show $done_count/$expected completed imports"
+      warn "image importer completed on $completed_count/$expected node(s): ${completed_nodes:-none}"
+      warn "image importer pod status:"
+      k3s kubectl get pods -n "$namespace" -l "$selector" -o wide >&2 || true
+
+      warn "image importer logs by pod:"
+      while read -r pod node phase; do
+        [ -n "$pod" ] || continue
+        warn "----- importer pod=$pod node=${node:-unknown} phase=${phase:-unknown} -----"
+        k3s kubectl logs -n "$namespace" "$pod" -c importer --tail=160 >&2 || true
+      done <<EOF_IMPORTER_ROWS
+$pod_rows
+EOF_IMPORTER_ROWS
+
       return 1
     fi
 
@@ -1137,7 +1165,7 @@ EOF_IMPORTER
     k3s kubectl get pods -n "$NAMESPACE" -l "app=$app_label" -o wide || true
     k3s kubectl logs -n "$NAMESPACE" -l "app=$app_label" --tail=100 --prefix=true || true
     cleanup_image_importer
-    fatal "image import did not complete on every ready node for $image_name"
+    fatal "image import did not complete on every expected importer pod for $image_name; see node-specific importer logs above"
   fi
 
   cleanup_image_importer
