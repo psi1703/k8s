@@ -971,6 +971,79 @@ apply_if_exists() {
   fi
 }
 
+apply_observability_manifests() {
+  local source_dir="${OBSERVABILITY_DIR:-}"
+  [ -n "$source_dir" ] || return 0
+  [ -d "$source_dir" ] || return 0
+
+  local has_service_monitor_crd=0
+  if k3s kubectl get crd servicemonitors.monitoring.coreos.com >/dev/null 2>&1; then
+    has_service_monitor_crd=1
+  fi
+
+  local applied=0
+  local file
+  for file in "$source_dir"/*.yaml; do
+    [ -f "$file" ] || continue
+
+    case "$(basename "$file")" in
+      *values.yaml|alloy-values.yaml|loki-values.yaml|prometheus-stack-values.yaml)
+        continue
+        ;;
+      servicemonitor-*.yaml)
+        if [ "$has_service_monitor_crd" = "1" ]; then
+          log "applying observability manifest $(basename "$file")"
+          k3s kubectl apply -f "$file"
+          applied=$((applied + 1))
+        else
+          warn "skipping $(basename "$file") because ServiceMonitor CRD is not installed"
+        fi
+        ;;
+      *)
+        log "applying observability manifest $(basename "$file")"
+        k3s kubectl apply -f "$file"
+        applied=$((applied + 1))
+        ;;
+    esac
+  done
+
+  if [ "$applied" -gt 0 ]; then
+    log "applied $applied observability manifest(s)"
+  fi
+}
+
+dry_run_observability_manifests() {
+  local source_dir="${OBSERVABILITY_DIR:-}"
+  [ -n "$source_dir" ] || return 0
+  [ -d "$source_dir" ] || return 0
+
+  local has_service_monitor_crd=0
+  if k3s kubectl get crd servicemonitors.monitoring.coreos.com >/dev/null 2>&1; then
+    has_service_monitor_crd=1
+  fi
+
+  local file
+  for file in "$source_dir"/*.yaml; do
+    [ -f "$file" ] || continue
+
+    case "$(basename "$file")" in
+      *values.yaml|alloy-values.yaml|loki-values.yaml|prometheus-stack-values.yaml)
+        continue
+        ;;
+      servicemonitor-*.yaml)
+        if [ "$has_service_monitor_crd" = "1" ]; then
+          k3s kubectl apply --dry-run=client -f "$file" >/dev/null
+        else
+          warn "skipping dry-run for $(basename "$file") because ServiceMonitor CRD is not installed"
+        fi
+        ;;
+      *)
+        k3s kubectl apply --dry-run=client -f "$file" >/dev/null
+        ;;
+    esac
+  done
+}
+
 image_distribution_server_ip() {
   if [ -n "${IMAGE_DISTRIBUTION_HOST:-}" ]; then
     printf '%s\n' "$IMAGE_DISTRIBUTION_HOST"
@@ -1356,7 +1429,9 @@ fi
 log "staging repository Dockerfiles and Kubernetes manifests for deployment"
 GENERATED_DIR="$(mktemp -d /tmp/otp-relay-k8s.XXXXXX)"
 SOURCE_MANIFEST_DIR="k8s/manifests"
+SOURCE_OBSERVABILITY_DIR="k8s/observability"
 MANIFEST_DIR="$GENERATED_DIR/manifests"
+OBSERVABILITY_DIR="$GENERATED_DIR/observability"
 APP_DOCKERFILE="k8s/Dockerfile"
 MONITOR_DOCKERFILE="k8s/Dockerfile.monitor"
 cleanup_generated_assets() { rm -rf "$GENERATED_DIR"; }
@@ -1364,6 +1439,11 @@ trap cleanup_generated_assets EXIT
 mkdir -p "$MANIFEST_DIR"
 cp "$SOURCE_MANIFEST_DIR"/*.yaml "$MANIFEST_DIR"/
 rm -f "$MANIFEST_DIR/secret-example.env"
+
+if [ -d "$SOURCE_OBSERVABILITY_DIR" ]; then
+  mkdir -p "$OBSERVABILITY_DIR"
+  find "$SOURCE_OBSERVABILITY_DIR" -maxdepth 1 -type f -name '*.yaml' -exec cp {} "$OBSERVABILITY_DIR"/ \;
+fi
 
 existing_pvc_storage_class="$(k3s kubectl get pvc otp-relay-data -n "$NAMESPACE" -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)"
 existing_pvc_storage_class="$(printf '%s' "$existing_pvc_storage_class" | xargs)"
@@ -1412,6 +1492,7 @@ if [ "$REDIS_ENABLED" = "1" ]; then
     fi
   done
 fi
+dry_run_observability_manifests
 
 if requires_manifests_apply; then
   log "creating/updating Kubernetes secret"
@@ -1496,6 +1577,8 @@ if requires_manifests_apply; then
     k3s kubectl apply -f "$MANIFEST_DIR/monitor-service.yaml"
   fi
 
+  apply_observability_manifests
+
   if [ "$PORTAL_URL_CONFIG_REFRESHED" = "1" ]; then
     log "marking deployments for restart to pick up refreshed PORTAL_URL ConfigMap"
     mark_deployment_restart_required otp-relay
@@ -1576,6 +1659,7 @@ PVC storage:           ${PVC_STORAGE_CLASS:-default} / $PVC_SIZE
 NFS app storage:       enabled=$NFS_ENABLED server=${NFS_SERVER:-none} path=${NFS_PATH:-none} class=$NFS_STORAGE_CLASS pv=$NFS_PV_NAME
 Redis:                 enabled=$REDIS_ENABLED required=$REDIS_REQUIRED url=${REDIS_URL:-none} storage=${REDIS_STORAGE_CLASS:-default}/$REDIS_SIZE spread_recreate_pvcs=$REDIS_SPREAD_RECREATE_PVCS
 Image distribution:    enabled=$DISTRIBUTE_IMAGES_TO_NODES importer=$IMAGE_IMPORTER_IMAGE port=$IMAGE_DISTRIBUTION_PORT
+Observability YAMLs:   applied from k8s/observability when present
 
 Useful commands:
   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
