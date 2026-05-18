@@ -37,16 +37,16 @@ spec:
           env:
             - name: OTP_RELAY_DATA_DIR
               value: /app/data
-            - name: WHATSAPP_API_KEY
+            - name: TELEGRAM_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: otp-relay-secrets
-                  key: WHATSAPP_API_KEY
-            - name: WHATSAPP_RECIPIENT
+                  key: TELEGRAM_BOT_TOKEN
+            - name: TELEGRAM_CHAT_ID
               valueFrom:
                 secretKeyRef:
                   name: otp-relay-secrets
-                  key: WHATSAPP_RECIPIENT
+                  key: TELEGRAM_CHAT_ID
 
           securityContext:
             allowPrivilegeEscalation: false
