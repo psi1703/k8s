@@ -893,6 +893,12 @@ if (manifest_dir / "deployment-monitor.yaml").exists():
     text = add_nodesel(text, os.environ.get("MONITOR_NODE_SELECTOR_KEY", ""), os.environ.get("MONITOR_NODE_SELECTOR_VALUE", ""))
     write("deployment-monitor.yaml", text)
 
+# Monitor metrics Service. This is internal-only and is selected by
+# k8s/observability/servicemonitor-otp-monitor.yaml.
+if (manifest_dir / "monitor-service.yaml").exists():
+    text = replace_namespace(read("monitor-service.yaml"))
+    write("monitor-service.yaml", text)
+
 # Service
 if (manifest_dir / "service.yaml").exists():
     text = replace_namespace(read("service.yaml"))
@@ -1303,7 +1309,7 @@ log "checking required source files"
 [ -f k8s/Dockerfile ] || fatal "k8s/Dockerfile is missing"
 [ -f k8s/Dockerfile.monitor ] || fatal "k8s/Dockerfile.monitor is missing"
 [ -d k8s/manifests ] || fatal "k8s/manifests directory is missing"
-for required_manifest in namespace.yaml pvc.yaml deployment.yaml service.yaml deployment-monitor.yaml; do
+for required_manifest in namespace.yaml pvc.yaml deployment.yaml service.yaml deployment-monitor.yaml monitor-service.yaml; do
   [ -f "k8s/manifests/$required_manifest" ] || fatal "k8s/manifests/$required_manifest is missing"
 done
 if [ "$REDIS_ENABLED" = "1" ]; then
@@ -1394,7 +1400,8 @@ k3s kubectl apply --dry-run=client \
   -f "$MANIFEST_DIR/pvc.yaml" \
   -f "$MANIFEST_DIR/deployment.yaml" \
   -f "$MANIFEST_DIR/service.yaml" \
-  -f "$MANIFEST_DIR/deployment-monitor.yaml" >/dev/null
+  -f "$MANIFEST_DIR/deployment-monitor.yaml" \
+  -f "$MANIFEST_DIR/monitor-service.yaml" >/dev/null
 if [ "$INGRESS_ENABLED" = "1" ] && [ -f "$MANIFEST_DIR/ingress.yaml" ]; then
   k3s kubectl apply --dry-run=client -f "$MANIFEST_DIR/ingress.yaml" >/dev/null
 fi
@@ -1486,6 +1493,7 @@ if requires_manifests_apply; then
 
   if [ "$DEPLOY_MODE" = "full" ] || [ "$DEPLOY_MODE" = "monitor" ] || [ "$DEPLOY_MODE" = "manifests" ]; then
     k3s kubectl apply -f "$MANIFEST_DIR/deployment-monitor.yaml"
+    k3s kubectl apply -f "$MANIFEST_DIR/monitor-service.yaml"
   fi
 
   if [ "$PORTAL_URL_CONFIG_REFRESHED" = "1" ]; then
