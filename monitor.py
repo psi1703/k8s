@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
+from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -51,6 +52,7 @@ PHONE_INTERFACE = os.getenv("PHONE_INTERFACE", "ens33")
 PHONE_PING_INTERVAL = int(os.getenv("PHONE_PING_INTERVAL", "300"))
 PHONE_OFFLINE_THRESHOLD = int(os.getenv("PHONE_OFFLINE_THRESHOLD", "2"))
 BATCH_WINDOW_SEC = int(os.getenv("BATCH_WINDOW_SEC", "10"))
+MONITOR_METRICS_PORT = int(os.getenv("MONITOR_METRICS_PORT", "9101"))
 
 # Prefer an explicit URL for Kubernetes, where Service/Ingress naming may differ.
 _explicit_portal_url = os.getenv("PORTAL_URL", "").strip()
@@ -71,6 +73,29 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
 logger = logging.getLogger("otp-monitor")
+
+
+# ── Prometheus metrics ────────────────────────────────────────────────────────
+OTP_IPHONE_PRESENT = Gauge(
+    "otp_iphone_present",
+    "Whether the monitored iPhone is currently reachable by ARP",
+)
+OTP_IPHONE_ABSENCE_SECONDS = Gauge(
+    "otp_iphone_absence_seconds",
+    "Current iPhone absence duration in seconds; zero while the phone is reachable",
+)
+OTP_IPHONE_ABSENCE_EVENTS_TOTAL = Counter(
+    "otp_iphone_absence_events_total",
+    "Total number of iPhone absence events detected by the monitor",
+)
+OTP_IPHONE_ABSENCE_DURATION_SECONDS = Histogram(
+    "otp_iphone_absence_duration_seconds",
+    "Duration in seconds of completed iPhone absence events",
+)
+OTP_MONITOR_ARP_LAST_SUCCESS_TIMESTAMP_SECONDS = Gauge(
+    "otp_monitor_arp_last_success_timestamp_seconds",
+    "Unix timestamp of the last successful ARP check",
+)
 
 
 # ── Audit log writer ──────────────────────────────────────────────────────────
@@ -225,6 +250,9 @@ def ping(ip: str) -> bool:
 
 
 def watch_phone():
+    OTP_IPHONE_PRESENT.set(0)
+    OTP_IPHONE_ABSENCE_SECONDS.set(0)
+
     if not PHONE_IP:
         logger.warning("PHONE_IP not set — phone watcher disabled")
         return
@@ -247,15 +275,24 @@ def watch_phone():
 
     consecutive_failures = 0
     phone_online = True
+    absence_started_at = None
 
     # Short delay before first check to let networking settle after start.
     time.sleep(30)
 
     while True:
         if ping(PHONE_IP):
+            now_ts = time.time()
+            OTP_MONITOR_ARP_LAST_SUCCESS_TIMESTAMP_SECONDS.set(now_ts)
+            OTP_IPHONE_PRESENT.set(1)
+            OTP_IPHONE_ABSENCE_SECONDS.set(0)
+
             if not phone_online:
                 phone_online = True
                 consecutive_failures = 0
+                if absence_started_at is not None:
+                    OTP_IPHONE_ABSENCE_DURATION_SECONDS.observe(max(0, now_ts - absence_started_at))
+                    absence_started_at = None
                 audit("phone_online", f"iPhone {PHONE_IP} is reachable again", "info")
                 logger.info(f"Phone {PHONE_IP} back online")
             else:
@@ -267,12 +304,19 @@ def watch_phone():
 
             if phone_online and consecutive_failures >= PHONE_OFFLINE_THRESHOLD:
                 phone_online = False
+                absence_started_at = time.time()
+                OTP_IPHONE_PRESENT.set(0)
+                OTP_IPHONE_ABSENCE_SECONDS.set(0)
+                OTP_IPHONE_ABSENCE_EVENTS_TOTAL.inc()
                 audit(
                     "phone_offline",
                     f"iPhone {PHONE_IP} unreachable after {PHONE_OFFLINE_THRESHOLD} consecutive ARP checks",
                     "error",
                 )
                 logger.error(f"Phone {PHONE_IP} declared offline")
+            elif not phone_online and absence_started_at is not None:
+                OTP_IPHONE_PRESENT.set(0)
+                OTP_IPHONE_ABSENCE_SECONDS.set(max(0, time.time() - absence_started_at))
 
         time.sleep(PHONE_PING_INTERVAL)
 
@@ -280,6 +324,9 @@ def watch_phone():
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     logger.info("OTP Monitor starting")
+    start_http_server(MONITOR_METRICS_PORT)
+    logger.info("Prometheus metrics server listening on port %s", MONITOR_METRICS_PORT)
+
     audit(
         "monitor_start",
         f"alert_level={ALERT_LEVEL} phone_ip={PHONE_IP or 'not set'} "
