@@ -5,6 +5,7 @@ metadata:
   namespace: otp-relay
   labels:
     app: otp-monitor
+    metrics: enabled
 spec:
   type: ClusterIP
   selector:
