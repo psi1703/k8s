@@ -270,6 +270,10 @@ jobs:
                 MANIFESTS_CHANGED=1
                 ;;
 
+              k8s/observability/*|k8s/observability/***)
+                MANIFESTS_CHANGED=1
+                ;;
+
               README.md|LICENSE|.gitignore|docs/*|docs/**|scripts/generate_sample_users.py)
                 DOCS_ONLY_CHANGED=1
                 ;;
