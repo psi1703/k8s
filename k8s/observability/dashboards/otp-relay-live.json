@@ -4,10 +4,11 @@
   "metadata": {
     "name": "otp-relay-live",
     "namespace": "default",
-    "uid": "otp-relay-live",
-    "labels": {},
+    "uid": "1a7b3332-9c7b-4b33-bb46-9026427f10ff",
     "annotations": {
-      "grafana.app/saved-from-ui": "Grafana v13.0.1 (a100054f)"
+      "grafana.app/folder": "afmei4vghnvggd",
+      "grafana.app/folderTitle": "INIT",
+      "grafana.app/folderUrl": "/dashboards/f/afmei4vghnvggd/init"
     }
   },
   "spec": {
@@ -163,8 +164,8 @@
                       },
                       "spec": {
                         "editorMode": "code",
-                        "expr": "sum(rate(otp_delivered_total[5m])) * 3600",
-                        "legendFormat": "OTPs delivered per hour, smoothed.",
+                        "expr": "sum(increase(otp_delivered_total[5m]))",
+                        "legendFormat": "OTPs delivered (per hour bucket)",
                         "range": true
                       }
                     },
@@ -184,9 +185,9 @@
                       },
                       "spec": {
                         "editorMode": "code",
-                        "expr": "sum(rate(otp_claims_total[5m])) * 3600",
+                        "expr": "sum(increase(otp_claims_total[5m]))",
                         "instant": false,
-                        "legendFormat": "Claims per hour, smoothed.",
+                        "legendFormat": "Claims (per hour bucket)",
                         "range": true
                       }
                     },
@@ -796,7 +797,7 @@
                       },
                       "spec": {
                         "editorMode": "code",
-                        "expr": "max(up{job=~\"otp-monitor.*\"})",
+                        "expr": "max(up{job=\"otp-monitor\"})",
                         "legendFormat": "__auto",
                         "range": true
                       }
@@ -985,7 +986,7 @@
                       },
                       "spec": {
                         "editorMode": "code",
-                        "expr": "max(up{job=~\"kube-prometheus-stack-prometheus\"})",
+                        "expr": "max(up{job=\"kube-prometheus-stack-prometheus\"})",
                         "legendFormat": "__auto",
                         "range": true
                       }
