@@ -255,6 +255,10 @@ jobs:
                 MONITOR_CHANGED=1
                 ;;
 
+              scripts/build_grafana_dashboard_configmap.py)
+                MANIFESTS_CHANGED=1
+                ;;
+
               main.py|frontend/*|frontend/**|scripts/build_help_docs.py|docs/help/*|docs/help/**)
                 APP_CHANGED=1
                 ;;
