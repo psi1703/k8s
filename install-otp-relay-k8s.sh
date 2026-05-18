@@ -45,10 +45,10 @@ set -Eeuo pipefail
 #
 # Runtime ConfigMap inputs:
 #   PHONE_IP, PHONE_INTERFACE, PHONE_PING_INTERVAL, PHONE_OFFLINE_THRESHOLD
-#   BATCH_WINDOW_SEC, ALERT_LEVEL, PORTAL_URL
+#   PORTAL_URL
 #
 # Runtime Secret inputs:
-#   SMS_SECRET_TOKEN, WHATSAPP_API_KEY, WHATSAPP_RECIPIENT
+#   SMS_SECRET_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 #
 # Optional GitHub runner setup:
 #   INSTALL_GITHUB_RUNNER, GITHUB_RUNNER_URL, GITHUB_RUNNER_TOKEN,
@@ -127,10 +127,8 @@ PHONE_INTERFACE="$(printf '%s' "$PHONE_INTERFACE" | xargs)"
 PHONE_INTERFACE="${PHONE_INTERFACE:-eth0}"
 PHONE_PING_INTERVAL="${PHONE_PING_INTERVAL:-150}"
 PHONE_OFFLINE_THRESHOLD="${PHONE_OFFLINE_THRESHOLD:-2}"
-BATCH_WINDOW_SEC="${BATCH_WINDOW_SEC:-10}"
-ALERT_LEVEL="${ALERT_LEVEL:-error}"
-WHATSAPP_API_KEY="${WHATSAPP_API_KEY:-}"
-WHATSAPP_RECIPIENT="${WHATSAPP_RECIPIENT:-}"
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 
 RUNTIME_DATA_DIR="${RUNTIME_DATA_DIR:-}"
 SKIP_HELP_DOCS_BUILD="${SKIP_HELP_DOCS_BUILD:-0}"
@@ -575,8 +573,6 @@ apply_runtime_configmap() {
     --from-literal=PHONE_INTERFACE="$PHONE_INTERFACE" \
     --from-literal=PHONE_PING_INTERVAL="$PHONE_PING_INTERVAL" \
     --from-literal=PHONE_OFFLINE_THRESHOLD="$PHONE_OFFLINE_THRESHOLD" \
-    --from-literal=BATCH_WINDOW_SEC="$BATCH_WINDOW_SEC" \
-    --from-literal=ALERT_LEVEL="$ALERT_LEVEL" \
     --from-literal=SERVER_HOSTNAME="$SERVER_HOSTNAME" \
     --from-literal=SERVER_IP="$SERVER_IP" \
     --from-literal=PORTAL_URL="$PORTAL_URL" \
@@ -710,8 +706,6 @@ render_manifests() {
   PHONE_INTERFACE="$PHONE_INTERFACE" \
   PHONE_PING_INTERVAL="$PHONE_PING_INTERVAL" \
   PHONE_OFFLINE_THRESHOLD="$PHONE_OFFLINE_THRESHOLD" \
-  BATCH_WINDOW_SEC="$BATCH_WINDOW_SEC" \
-  ALERT_LEVEL="$ALERT_LEVEL" \
   SERVER_HOSTNAME="$SERVER_HOSTNAME" \
   SERVER_IP="$SERVER_IP" \
   PORTAL_URL="$PORTAL_URL" \
@@ -818,8 +812,6 @@ if (manifest_dir / "configmap.yaml").exists():
         "PHONE_INTERFACE": os.environ["PHONE_INTERFACE"],
         "PHONE_PING_INTERVAL": os.environ["PHONE_PING_INTERVAL"],
         "PHONE_OFFLINE_THRESHOLD": os.environ["PHONE_OFFLINE_THRESHOLD"],
-        "BATCH_WINDOW_SEC": os.environ["BATCH_WINDOW_SEC"],
-        "ALERT_LEVEL": os.environ["ALERT_LEVEL"],
         "SERVER_HOSTNAME": os.environ["SERVER_HOSTNAME"],
         "SERVER_IP": os.environ["SERVER_IP"],
         "PORTAL_URL": os.environ["PORTAL_URL"],
@@ -1396,8 +1388,8 @@ fi
 if [ -z "$PHONE_IP" ]; then
   fatal "PHONE_IP is required because monitor.py is a core component"
 fi
-if [ -z "$WHATSAPP_API_KEY" ] || [ -z "$WHATSAPP_RECIPIENT" ]; then
-  warn "WhatsApp alert credentials are not set. monitor.py will still run, but WhatsApp alerts will be skipped."
+if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+  warn "Telegram alert credentials are not set. monitor.py will still run, but Telegram phone-state alerts will be skipped."
 fi
 
 if requires_app_image; then
@@ -1499,8 +1491,8 @@ if requires_manifests_apply; then
   k3s kubectl create secret generic otp-relay-secrets \
     --namespace "$NAMESPACE" \
     --from-literal=SMS_SECRET_TOKEN="$SMS_SECRET_TOKEN" \
-    --from-literal=WHATSAPP_API_KEY="$WHATSAPP_API_KEY" \
-    --from-literal=WHATSAPP_RECIPIENT="$WHATSAPP_RECIPIENT" \
+    --from-literal=TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" \
+    --from-literal=TELEGRAM_CHAT_ID="$TELEGRAM_CHAT_ID" \
     --dry-run=client -o yaml | k3s kubectl apply -f -
 fi
 
