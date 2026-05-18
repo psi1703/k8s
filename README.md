@@ -39,7 +39,7 @@
 - OTP values are **never written to disk** — runtime state is held in Redis with TTL expiry.
 - Persistent application files (users, audit log, wizard state, admin config) are stored on an NFS-backed shared volume at `/app/data`.
 - The portal is exposed over HTTPS through a Traefik ingress. All other services use `ClusterIP` with no public exposure.
-- A dedicated monitor pod runs with `hostNetwork` and `NET_RAW` to check phone presence, SMS path health, and send WhatsApp alerts. It has no Service and no Ingress.
+- A dedicated monitor pod runs with `hostNetwork` and `NET_RAW` to check phone presence and send Telegram alerts for iPhone state changes. It has no Service and no Ingress.
 
 ---
 
@@ -69,7 +69,7 @@ Monitor pod
   ──► Phone presence checks
   ──► SMS-path checks
   ──► Shared audit log checks
-  ──► WhatsApp alerts
+  ──► Telegram alerts
   (no Service / no Ingress)
 ```
 
@@ -314,8 +314,8 @@ All deployment logic lives in `install-otp-relay-k8s.sh` and the manifests in `k
 |--------|-------------|
 | `PHONE_IP` | IP address of the company iPhone |
 | `PHONE_INTERFACE` | Network interface to the phone |
-| `WHATSAPP_API_KEY` | WhatsApp alert API key |
-| `WHATSAPP_RECIPIENT` | WhatsApp recipient for alerts |
+| `TELEGRAM_BOT_TOKEN` | Telegram bot token for monitor alerts |
+| `TELEGRAM_CHAT_ID` | Telegram chat ID for monitor alerts |
 | `PORTAL_URL` | Public portal URL |
 
 ### Manual fallback
@@ -365,7 +365,7 @@ sudo /usr/local/bin/otp-relayk3s-monitor.sh
 ```
 .env
 secret.env
-Runtime tokens or WhatsApp credentials
+Runtime tokens or Telegram credentials
 users.xlsx (production copy)
 admin_auth.json
 admin_config.json
@@ -581,12 +581,12 @@ The monitor pod is a required internal workload with elevated capabilities and n
 | Service | None |
 | Ingress | None |
 | Audit log access | Reads `/app/data/audit.log` |
-| Alerting | WhatsApp (when configured) |
+| Alerting | Telegram for phone state changes (when configured) |
 
 ### Checks performed
 
 - Phone presence on phone network (ping/ARP)
-- SMS-path reachability checks
+- Telegram alerting for `phone_online` / `phone_offline` events
 - Shared audit log integrity
 - Overall deployment health
 
@@ -607,7 +607,7 @@ OK: OTP Relay K3s deployment is healthy.
 sudo nano /etc/otp-relay-k3s-monitor.env
 ```
 
-If SMTP settings are incomplete, the monitor still reports health locally but may not send email alerts.
+If Telegram settings are incomplete, the monitor still reports health locally but may not send Telegram phone-state alerts.
 
 ---
 
