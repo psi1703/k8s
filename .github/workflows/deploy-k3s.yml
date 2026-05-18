@@ -270,7 +270,7 @@ jobs:
                 MANIFESTS_CHANGED=1
                 ;;
 
-              k8s/observability/*|k8s/observability/***)
+              k8s/observability/*|k8s/observability/**)
                 MANIFESTS_CHANGED=1
                 ;;
 
