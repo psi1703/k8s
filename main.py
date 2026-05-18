@@ -35,6 +35,8 @@ except ImportError:
 from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+from starlette.responses import Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -144,6 +146,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("otp-relay")
 redis_client = None
+
+# -- Prometheus metrics -------------------------------------------------------
+OTP_QUEUE_DEPTH = Gauge("otp_queue_depth", "Current OTP claim queue depth")
+OTP_ACTIVE_USER = Gauge("otp_active_user", "Whether an OTP claimant is currently active at the front of the queue")
+OTP_CLAIMS_TOTAL = Counter("otp_claims_total", "Total OTP claim requests accepted")
+OTP_DELIVERED_TOTAL = Counter("otp_delivered_total", "Total OTPs delivered to users")
+OTP_CLAIM_EXPIRED_TOTAL = Counter("otp_claim_expired_total", "Total OTP claims expired before delivery")
+OTP_REQUEST_DURATION_SECONDS = Histogram(
+    "otp_request_duration_seconds",
+    "OTP Relay HTTP request duration in seconds",
+    ["method", "path", "status"],
+)
 
 # -- Server-backed wizard/admin state -----------------------------------------
 DATA_DIR = _resolve_runtime_path(os.environ.get("OTP_RELAY_DATA_DIR", "data"))
@@ -321,6 +335,7 @@ def _redis_purge_expired_claims() -> None:
         redis_client.lpop(REDIS_QUEUE_KEY)
         redis_client.delete(_redis_claim_key(token))
         audit("claim_expired", token, f"No OTP arrived within {CLAIM_EXPIRY_SEC}s - evicted from slot 1", "warn")
+        OTP_CLAIM_EXPIRED_TOTAL.inc()
 
 
 def _redis_get_pending_otp(token: str) -> Optional[Dict[str, Any]]:
@@ -430,6 +445,20 @@ def _redis_admin_queue() -> List[Dict[str, Any]]:
             "position": index,
         })
     return rows
+
+
+def _update_app_metrics() -> None:
+    """Refresh live app gauges for Prometheus."""
+    try:
+        if _use_redis_state():
+            depth = len(_redis_queue_tokens())
+        else:
+            depth = len(claim_queue)
+
+        OTP_QUEUE_DEPTH.set(depth)
+        OTP_ACTIVE_USER.set(1 if depth > 0 else 0)
+    except Exception as exc:
+        logger.warning("Could not update Prometheus app metrics: %s", exc)
 
 
 def _ensure_data_dir() -> None:
@@ -882,6 +911,7 @@ def purge_expired() -> None:
         if age > CLAIM_EXPIRY_SEC:
             expired = claim_queue.popleft()
             audit("claim_expired", expired["token"], f"No OTP arrived within {CLAIM_EXPIRY_SEC}s - evicted from slot 1", "warn")
+            OTP_CLAIM_EXPIRED_TOTAL.inc()
         else:
             break
 
@@ -951,6 +981,30 @@ async def startup() -> None:
         logger.warning("users.xlsx not found at %s", USERS_EXCEL_PATH)
         audit("server_start", detail="No users.xlsx - POST /admin/reload-users after adding it", status="warn")
     asyncio.create_task(background_purge())
+
+
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    start = asyncio.get_running_loop().time()
+    response = await call_next(request)
+    elapsed = asyncio.get_running_loop().time() - start
+
+    if request.url.path != "/metrics":
+        route = request.scope.get("route")
+        path = getattr(route, "path", request.url.path)
+        OTP_REQUEST_DURATION_SECONDS.labels(
+            method=request.method,
+            path=path,
+            status=str(response.status_code),
+        ).observe(elapsed)
+
+    return response
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics():
+    _update_app_metrics()
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/healthz")
@@ -1045,6 +1099,7 @@ async def claim_otp(request: Request):
                         )
 
             _redis_add_claim(token)
+            OTP_CLAIMS_TOTAL.inc()
             position = _redis_queue_position(token)
             queue_depth = len(_redis_queue_tokens())
             wait_estimate = max(0, (position - 1) * CLAIM_EXPIRY_SEC)
@@ -1097,6 +1152,7 @@ async def claim_otp(request: Request):
         "email": users[token]["email"],
         "claimed_at": now,
     })
+    OTP_CLAIMS_TOTAL.inc()
 
     position = len(claim_queue)
     queue_depth = len(claim_queue)
@@ -1239,6 +1295,7 @@ async def sms_received(request: Request):
         _redis_set_pending_otp(recipient["token"], otp)
 
         audit("otp_delivered", recipient["token"], "OTP ready for display - queue unblocked")
+        OTP_DELIVERED_TOTAL.inc()
         return {"status": "delivered", "recipient": recipient["name"]}
 
     purge_expired()
@@ -1257,6 +1314,7 @@ async def sms_received(request: Request):
     pending_otps[recipient["token"]] = {"otp": otp, "arrived_at": _utcnow_naive()}
 
     audit("otp_delivered", recipient["token"], "OTP ready for display - queue unblocked")
+    OTP_DELIVERED_TOTAL.inc()
     return {"status": "delivered", "recipient": recipient["name"]}
 
 
