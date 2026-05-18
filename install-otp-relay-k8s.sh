@@ -1384,6 +1384,7 @@ if [ "$REDIS_ENABLED" = "1" ]; then
 fi
 [ -f scripts/build_help_docs.py ] || fatal "required help-doc builder is missing: scripts/build_help_docs.py"
 [ -d docs/help ] || fatal "required help-doc input directory is missing: docs/help"
+[ -f scripts/build_grafana_dashboard_configmap.py ] || fatal "required Grafana dashboard ConfigMap builder is missing: scripts/build_grafana_dashboard_configmap.py"
 
 if [ -z "$PHONE_IP" ]; then
   fatal "PHONE_IP is required because monitor.py is a core component"
@@ -1416,6 +1417,11 @@ if requires_app_image; then
   [ -f frontend/app.js ] || fatal "frontend/app.js was not produced by npm run build:frontend"
 else
   log "DEPLOY_MODE=$DEPLOY_MODE does not require app help-doc build; skipping installer venv"
+fi
+
+if [ -f k8s/observability/dashboards/otp-relay-live.json ]; then
+  log "generating Grafana dashboard ConfigMap from dashboard JSON"
+  python3 scripts/build_grafana_dashboard_configmap.py
 fi
 
 log "staging repository Dockerfiles and Kubernetes manifests for deployment"
