@@ -3,15 +3,12 @@
 # Two parallel tasks:
 #   1. Phone watcher  — uses ARP checks for iPhone presence and writes
 #                       phone_online / phone_offline events to the audit log
-#   2. Alert forwarder — tails the audit log in real time and forwards
-#                        entries at or above ALERT_LEVEL to WhatsApp
-#                        via CallMeBot API.
+#   2. Alert forwarder — tails the audit log in real time and forwards only
+#                        phone_online / phone_offline events to Telegram.
 #
-# All events — including phone_* — flow through the same alert filter,
-# so ALERT_LEVEL controls everything uniformly.
-#
-# Message batching: events that arrive within BATCH_WINDOW_SEC are grouped
-# into one WhatsApp message to avoid flooding.
+# SCH production model:
+#   - monitor.py sends Telegram alerts for iPhone state changes only.
+#   - Broader app/cluster alerts are handled by Prometheus Alertmanager.
 
 import json
 import logging
@@ -19,7 +16,6 @@ import os
 import subprocess
 import threading
 import time
-import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,14 +40,12 @@ AUDIT_LOG_PATH = str(
     )
 )
 
-WHATSAPP_API_KEY = os.getenv("WHATSAPP_API_KEY", "")
-WHATSAPP_RECIPIENT = os.getenv("WHATSAPP_RECIPIENT", "")
-ALERT_LEVEL = os.getenv("ALERT_LEVEL", "error").lower()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 PHONE_IP = os.getenv("PHONE_IP", "")
 PHONE_INTERFACE = os.getenv("PHONE_INTERFACE", "ens33")
 PHONE_PING_INTERVAL = int(os.getenv("PHONE_PING_INTERVAL", "300"))
 PHONE_OFFLINE_THRESHOLD = int(os.getenv("PHONE_OFFLINE_THRESHOLD", "2"))
-BATCH_WINDOW_SEC = int(os.getenv("BATCH_WINDOW_SEC", "10"))
 MONITOR_METRICS_PORT = int(os.getenv("MONITOR_METRICS_PORT", "9101"))
 
 # Prefer an explicit URL for Kubernetes, where Service/Ingress naming may differ.
@@ -65,7 +59,6 @@ PORTAL_URL = (
     "https://srvotp26.init-db.lan"
 )
 
-LEVEL_ORDER = {"info": 0, "warn": 1, "error": 2}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -118,91 +111,60 @@ def audit(event: str, detail: str = "", status: str = "info"):
     logger.log(level, f"[{event}] {detail}")
 
 
-# ── WhatsApp via CallMeBot ────────────────────────────────────────────────────
-def send_whatsapp(message: str):
-    if not WHATSAPP_API_KEY or not WHATSAPP_RECIPIENT:
-        logger.warning("WhatsApp not configured — skipping alert")
+# ── Telegram Bot API ───────────────────────────────────────────────────────────
+def send_telegram(message: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram not configured — skipping alert")
         return
+
     try:
-        params = urllib.parse.urlencode({
-            "phone": WHATSAPP_RECIPIENT,
+        payload = json.dumps({
+            "chat_id": TELEGRAM_CHAT_ID,
             "text": message,
-            "apikey": WHATSAPP_API_KEY,
-        })
-        url = f"https://api.callmebot.com/whatsapp.php?{params}"
-        with urllib.request.urlopen(url, timeout=15) as response:
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True,
+        }).encode("utf-8")
+
+        request = urllib.request.Request(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        with urllib.request.urlopen(request, timeout=15) as response:
             body = response.read().decode(errors="replace")
-            logger.info(f"WhatsApp sent — response: {body[:80]}")
+            logger.info("Telegram alert sent — response: %s", body[:120])
     except Exception as e:
-        logger.error(f"WhatsApp delivery failed: {e}")
-
-
-# ── Batching dispatcher ───────────────────────────────────────────────────────
-_batch = []
-_batch_lock = threading.Lock()
-_batch_timer = None
-
-
-def _flush_batch():
-    global _batch, _batch_timer
-    with _batch_lock:
-        entries = _batch[:]
-        _batch = []
-        _batch_timer = None
-
-    if not entries:
-        return
-
-    if len(entries) == 1:
-        e = entries[0]
-        icon = "🔴" if e.get("status") == "error" else "🟡"
-        msg = (
-            f"{icon} *OTP Relay Alert*\n"
-            f"[{e.get('status', 'info')}] {e.get('event', '')}"
-            + (f" | {e.get('token')}" if e.get("token") else "")
-            + (f"\n{e.get('detail')}" if e.get("detail") else "")
-            + f"\n\n🔗 {PORTAL_URL}/admin/log"
-        )
-    else:
-        lines = []
-        for e in entries:
-            icon = "🔴" if e.get("status") == "error" else "🟡"
-            line = f"{icon} [{e.get('status', 'info')}] {e.get('event', '')}"
-            if e.get("token"):
-                line += f" | {e.get('token')}"
-            if e.get("detail"):
-                line += f"\n   {e.get('detail')}"
-            lines.append(line)
-        msg = (
-            f"⚠️ *OTP Relay — {len(entries)} alerts*\n\n"
-            + "\n\n".join(lines)
-            + f"\n\n🔗 {PORTAL_URL}/admin/log"
-        )
-
-    send_whatsapp(msg)
+        logger.error("Telegram delivery failed: %s", e)
 
 
 def dispatch(entry: dict):
-    """Add entry to batch; start flush timer if not already running."""
-    global _batch_timer
-    with _batch_lock:
-        _batch.append(entry)
-        if _batch_timer is None:
-            _batch_timer = threading.Timer(BATCH_WINDOW_SEC, _flush_batch)
-            _batch_timer.daemon = True
-            _batch_timer.start()
+    event = entry.get("event", "")
+    if event == "phone_offline":
+        icon = "🔴"
+        title = "OTP Relay iPhone Offline"
+    elif event == "phone_online":
+        icon = "🟢"
+        title = "OTP Relay iPhone Online"
+    else:
+        return
 
-
-def should_alert(status: str) -> bool:
-    return LEVEL_ORDER.get(status, 0) >= LEVEL_ORDER.get(ALERT_LEVEL, 2)
+    message = (
+        f"{icon} *{title}*\n"
+        f"{entry.get('detail', '')}\n\n"
+        f"🔗 {PORTAL_URL}/admin/log"
+    )
+    send_telegram(message)
 
 
 # ── Log tailer ────────────────────────────────────────────────────────────────
 def tail_audit_log():
     """
     Follows the audit log file from the end, like `tail -f`.
-    Forwards any entry whose status meets the alert threshold.
-    Handles the log file not existing yet.
+
+    SCH behavior: forward only phone_offline and phone_online events to Telegram.
+    Other app/cluster alerts are handled by Prometheus Alertmanager.
     """
     log_path = Path(AUDIT_LOG_PATH)
     logger.info(f"Log tailer started — watching {log_path}")
@@ -210,27 +172,25 @@ def tail_audit_log():
     while not log_path.exists():
         time.sleep(5)
 
-    with open(log_path, "r", encoding="utf-8") as f:
+    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
         f.seek(0, 2)
         while True:
             line = f.readline()
             if not line:
                 time.sleep(0.5)
                 continue
-            line = line.strip()
-            if not line:
+
+            raw = line.strip()
+            if not raw or "\x00" in raw:
                 continue
+
             try:
-                entry = json.loads(line)
-                status = entry.get("status", "info")
-                event = entry.get("event", "")
-                # Never alert on our own monitor_start event to avoid loops.
-                if event == "monitor_start":
-                    continue
-                if should_alert(status):
-                    dispatch(entry)
+                entry = json.loads(raw)
             except json.JSONDecodeError:
                 continue
+
+            if entry.get("event") in {"phone_offline", "phone_online"}:
+                dispatch(entry)
 
 
 # ── Phone watcher ─────────────────────────────────────────────────────────────
@@ -329,7 +289,8 @@ if __name__ == "__main__":
 
     audit(
         "monitor_start",
-        f"alert_level={ALERT_LEVEL} phone_ip={PHONE_IP or 'not set'} "
+        f"telegram_configured={bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)} "
+        f"phone_ip={PHONE_IP or 'not set'} "
         f"interface={PHONE_INTERFACE} ping_interval={PHONE_PING_INTERVAL}s",
         "info",
     )
