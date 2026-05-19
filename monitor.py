@@ -46,6 +46,8 @@ PHONE_IP = os.getenv("PHONE_IP", "")
 PHONE_INTERFACE = os.getenv("PHONE_INTERFACE", "ens33")
 PHONE_PING_INTERVAL = int(os.getenv("PHONE_PING_INTERVAL", "300"))
 PHONE_OFFLINE_THRESHOLD = int(os.getenv("PHONE_OFFLINE_THRESHOLD", "2"))
+PHONE_ARP_COUNT = int(os.getenv("PHONE_ARP_COUNT", "2"))
+PHONE_ARP_TIMEOUT = int(os.getenv("PHONE_ARP_TIMEOUT", "2"))
 MONITOR_METRICS_PORT = int(os.getenv("MONITOR_METRICS_PORT", "9101"))
 
 # Prefer an explicit URL for Kubernetes, where Service/Ingress naming may differ.
@@ -198,7 +200,13 @@ def ping(ip: str) -> bool:
     """Use ARP instead of ICMP ping for iPhone presence detection."""
     try:
         result = subprocess.run(
-            ["arping", "-c", "2", "-w", "1", "-I", PHONE_INTERFACE, ip],
+            [
+                "arping",
+                "-c", str(PHONE_ARP_COUNT),
+                "-w", str(PHONE_ARP_TIMEOUT),
+                "-I", PHONE_INTERFACE,
+                ip,
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
@@ -221,7 +229,9 @@ def watch_phone():
         f"Phone watcher started — target {PHONE_IP}, "
         f"interface {PHONE_INTERFACE}, "
         f"interval {PHONE_PING_INTERVAL}s, "
-        f"threshold {PHONE_OFFLINE_THRESHOLD} missed pings"
+        f"threshold {PHONE_OFFLINE_THRESHOLD} missed pings, "
+        f"arp_count {PHONE_ARP_COUNT}, "
+        f"arp_timeout {PHONE_ARP_TIMEOUT}s"
     )
 
     if not os.path.exists(f"/sys/class/net/{PHONE_INTERFACE}"):
@@ -291,7 +301,8 @@ if __name__ == "__main__":
         "monitor_start",
         f"telegram_configured={bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)} "
         f"phone_ip={PHONE_IP or 'not set'} "
-        f"interface={PHONE_INTERFACE} ping_interval={PHONE_PING_INTERVAL}s",
+        f"interface={PHONE_INTERFACE} ping_interval={PHONE_PING_INTERVAL}s "
+        f"arp_count={PHONE_ARP_COUNT} arp_timeout={PHONE_ARP_TIMEOUT}s",
         "info",
     )
 
