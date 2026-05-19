@@ -12,7 +12,8 @@ ENV OTP_RELAY_DATA_DIR=/app/data \
 # iOS devices filter ICMP ping in low-power state but must respond to ARP,
 # making arping the only reliable way to detect a sleeping iPhone.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends iputils-arping && \
+    apt-get install -y --no-install-recommends iputils-arping libcap2-bin && \
+    setcap cap_net_raw+ep /usr/bin/arping && \
     rm -rf /var/lib/apt/lists/*
 
 # Fixed UID matches the Kubernetes securityContext runAsUser/fsGroup.
