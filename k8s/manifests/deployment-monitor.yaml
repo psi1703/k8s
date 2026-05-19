@@ -49,7 +49,7 @@ spec:
                   key: TELEGRAM_CHAT_ID
 
           securityContext:
-            allowPrivilegeEscalation: false
+            allowPrivilegeEscalation: true
             capabilities:
               drop:
                 - ALL
