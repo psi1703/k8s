@@ -94,7 +94,7 @@
                 },
                 "showPercentChange": false,
                 "text": {
-                  "valueSize": 90
+                  "valueSize": 58
                 },
                 "textMode": "value",
                 "wideLayout": true
@@ -460,7 +460,7 @@
                 "textMode": "value",
                 "wideLayout": true,
                 "text": {
-                  "valueSize": 90
+                  "valueSize": 54
                 }
               },
               "fieldConfig": {
@@ -549,8 +549,8 @@
             "spec": {
               "options": {
                 "colorMode": "value",
-                "graphMode": "area",
-                "justifyMode": "auto",
+                "graphMode": "none",
+                "justifyMode": "center",
                 "orientation": "auto",
                 "percentChangeColorMode": "standard",
                 "reduceOptions": {
@@ -562,7 +562,10 @@
                 },
                 "showPercentChange": false,
                 "textMode": "auto",
-                "wideLayout": true
+                "wideLayout": true,
+                "text": {
+                  "valueSize": 64
+                }
               },
               "fieldConfig": {
                 "defaults": {
@@ -639,8 +642,8 @@
             "spec": {
               "options": {
                 "colorMode": "value",
-                "graphMode": "area",
-                "justifyMode": "auto",
+                "graphMode": "none",
+                "justifyMode": "center",
                 "orientation": "auto",
                 "percentChangeColorMode": "standard",
                 "reduceOptions": {
@@ -652,7 +655,10 @@
                 },
                 "showPercentChange": false,
                 "textMode": "auto",
-                "wideLayout": true
+                "wideLayout": true,
+                "text": {
+                  "valueSize": 52
+                }
               },
               "fieldConfig": {
                 "defaults": {
@@ -741,7 +747,7 @@
               "options": {
                 "colorMode": "value",
                 "graphMode": "none",
-                "justifyMode": "auto",
+                "justifyMode": "center",
                 "orientation": "auto",
                 "percentChangeColorMode": "standard",
                 "reduceOptions": {
@@ -753,7 +759,10 @@
                 },
                 "showPercentChange": false,
                 "textMode": "auto",
-                "wideLayout": true
+                "wideLayout": true,
+                "text": {
+                  "valueSize": 64
+                }
               },
               "fieldConfig": {
                 "defaults": {
@@ -837,7 +846,7 @@
                 "textMode": "auto",
                 "wideLayout": true,
                 "text": {
-                  "valueSize": 90
+                  "valueSize": 52
                 }
               },
               "fieldConfig": {
@@ -927,7 +936,7 @@
               "options": {
                 "colorMode": "background_solid",
                 "graphMode": "none",
-                "justifyMode": "auto",
+                "justifyMode": "center",
                 "orientation": "auto",
                 "percentChangeColorMode": "standard",
                 "reduceOptions": {
@@ -941,7 +950,7 @@
                 "textMode": "auto",
                 "wideLayout": true,
                 "text": {
-                  "valueSize": 90
+                  "valueSize": 64
                 }
               },
               "fieldConfig": {
@@ -1034,7 +1043,7 @@
                 "textMode": "auto",
                 "wideLayout": true,
                 "text": {
-                  "valueSize": 90
+                  "valueSize": 58
                 }
               },
               "fieldConfig": {
@@ -1136,7 +1145,10 @@
                 },
                 "showPercentChange": false,
                 "textMode": "auto",
-                "wideLayout": true
+                "wideLayout": true,
+                "text": {
+                  "valueSize": 56
+                }
               },
               "fieldConfig": {
                 "defaults": {
@@ -1179,8 +1191,8 @@
             "spec": {
               "x": 0,
               "y": 0,
-              "width": 4,
-              "height": 6,
+              "width": 5,
+              "height": 8,
               "element": {
                 "kind": "ElementReference",
                 "name": "panel-1"
@@ -1190,10 +1202,10 @@
           {
             "kind": "GridLayoutItem",
             "spec": {
-              "x": 4,
+              "x": 5,
               "y": 0,
               "width": 5,
-              "height": 6,
+              "height": 8,
               "element": {
                 "kind": "ElementReference",
                 "name": "panel-2"
@@ -1203,10 +1215,10 @@
           {
             "kind": "GridLayoutItem",
             "spec": {
-              "x": 9,
+              "x": 10,
               "y": 0,
               "width": 4,
-              "height": 6,
+              "height": 8,
               "element": {
                 "kind": "ElementReference",
                 "name": "panel-3"
@@ -1216,10 +1228,10 @@
           {
             "kind": "GridLayoutItem",
             "spec": {
-              "x": 13,
+              "x": 14,
               "y": 0,
-              "width": 4,
-              "height": 6,
+              "width": 5,
+              "height": 8,
               "element": {
                 "kind": "ElementReference",
                 "name": "panel-4"
@@ -1229,10 +1241,10 @@
           {
             "kind": "GridLayoutItem",
             "spec": {
-              "x": 17,
+              "x": 19,
               "y": 0,
-              "width": 4,
-              "height": 6,
+              "width": 5,
+              "height": 8,
               "element": {
                 "kind": "ElementReference",
                 "name": "panel-5"
@@ -1243,9 +1255,9 @@
             "kind": "GridLayoutItem",
             "spec": {
               "x": 0,
-              "y": 6,
-              "width": 5,
-              "height": 6,
+              "y": 8,
+              "width": 6,
+              "height": 8,
               "element": {
                 "kind": "ElementReference",
                 "name": "panel-6"
@@ -1255,10 +1267,10 @@
           {
             "kind": "GridLayoutItem",
             "spec": {
-              "x": 5,
-              "y": 6,
-              "width": 4,
-              "height": 6,
+              "x": 6,
+              "y": 8,
+              "width": 6,
+              "height": 8,
               "element": {
                 "kind": "ElementReference",
                 "name": "panel-7"
@@ -1268,10 +1280,10 @@
           {
             "kind": "GridLayoutItem",
             "spec": {
-              "x": 9,
-              "y": 6,
-              "width": 4,
-              "height": 6,
+              "x": 12,
+              "y": 8,
+              "width": 6,
+              "height": 8,
               "element": {
                 "kind": "ElementReference",
                 "name": "panel-8"
@@ -1281,10 +1293,10 @@
           {
             "kind": "GridLayoutItem",
             "spec": {
-              "x": 13,
-              "y": 6,
-              "width": 4,
-              "height": 6,
+              "x": 18,
+              "y": 8,
+              "width": 6,
+              "height": 8,
               "element": {
                 "kind": "ElementReference",
                 "name": "panel-9"
@@ -1295,8 +1307,8 @@
             "kind": "GridLayoutItem",
             "spec": {
               "x": 0,
-              "y": 12,
-              "width": 21,
+              "y": 16,
+              "width": 24,
               "height": 8,
               "element": {
                 "kind": "ElementReference",
@@ -1308,8 +1320,8 @@
             "kind": "GridLayoutItem",
             "spec": {
               "x": 0,
-              "y": 20,
-              "width": 21,
+              "y": 24,
+              "width": 24,
               "height": 8,
               "element": {
                 "kind": "ElementReference",
