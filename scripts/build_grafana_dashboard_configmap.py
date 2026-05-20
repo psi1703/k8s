@@ -25,6 +25,43 @@ def _indent_literal_block(text: str, spaces: int = 4) -> str:
     return "".join(prefix + line if line.strip() else "\n" for line in text.splitlines(True))
 
 
+def _sanitize_dashboard(dashboard: dict) -> dict:
+    """Remove Grafana UI/export metadata that breaks sidecar provisioning."""
+
+    metadata = dashboard.get("metadata")
+    if isinstance(metadata, dict):
+        annotations = metadata.get("annotations")
+        if isinstance(annotations, dict):
+            for key in [
+                "grafana.app/folder",
+                "grafana.app/folderTitle",
+                "grafana.app/folderUrl",
+                "grafana.app/createdBy",
+                "grafana.app/updatedBy",
+                "grafana.app/updatedTimestamp",
+                "grafana.app/saved-from-ui",
+            ]:
+                annotations.pop(key, None)
+
+            if not annotations:
+                metadata.pop("annotations", None)
+
+        labels = metadata.get("labels")
+        if isinstance(labels, dict):
+            labels.pop("grafana.app/deprecatedInternalID", None)
+            if not labels:
+                metadata.pop("labels", None)
+
+        for key in [
+            "resourceVersion",
+            "generation",
+            "creationTimestamp",
+        ]:
+            metadata.pop(key, None)
+
+    return dashboard
+
+
 def build_configmap_yaml(
     source: Path,
     name: str,
@@ -37,6 +74,8 @@ def build_configmap_yaml(
         raise SystemExit(f"Dashboard JSON not found: {source}") from exc
     except json.JSONDecodeError as exc:
         raise SystemExit(f"Dashboard JSON is invalid: {source}: {exc}") from exc
+
+    dashboard = _sanitize_dashboard(dashboard)
 
     # Normalize formatting so generated YAML diffs are stable.
     dashboard_json = json.dumps(dashboard, indent=2, ensure_ascii=False) + "\n"
