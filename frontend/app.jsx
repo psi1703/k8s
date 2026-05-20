@@ -21,19 +21,56 @@ function wizardClientSecret() {
   return value;
 }
 
+function normalizeEmbeddedGuideHtml(html) {
+  const origin = window.location.origin;
+  return String(html || '<p>Loading…</p>')
+    .replaceAll('src="/', `src="${origin}/`)
+    .replaceAll("src='/", `src='${origin}/`)
+    .replaceAll('href="/', `href="${origin}/`)
+    .replaceAll("href='/", `href='${origin}/`);
+}
+
 function htmlToSandboxedSrcDoc(html) {
+  const safeHtml = normalizeEmbeddedGuideHtml(html);
   return `<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <base target="_blank" />
+  <base href="${window.location.origin}/" target="_blank" />
   <style>
-    body { font-family: Arial, sans-serif; color: #363A3B; margin: 0; padding: 16px; line-height: 1.55; }
-    img, table { max-width: 100%; }
+    body {
+      font-family: Arial, sans-serif;
+      color: #363A3B;
+      margin: 0;
+      padding: 16px;
+      line-height: 1.55;
+      background: #FFFFFF;
+    }
+    img {
+      display: block;
+      max-width: 100%;
+      height: auto;
+      border: 1px solid #dbe3ee;
+      border-radius: 14px;
+      background: #f1f5f9;
+      margin: 14px 0 18px;
+    }
+    table {
+      max-width: 100%;
+      width: 100%;
+      border-collapse: collapse;
+    }
+    th,
+    td {
+      border: 1px solid #dbe3ee;
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
     a { color: #006DCC; }
   </style>
 </head>
-<body>${html || '<p>Loading…</p>'}</body>
+<body>${safeHtml}</body>
 </html>`;
 }
 
@@ -1437,7 +1474,7 @@ function GuideOverlay({ step, guide, page, setPage, onClose, onPopOut }) {
           ) : activePage.type === 'html' ? (
             <iframe
               title={`${step.title} guide page`}
-              sandbox="allow-popups allow-popups-to-escape-sandbox"
+              sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
               srcDoc={htmlToSandboxedSrcDoc(activePage.html || '')}
               className="guide-html-frame"
             />
@@ -1565,7 +1602,7 @@ function HelpView({ faqOpen, setFaqOpen } = {}) {
                       <div className="faq-a" style={{ display: 'block' }}>
                         <iframe
                           title={doc.title}
-                          sandbox="allow-popups allow-popups-to-escape-sandbox"
+                          sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
                           srcDoc={htmlToSandboxedSrcDoc(docHtml[doc.slug] || '<p>Loading…</p>')}
                           className="help-doc-frame"
                         />
