@@ -14,8 +14,9 @@ NFS/RWX app storage for /app/data
 Redis Sentinel/HAProxy topology
 Redis failover validated
 Traefik HTTPS ingress enabled
-MetalLB LoadBalancer exposure
 Monitor pod isolated from Service/Ingress
+Observability namespace with Prometheus/Grafana/Loki/Alloy
+OTP Relay live Grafana dashboard provisioned from ConfigMap
 ```
 
 Known node labels used for OTP Relay placement:
@@ -35,6 +36,10 @@ kubectl get pods -n otp-relay -o wide
 kubectl get svc -n otp-relay
 kubectl get ingress -n otp-relay
 kubectl get pvc -n otp-relay
+kubectl get pods -n observability -o wide
+kubectl get svc -n observability
+kubectl get configmap otp-relay-live-dashboard -n observability
+kubectl get servicemonitor -n observability
 ```
 
 Application endpoints:
@@ -48,9 +53,12 @@ Expected:
 
 - `/healthz` returns OK.
 - `/readyz` returns Redis OK and Redis required.
-- App pod is Running/Ready.
+- App pods are Running/Ready.
 - Monitor pod is Running/Ready.
 - Redis, Sentinel, and HAProxy pods are Running/Ready.
+- Observability pods are Running/Ready.
+- `otp-relay-live-dashboard` ConfigMap exists in the `observability` namespace.
+- ServiceMonitor resources exist for the portal and monitor.
 
 ## Application storage checks
 
@@ -123,7 +131,7 @@ kubectl logs -n otp-relay deployment/otp-redis-haproxy --tail=100
 The app should continue using:
 
 ```text
-redis://otp-redis:6379/0
+redis://otp-redis-haproxy:6379/0
 ```
 
 `otp-redis` should route to HAProxy, which then routes to the current Redis master.
@@ -189,7 +197,151 @@ Expected monitor properties:
 - No Ingress.
 - Can check phone presence on the configured phone network.
 - Can read `/app/data/audit.log`.
-- Can send WhatsApp alerts when configured.
+- Can send Telegram alerts when configured.
+
+## Observability and Grafana checks
+
+The observability stack runs in the `observability` namespace. The OTP Relay live dashboard is provisioned from a Kubernetes ConfigMap and should not be manually edited or saved from the Grafana UI.
+
+### Core resources
+
+```bash
+kubectl get pods -n observability -o wide
+kubectl get svc -n observability
+kubectl get configmap otp-relay-live-dashboard -n observability
+kubectl get servicemonitor -n observability
+```
+
+Expected:
+
+- Grafana pod is Running/Ready.
+- Prometheus pod is Running/Ready.
+- Loki/Alloy components are Running/Ready when deployed.
+- `otp-relay-live-dashboard` exists.
+- ServiceMonitor resources exist for `otp-relay` and `otp-monitor`.
+
+### Dashboard source and generated output
+
+```text
+Source:    k8s/observability/dashboards/otp-relay-live.json
+Generated: k8s/observability/grafana-dashboard-otp-relay-live.yaml
+ConfigMap: otp-relay-live-dashboard
+UID:       otp-relay-live
+```
+
+After editing the source dashboard JSON, regenerate the ConfigMap:
+
+```bash
+python3 scripts/generate_grafana_dashboard_configmap.py
+```
+
+Validate the generated dashboard JSON before applying:
+
+```bash
+grep -n '"refresh"' k8s/observability/grafana-dashboard-otp-relay-live.yaml
+grep -n '"timepicker"' k8s/observability/grafana-dashboard-otp-relay-live.yaml
+grep -n '"refresh_intervals"' k8s/observability/grafana-dashboard-otp-relay-live.yaml
+```
+
+Apply and reload Grafana:
+
+```bash
+kubectl apply -f k8s/observability/grafana-dashboard-otp-relay-live.yaml
+kubectl rollout restart deployment/kube-prometheus-stack-grafana -n observability
+kubectl rollout status deployment/kube-prometheus-stack-grafana -n observability
+```
+
+Confirm the live ConfigMap contains the expected refresh metadata:
+
+```bash
+kubectl get configmap otp-relay-live-dashboard -n observability \
+  -o jsonpath='{.data.otp-relay-live\.json}' | grep -E '"refresh":|"timepicker"|"refresh_intervals"'
+```
+
+Expected:
+
+- `"refresh": "15s"` exists.
+- `timepicker.refresh_intervals` exists and includes `15s`.
+- Top dashboard panels render as Stat tiles, not time-series graphs.
+- Tile text is not clipped.
+- Dashboard values update automatically without manual page refresh.
+
+### Grafana dashboard metrics
+
+The dashboard depends on these metrics:
+
+```text
+up{job="otp-relay"}
+up{job="otp-monitor"}
+otp_iphone_present
+otp_monitor_arp_last_success_timestamp_seconds
+otp_queue_depth
+otp_active_user
+otp_delivered_total
+otp_claims_total
+otp_iphone_absence_events_total
+```
+
+Check live Prometheus values when debugging dashboard panels:
+
+```bash
+kubectl port-forward svc/kube-prometheus-stack-prometheus 9090:9090 -n observability
+```
+
+Then query from another shell or browser:
+
+```bash
+curl -s 'http://127.0.0.1:9090/api/v1/query?query=otp_queue_depth'
+curl -s 'http://127.0.0.1:9090/api/v1/query?query=otp_active_user'
+curl -s 'http://127.0.0.1:9090/api/v1/query?query=otp_iphone_present'
+```
+
+### Dashboard-specific checks
+
+- Queue tile shows users waiting behind the currently active OTP user.
+- Active user tile shows whether a user currently holds the OTP slot.
+- Last ARP shows the age of the monitor pod's last successful ARP probe, not simply whether the fake iPhone VM process is running.
+- If fake phone status is up but Last ARP is stale, check monitor connectivity and ARP metrics before changing the dashboard.
+
+## Frontend and help overlay validation
+
+The portal serves the generated frontend bundle:
+
+```text
+Source:    frontend/app.jsx
+Generated: frontend/app.js
+```
+
+Do not edit `frontend/app.js` directly as source. Make frontend changes in `frontend/app.jsx`, rebuild `frontend/app.js`, and commit both if the generated bundle changes.
+
+Help content is generated from markdown:
+
+```text
+Source:    docs/help/*.md and docs/help/assets/*
+Generated: frontend/help/*
+```
+
+Regenerate help output:
+
+```bash
+python3 scripts/build_help_docs.py
+```
+
+If a guide image works in pop-out view but not in the overlay:
+
+- Confirm the image exists under `frontend/help/assets/`.
+- Confirm `frontend/help/wizard-guide.json` uses `/help/assets/...` paths.
+- Check `frontend/app.jsx` overlay iframe handling.
+- Rebuild `frontend/app.js` after fixing `frontend/app.jsx`.
+
+Useful checks:
+
+```bash
+find frontend/help -type f | sort | grep -Ei 'png|jpg|jpeg|webp|svg'
+grep -R 'new-user-onboarding-sequence.png' -n docs/help frontend/help frontend/app.jsx frontend/guide.html scripts/build_help_docs.py
+curl -I http://127.0.0.1:8000/help/assets/new-user-onboarding-sequence.png
+curl -I http://127.0.0.1:8000/help/wizard-guide.json
+```
 
 ## OTP validation checklist
 
@@ -205,7 +357,7 @@ Run this before approving multi-replica app validation:
 - Pending OTP survives app restart when Redis is healthy.
 - Two-replica OTP flow works in a controlled test.
 
-Do not make two replicas the default until these checks pass.
+Do not approve a production multi-replica posture until these checks pass after the latest source/build changes.
 
 ## DNS/TLS client validation checklist
 
@@ -243,6 +395,9 @@ kubectl get pods -n otp-relay -o wide
 kubectl describe pod -n otp-relay <pod-name>
 kubectl logs -n otp-relay deployment/otp-relay --tail=200
 kubectl logs -n otp-relay deployment/otp-monitor --tail=200
+kubectl get pods -n observability -o wide
+kubectl logs -n observability deployment/kube-prometheus-stack-grafana -c grafana --tail=100
+kubectl logs -n observability deployment/kube-prometheus-stack-grafana -c grafana-sc-dashboard --tail=100
 kubectl rollout status deployment/otp-relay -n otp-relay
 kubectl rollout restart deployment/otp-relay -n otp-relay
 kubectl get events -n otp-relay --sort-by=.lastTimestamp
@@ -259,5 +414,9 @@ kubectl get events -n otp-relay --sort-by=.lastTimestamp
 | `/readyz` with Redis required | Validated |
 | TLS/Ingress | Enabled; client trust rollout pending |
 | Monitor isolation | Aligned |
-| App multi-replica default | Not yet approved |
+| Observability namespace | Enabled |
+| Grafana live dashboard | Provisioned from ConfigMap |
+| Dashboard refresh/timepicker metadata | Documented and validated through generator |
+| Frontend source/generated bundle model | Documented |
+| App multi-replica default | Requires latest OTP business-flow validation |
 | Worker-drain validation | Pending |
