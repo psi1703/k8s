@@ -239,6 +239,7 @@ def _panel_type_from_viz_config(viz_config: dict[str, Any], element_spec: dict[s
     viz_spec = _as_dict(viz_config.get("spec"))
 
     candidates = [
+        viz_config.get("group"),
         viz_spec.get("pluginId"),
         viz_spec.get("type"),
         viz_spec.get("kind"),
