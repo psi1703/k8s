@@ -135,7 +135,7 @@ k8s/observability/dashboards/otp-relay-live.json
 The generator script is:
 
 ```text
-scripts/generate_grafana_dashboard_configmap.py
+scripts/build_grafana_dashboard_configmap.py
 ```
 
 The generated ConfigMap output is:
