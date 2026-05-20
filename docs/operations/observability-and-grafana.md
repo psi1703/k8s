@@ -52,7 +52,7 @@ The Grafana dashboard follows a source-generated workflow.
 ```text
 Source:    k8s/observability/dashboards/otp-relay-live.json
 Generated: k8s/observability/grafana-dashboard-otp-relay-live.yaml
-Generator: scripts/generate_grafana_dashboard_configmap.py
+Generator: scripts/build_grafana_dashboard_configmap.py
 ConfigMap: otp-relay-live-dashboard
 Namespace: observability
 Data key:  otp-relay-live.json
