@@ -227,6 +227,67 @@ def _query_to_target(query: dict[str, Any], index: int) -> dict[str, Any]:
     return target
 
 
+def _panel_type_from_viz_config(viz_config: dict[str, Any], element_spec: dict[str, Any]) -> str:
+    """Return a real Grafana panel plugin id.
+
+    Grafana v2 exports use vizConfig.kind="VizConfig", which is a wrapper kind,
+    not a renderable panel plugin. The actual plugin is normally in
+    vizConfig.spec.pluginId. File provisioning must receive plugin ids such as
+    stat, timeseries, gauge, table, logs, or text.
+    """
+
+    viz_spec = _as_dict(viz_config.get("spec"))
+
+    candidates = [
+        viz_spec.get("pluginId"),
+        viz_spec.get("type"),
+        viz_spec.get("kind"),
+        element_spec.get("type"),
+    ]
+
+    aliases = {
+        "timeseries": "timeseries",
+        "time-series": "timeseries",
+        "time series": "timeseries",
+        "stat": "stat",
+        "gauge": "gauge",
+        "bargauge": "bargauge",
+        "bar-gauge": "bargauge",
+        "bar gauge": "bargauge",
+        "table": "table",
+        "logs": "logs",
+        "log": "logs",
+        "text": "text",
+        "row": "row",
+    }
+
+    invalid_wrapper_types = {
+        "vizconfig",
+        "viz-config",
+        "viz config",
+        "panel",
+    }
+
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+
+        value = candidate.strip()
+        if not value:
+            continue
+
+        normalized = value.lower()
+        if normalized in invalid_wrapper_types:
+            continue
+
+        return aliases.get(normalized, normalized)
+
+    # Safe fallback: every supported Grafana install has timeseries.
+    return "timeseries"
+
+
+
+
 def _panel_to_classic(
     name: str,
     element: dict[str, Any],
@@ -248,7 +309,7 @@ def _panel_to_classic(
     panel = {
         "id": panel_id,
         "title": element_spec.get("title") or name,
-        "type": viz_config.get("kind") or element_spec.get("type") or "timeseries",
+        "type": _panel_type_from_viz_config(viz_config, element_spec),
         "gridPos": grid_pos,
         "targets": targets,
         "fieldConfig": viz_spec.get("fieldConfig", {"defaults": {}, "overrides": []}),
@@ -372,6 +433,13 @@ def _sanitize_classic_dashboard(dashboard: dict[str, Any]) -> dict[str, Any]:
     # Folder identity from another Grafana instance can break the provider.
     for key in ["folderId", "folderUid", "folderTitle", "folderUrl"]:
         dashboard.pop(key, None)
+
+    for panel in _as_list(dashboard.get("panels")):
+        if not isinstance(panel, dict):
+            continue
+        panel_type = panel.get("type")
+        if isinstance(panel_type, str) and panel_type.strip().lower() in {"vizconfig", "viz-config", "viz config"}:
+            panel["type"] = "timeseries"
 
     # Keep generated diffs stable and avoid stale optimistic-lock versions.
     dashboard["version"] = 1
