@@ -19,7 +19,7 @@ This directory is the single source for project documentation. Kubernetes manife
 |---|---|---|---|
 | Portal frontend | `frontend/app.jsx` | `frontend/app.js` | Installer / frontend build |
 | Help docs | `docs/help/*.md`, `docs/help/assets/*` | `frontend/help/*` | `python3 scripts/build_help_docs.py` |
-| Grafana dashboard | `k8s/observability/dashboards/otp-relay-live.json` | `k8s/observability/grafana-dashboard-otp-relay-live.yaml` | `python3 scripts/generate_grafana_dashboard_configmap.py` |
+| Grafana dashboard | `k8s/observability/dashboards/otp-relay-live.json` | `k8s/observability/grafana-dashboard-otp-relay-live.yaml` | `python3 scripts/build_grafana_dashboard_configmap.py` |
 
 ## Documentation rules
 
