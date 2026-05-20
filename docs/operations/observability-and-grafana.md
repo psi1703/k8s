@@ -72,7 +72,7 @@ Rules:
 From the repo root:
 
 ```bash
-python3 scripts/generate_grafana_dashboard_configmap.py
+python3 scripts/build_grafana_dashboard_configmap.py
 ```
 
 The generator supports Grafana `dashboard.grafana.app/v2` exports and converts them to classic Grafana dashboard JSON for sidecar provisioning.
@@ -304,7 +304,7 @@ Cause: the v2-to-classic conversion did not preserve `vizConfig.group`, so Stat 
 Fix:
 
 ```bash
-python3 scripts/generate_grafana_dashboard_configmap.py
+python3 scripts/build_grafana_dashboard_configmap.py
 kubectl apply -f k8s/observability/grafana-dashboard-otp-relay-live.yaml
 kubectl rollout restart deployment/kube-prometheus-stack-grafana -n observability
 ```
@@ -318,7 +318,7 @@ Cause: the generated dashboard has `"refresh": "15s"` but is missing `timepicker
 Fix:
 
 ```bash
-python3 scripts/generate_grafana_dashboard_configmap.py
+python3 scripts/build_grafana_dashboard_configmap.py
 grep -n '"refresh"' k8s/observability/grafana-dashboard-otp-relay-live.yaml
 grep -n '"timepicker"' k8s/observability/grafana-dashboard-otp-relay-live.yaml
 grep -n '"refresh_intervals"' k8s/observability/grafana-dashboard-otp-relay-live.yaml
@@ -361,7 +361,7 @@ k8s/observability/dashboards/otp-relay-live.json
 Then regenerate:
 
 ```bash
-python3 scripts/generate_grafana_dashboard_configmap.py
+python3 scripts/build_grafana_dashboard_configmap.py
 ```
 
 ## Commit checklist
@@ -374,4 +374,4 @@ k8s/observability/grafana-dashboard-otp-relay-live.yaml
 scripts/generate_grafana_dashboard_configmap.py
 ```
 
-Only include `scripts/generate_grafana_dashboard_configmap.py` when the generator itself changed.
+Only include `scripts/build_grafana_dashboard_configmap.py` when the generator itself changed.
