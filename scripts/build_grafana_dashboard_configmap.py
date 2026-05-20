@@ -11,6 +11,13 @@ It supports both:
 
 The sidecar provisioning path expects classic dashboard JSON, so v2 exports are
 converted before being embedded into the ConfigMap.
+
+Important provisioning rules enforced here:
+  - never keep Grafana's exported numeric dashboard id
+  - always emit id: null
+  - use a stable dashboard uid
+  - strip folder UID metadata exported from another Grafana instance
+  - strip dashboard.grafana.app/v2 wrapper fields
 """
 
 from __future__ import annotations
@@ -18,6 +25,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +35,7 @@ DEFAULT_OUTPUT = Path("k8s/observability/grafana-dashboard-otp-relay-live.yaml")
 DEFAULT_CONFIGMAP_NAME = "otp-relay-live-dashboard"
 DEFAULT_NAMESPACE = "observability"
 DEFAULT_KEY = "otp-relay-live.json"
+DEFAULT_DASHBOARD_UID = "otp-relay-live"
 
 
 def _indent_literal_block(text: str, spaces: int = 4) -> str:
@@ -44,6 +53,35 @@ def _as_list(value: Any) -> list[Any]:
 
 def _drop_none(value: dict[str, Any]) -> dict[str, Any]:
     return {key: item for key, item in value.items() if item is not None}
+
+
+def _stable_uid(*candidates: Any) -> str:
+    """Return a safe, stable Grafana dashboard UID.
+
+    Grafana's database/provisioning path must not receive an exported numeric
+    dashboard id. For this repo we prefer the source object name
+    "otp-relay-live", falling back to a sanitized candidate only if needed.
+    """
+
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+
+        value = candidate.strip()
+        if not value:
+            continue
+
+        # Do not use long UUIDs or integer-like exported identifiers as the UID.
+        if re.fullmatch(r"\d+", value):
+            continue
+        if len(value) > 40:
+            continue
+
+        value = re.sub(r"[^A-Za-z0-9_-]+", "-", value).strip("-")
+        if value:
+            return value[:40]
+
+    return DEFAULT_DASHBOARD_UID
 
 
 def _sanitize_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -75,6 +113,8 @@ def _sanitize_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "resourceVersion",
         "generation",
         "creationTimestamp",
+        "managedFields",
+        "selfLink",
     ]:
         metadata.pop(key, None)
 
@@ -267,17 +307,22 @@ def _convert_v2_dashboard_to_classic(dashboard: dict[str, Any]) -> dict[str, Any
         if isinstance(annotation, dict)
     ]
 
-    dashboard_uid = metadata.get("uid") or metadata.get("name")
-    if isinstance(dashboard_uid, str) and len(dashboard_uid) > 40:
-        dashboard_uid = metadata.get("name")
+    dashboard_uid = _stable_uid(
+        metadata.get("name"),
+        spec.get("uid"),
+        metadata.get("uid"),
+        DEFAULT_DASHBOARD_UID,
+    )
 
     classic = {
+        # Critical for provisioning: never persist an exported Grafana DB id.
+        "id": None,
         "uid": dashboard_uid,
         "title": spec.get("title") or metadata.get("name") or "OTP Relay",
         "tags": spec.get("tags", []),
         "timezone": timezone or "browser",
         "schemaVersion": spec.get("schemaVersion", 39),
-        "version": spec.get("version", 1),
+        "version": 1,
         "refresh": refresh or "15s",
         "time": time_range,
         "annotations": {"list": annotations},
@@ -297,6 +342,43 @@ def _convert_v2_dashboard_to_classic(dashboard: dict[str, Any]) -> dict[str, Any
     return classic
 
 
+def _sanitize_classic_dashboard(dashboard: dict[str, Any]) -> dict[str, Any]:
+    """Make an already-classic Grafana dashboard safe for sidecar provisioning."""
+
+    dashboard = copy.deepcopy(dashboard)
+
+    # These are wrappers/export metadata, not valid persisted dashboard fields for
+    # file provisioning.
+    for key in [
+        "apiVersion",
+        "kind",
+        "metadata",
+        "meta",
+        "status",
+        "__inputs",
+        "__requires",
+    ]:
+        dashboard.pop(key, None)
+
+    # Critical for provisioning: never carry Grafana's exported numeric DB id.
+    dashboard["id"] = None
+
+    dashboard["uid"] = _stable_uid(
+        dashboard.get("uid"),
+        dashboard.get("title"),
+        DEFAULT_DASHBOARD_UID,
+    )
+
+    # Folder identity from another Grafana instance can break the provider.
+    for key in ["folderId", "folderUid", "folderTitle", "folderUrl"]:
+        dashboard.pop(key, None)
+
+    # Keep generated diffs stable and avoid stale optimistic-lock versions.
+    dashboard["version"] = 1
+
+    return dashboard
+
+
 def _sanitize_dashboard(dashboard: dict[str, Any]) -> dict[str, Any]:
     """Return sidecar-compatible classic dashboard JSON."""
 
@@ -310,14 +392,7 @@ def _sanitize_dashboard(dashboard: dict[str, Any]) -> dict[str, Any]:
     ):
         return _convert_v2_dashboard_to_classic(dashboard)
 
-    metadata = dashboard.get("metadata")
-    if isinstance(metadata, dict):
-        dashboard["metadata"] = _sanitize_metadata(metadata)
-
-    for key in ["apiVersion", "kind"]:
-        dashboard.pop(key, None)
-
-    return dashboard
+    return _sanitize_classic_dashboard(dashboard)
 
 
 def build_configmap_yaml(
