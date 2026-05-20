@@ -195,7 +195,7 @@ k8s/observability/grafana-dashboard-otp-relay-live.yaml
 Regenerate after editing the dashboard source:
 
 ```bash
-python3 scripts/generate_grafana_dashboard_configmap.py
+python3 scripts/build_grafana_dashboard_configmap.py
 ```
 
 Validate generated dashboard metadata:
