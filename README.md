@@ -21,11 +21,12 @@
 11. [NFS Shared Storage](#11-nfs-shared-storage)
 12. [TLS & DNS](#12-tls--dns)
 13. [Monitor Service](#13-monitor-service)
-14. [Operations Runbook](#14-operations-runbook)
-15. [Troubleshooting](#15-troubleshooting)
-16. [Development Guide](#16-development-guide)
-17. [Validation Checklists](#17-validation-checklists)
-18. [SCH Production Alignment](#18-sch-production-alignment)
+14. [Observability & Grafana Dashboard](#14-observability--grafana-dashboard)
+15. [Operations Runbook](#15-operations-runbook)
+16. [Troubleshooting](#16-troubleshooting)
+17. [Development Guide](#17-development-guide)
+18. [Validation Checklists](#18-validation-checklists)
+19. [SCH Production Alignment](#19-sch-production-alignment)
 
 ---
 
@@ -117,43 +118,71 @@ Monitor pod
 
 ```
 .
-├── main.py                      # FastAPI portal application (1 587 lines)
-├── monitor.py                   # Monitor service logic
-├── requirements.txt             # Python dependencies
-├── install-otp-relay-k8s.sh    # Deployment installer script
-├── otp-relayk3s-monitor.sh      # Symlinked health-check script
-├── package.json / package-lock.json  # Node.js frontend tooling
+├── main.py                              # FastAPI portal application
+├── monitor.py                           # Monitor service logic and Prometheus metrics
+├── requirements.txt                     # Python dependencies
+├── install-otp-relay-k8s.sh             # Deployment installer script
+├── otp-relayk3s-monitor.sh              # Symlinked health-check script
+├── package.json / package-lock.json     # Node.js frontend tooling
 ├── .dockerignore
 ├── .gitignore
 ├── LICENSE
 │
 ├── frontend/
-│   ├── app.jsx                  # React source (compile → app.js)
-│   ├── app.js                   # Production bundle (generated)
-│   ├── index.html               # Portal entry point
-│   ├── style.css                # Portal styles
-│   └── guide.html               # User-facing help stub
+│   ├── app.jsx                          # React source of truth
+│   ├── app.js                           # Generated production bundle served by portal
+│   ├── index.html                       # Portal entry point
+│   ├── style.css                        # Portal styles
+│   ├── guide.html                       # Pop-out RTA wizard guide
+│   └── help/                            # Generated help output
+│       ├── manifest.json
+│       ├── wizard-guide.json
+│       ├── rendered/                    # Generated HTML help pages
+│       └── assets/                      # Copied/generated help screenshots
 │
 ├── docs/
-│   ├── help/                    # Help page markdown sources (00–11)
-│   │   └── assets/              # Help page screenshots
+│   ├── help/                            # Help page markdown sources
+│   │   └── assets/                      # Help screenshot sources
 │   ├── architecture/
 │   ├── deployment/
 │   ├── development/
 │   └── operations/
 │
 ├── scripts/
-│   ├── build_help_docs.py       # Converts docs/help/ → frontend/help/
+│   ├── build_help_docs.py               # Converts docs/help/ → frontend/help/
+│   ├── generate_grafana_dashboard_configmap.py
+│   │                                    # Converts Grafana dashboard source → ConfigMap
 │   └── generate_sample_users.py
 │
 ├── k8s/
-│   ├── Dockerfile               # Portal app image
-│   ├── Dockerfile.monitor       # Monitor image
-│   └── manifests/               # Kubernetes YAML manifests
+│   ├── Dockerfile                       # Portal app image
+│   ├── Dockerfile.monitor               # Monitor image
+│   ├── manifests/                       # Core Kubernetes YAML manifests
+│   └── observability/
+│       ├── dashboards/
+│       │   └── otp-relay-live.json      # Grafana dashboard source of truth
+│       ├── grafana-dashboard-otp-relay-live.yaml
+│       │                                # Generated dashboard ConfigMap
+│       ├── grafana-ingressroute.yaml
+│       ├── prometheus-stack-values.yaml
+│       ├── loki-values.yaml
+│       ├── alloy-values.yaml
+│       ├── servicemonitor-otp-relay.yaml
+│       └── servicemonitor-otp-monitor.yaml
 │
 └── .github/
-    └── workflows/               # GitHub Actions CI/CD
+    └── workflows/                       # GitHub Actions CI/CD
 ```
+
+### Source-of-truth rules
+
+| Area | Edit this | Generate this | Command |
+|------|-----------|---------------|---------|
+| Frontend | `frontend/app.jsx` | `frontend/app.js` | Installer / frontend build |
+| Help docs | `docs/help/*.md`, `docs/help/assets/*` | `frontend/help/*` | `python3 scripts/build_help_docs.py` |
+| Grafana dashboard | `k8s/observability/dashboards/otp-relay-live.json` | `k8s/observability/grafana-dashboard-otp-relay-live.yaml` | `python3 scripts/generate_grafana_dashboard_configmap.py` |
+
+> **Important:** `frontend/app.jsx` is the React source. `frontend/app.js` is the generated production bundle actually served by the portal. Make frontend behavior changes in `app.jsx`, rebuild `app.js`, and commit both when the generated bundle changes.
 
 > **Single source of truth:** The root `README.md` is the canonical operational document. Do **not** restore legacy doc paths (`docs/k8s-plan.md`, `k8s/docs/`, `docs/dev/`, `docs/diagrams/`).
 
@@ -207,6 +236,17 @@ redis>=5.0.0,<6.0.0
 | Storage | NFS RWX PVC |
 | CI/CD | GitHub Actions + self-hosted runner |
 | Images | Built locally, imported via `k3s ctr images import` |
+
+### Observability
+
+| Component | Technology |
+|-----------|-----------|
+| Metrics | Prometheus via kube-prometheus-stack |
+| Dashboards | Grafana provisioned from ConfigMap |
+| App metrics | `/metrics` from portal and monitor |
+| Scrape config | `ServiceMonitor` resources |
+| Logs | Loki + Alloy |
+| Dashboard source | Grafana `dashboard.grafana.app/v2` JSON converted to classic JSON for provisioning |
 
 ---
 
@@ -301,6 +341,7 @@ git push origin main
   ──► Self-hosted runner checks out the repo
   ──► Installer syncs /opt/otp-relay-k8s to origin/main
   ──► Installer builds frontend app.js and help docs
+  ──► Installer generates the Grafana dashboard ConfigMap
   ──► Installer builds/imports app and monitor images
   ──► Installer renders/applies Kubernetes manifests
   ──► Installer waits for rollouts
@@ -335,6 +376,9 @@ sudo k3s kubectl get nodes -o wide
 sudo k3s kubectl get pods -n otp-relay -o wide
 sudo k3s kubectl get svc -n otp-relay
 sudo k3s kubectl get ingress -n otp-relay
+sudo k3s kubectl get pods -n observability -o wide
+sudo k3s kubectl -n observability get configmap otp-relay-live-dashboard
+sudo k3s kubectl -n observability get servicemonitor
 sudo /usr/local/bin/otp-relayk3s-monitor.sh
 ```
 
@@ -611,7 +655,123 @@ If Telegram settings are incomplete, the monitor still reports health locally bu
 
 ---
 
-## 14. Operations Runbook
+## 14. Observability & Grafana Dashboard
+
+The observability stack is deployed in the `observability` namespace and provides live operational visibility for the OTP Relay portal, monitor pod, Redis-related behavior, and iPhone presence.
+
+### Components
+
+| Component | Purpose |
+|-----------|---------|
+| Prometheus / kube-prometheus-stack | Scrapes portal, monitor, Kubernetes, and platform metrics |
+| Grafana | Displays the OTP Relay live dashboard |
+| ServiceMonitor `otp-relay` | Scrapes portal metrics |
+| ServiceMonitor `otp-monitor` | Scrapes monitor metrics, including iPhone presence and ARP age |
+| Loki | Stores logs |
+| Alloy | Collects and forwards logs |
+| Grafana dashboard ConfigMap | Provisions the OTP Relay live dashboard |
+
+### Dashboard source and generated output
+
+| Item | Path / value |
+|------|--------------|
+| Dashboard source | `k8s/observability/dashboards/otp-relay-live.json` |
+| Generated ConfigMap | `k8s/observability/grafana-dashboard-otp-relay-live.yaml` |
+| ConfigMap name | `otp-relay-live-dashboard` |
+| ConfigMap namespace | `observability` |
+| ConfigMap data key | `otp-relay-live.json` |
+| Dashboard UID | `otp-relay-live` |
+
+The dashboard source may be a Grafana `dashboard.grafana.app/v2` export. The generator converts that source into classic Grafana dashboard JSON because the Grafana sidecar provisioning path expects classic dashboard JSON.
+
+The generator must preserve:
+
+- `id: null`
+- `uid: otp-relay-live`
+- `refresh: 15s`
+- `timepicker.refresh_intervals`
+- Stat panel type from `vizConfig.group`
+- Grid layout and panel sizing from the dashboard source
+
+### Regenerate the dashboard ConfigMap
+
+Run this after editing `k8s/observability/dashboards/otp-relay-live.json`:
+
+```bash
+python3 scripts/generate_grafana_dashboard_configmap.py
+```
+
+Commit both files:
+
+```bash
+git add k8s/observability/dashboards/otp-relay-live.json \
+        k8s/observability/grafana-dashboard-otp-relay-live.yaml
+```
+
+### Validate generated dashboard JSON
+
+```bash
+grep -n '"refresh"' k8s/observability/grafana-dashboard-otp-relay-live.yaml
+grep -n '"timepicker"' k8s/observability/grafana-dashboard-otp-relay-live.yaml
+grep -n '"refresh_intervals"' k8s/observability/grafana-dashboard-otp-relay-live.yaml
+```
+
+The generated ConfigMap should include:
+
+```json
+"refresh": "15s"
+```
+
+and:
+
+```json
+"timepicker": {
+  "refresh_intervals": [
+    "5s",
+    "10s",
+    "15s"
+  ]
+}
+```
+
+### Apply dashboard changes manually
+
+```bash
+sudo k3s kubectl apply -f k8s/observability/grafana-dashboard-otp-relay-live.yaml
+sudo k3s kubectl -n observability rollout restart deployment/kube-prometheus-stack-grafana
+sudo k3s kubectl -n observability rollout status deployment/kube-prometheus-stack-grafana
+```
+
+### Live observability checks
+
+```bash
+sudo k3s kubectl get pods -n observability -o wide
+sudo k3s kubectl get svc -n observability
+sudo k3s kubectl -n observability get configmap otp-relay-live-dashboard
+sudo k3s kubectl -n observability get servicemonitor
+sudo k3s kubectl -n observability get configmap otp-relay-live-dashboard \
+  -o jsonpath='{.data.otp-relay-live\.json}' | grep -E '"refresh":|"timepicker"|"refresh_intervals"'
+```
+
+### Dashboard metrics
+
+The OTP Relay live dashboard depends on these metrics:
+
+| Metric | Meaning |
+|--------|---------|
+| `up{job="otp-relay"}` | Portal scrape status |
+| `up{job="otp-monitor"}` | Monitor scrape status |
+| `otp_iphone_present` | iPhone presence from monitor |
+| `otp_monitor_arp_last_success_timestamp_seconds` | Timestamp of last successful ARP probe |
+| `otp_queue_depth` | Waiting queue depth |
+| `otp_active_user` | Whether an OTP user currently holds the active slot |
+| `otp_delivered_total` | Delivered OTP counter |
+| `otp_claims_total` | Claim counter |
+| `otp_iphone_absence_events_total` | iPhone absence event counter |
+
+---
+
+## 15. Operations Runbook
 
 ### Daily health checks
 
@@ -621,6 +781,9 @@ sudo k3s kubectl get pods -n otp-relay -o wide
 sudo k3s kubectl get svc -n otp-relay
 sudo k3s kubectl get ingress -n otp-relay
 sudo k3s kubectl get pvc -n otp-relay
+sudo k3s kubectl get pods -n observability -o wide
+sudo k3s kubectl -n observability get configmap otp-relay-live-dashboard
+sudo k3s kubectl -n observability get servicemonitor
 sudo /usr/local/bin/otp-relayk3s-monitor.sh
 curl -k https://srvotptest26.init-db.lan/healthz
 curl -k https://srvotptest26.init-db.lan/readyz
@@ -653,6 +816,8 @@ sudo k3s kubectl logs -n otp-relay deployment/otp-relay --tail=200
 sudo k3s kubectl logs -n otp-relay deployment/otp-monitor --tail=200
 sudo k3s kubectl logs -n otp-relay deployment/otp-redis-sentinel --tail=200
 sudo k3s kubectl logs -n otp-relay deployment/otp-redis-haproxy --tail=200
+sudo k3s kubectl -n observability logs deployment/kube-prometheus-stack-grafana -c grafana --tail=100
+sudo k3s kubectl -n observability logs deployment/kube-prometheus-stack-grafana -c grafana-sc-dashboard --tail=100
 ```
 
 ### Rollouts
@@ -708,7 +873,7 @@ sudo k3s kubectl -n otp-relay get pods -o wide | grep -E 'redis-sentinel|redis-h
 
 ---
 
-## 15. Troubleshooting
+## 16. Troubleshooting
 
 ### Portal readyz fails — SSL certificate error
 
@@ -772,6 +937,61 @@ sudo k3s kubectl -n otp-relay rollout restart deployment/otp-redis-haproxy
 
 ---
 
+### Grafana dashboard panels show as small graphs instead of big status tiles
+
+**Symptom:** Portal, iPhone, Monitor, Prometheus, or other top dashboard panels render as mini time-series graphs instead of large Stat tiles.
+
+**Cause:** The Grafana v2 dashboard converter did not preserve `vizConfig.group`, so `stat` panels were converted as `timeseries`.
+
+**Fix:**
+```bash
+python3 scripts/generate_grafana_dashboard_configmap.py
+sudo k3s kubectl apply -f k8s/observability/grafana-dashboard-otp-relay-live.yaml
+sudo k3s kubectl -n observability rollout restart deployment/kube-prometheus-stack-grafana
+```
+
+Then verify the generated dashboard JSON contains `"type": "stat"` for the top panels.
+
+---
+
+### Grafana dashboard does not show 15s auto-refresh
+
+**Symptom:** The generated ConfigMap contains `"refresh": "15s"`, but the Grafana UI does not show the 15s refresh interval.
+
+**Cause:** The generated classic dashboard JSON is missing `timepicker.refresh_intervals`.
+
+**Fix:**
+```bash
+python3 scripts/generate_grafana_dashboard_configmap.py
+grep -n '"refresh"' k8s/observability/grafana-dashboard-otp-relay-live.yaml
+grep -n '"timepicker"' k8s/observability/grafana-dashboard-otp-relay-live.yaml
+grep -n '"refresh_intervals"' k8s/observability/grafana-dashboard-otp-relay-live.yaml
+sudo k3s kubectl apply -f k8s/observability/grafana-dashboard-otp-relay-live.yaml
+sudo k3s kubectl -n observability rollout restart deployment/kube-prometheus-stack-grafana
+```
+
+---
+
+### Grafana tile text is cut off
+
+**Symptom:** Words such as `ONLINE`, `RUNNING`, or `IN USE` are clipped in dashboard tiles.
+
+**Cause:** Stat panel tile width/height is too small, or `text.valueSize` is too large.
+
+**Fix:** Edit `k8s/observability/dashboards/otp-relay-live.json`, adjust the relevant `layout.spec.items[*].spec.width`, `height`, and panel `vizConfig.spec.options.text.valueSize`, then regenerate the ConfigMap.
+
+---
+
+### Wizard overlay image is broken but pop-out guide works
+
+**Symptom:** A help image is visible in the pop-out guide but broken in the portal overlay.
+
+**Cause:** The overlay renders generated help HTML inside a sandboxed `srcDoc` iframe. The pop-out guide renders the same HTML as a normal page. Embedded `/help/...` assets must resolve with the portal origin inside the iframe.
+
+**Fix:** Edit `frontend/app.jsx`, rebuild `frontend/app.js`, and commit both files. Do not edit `frontend/app.js` directly as source.
+
+---
+
 ### OTP not displaying in browser
 
 1. Check that the iOS Shortcut is configured with the correct portal URL and `SMS_SECRET_TOKEN`.
@@ -790,7 +1010,7 @@ sudo k3s kubectl -n otp-relay rollout restart deployment/otp-redis-haproxy
 
 ---
 
-## 16. Development Guide
+## 17. Development Guide
 
 ### Image builds
 
@@ -829,6 +1049,8 @@ The React source is at `frontend/app.jsx`. The installer compiles it to `fronten
 
 > Do **not** use browser-side Babel (`text/babel`). The production model is a pre-built bundle.
 
+> Do **not** edit `frontend/app.js` directly as source. Make changes in `frontend/app.jsx`, rebuild `frontend/app.js`, and commit both when the generated bundle changes.
+
 ### Help documentation build
 
 ```bash
@@ -844,6 +1066,27 @@ frontend/help/              # Generated HTML
 ```
 
 Run this during deployment, not manually inside a running pod.
+
+### Grafana dashboard build
+
+```bash
+# Source
+k8s/observability/dashboards/otp-relay-live.json
+
+# Build
+python3 scripts/generate_grafana_dashboard_configmap.py
+
+# Output
+k8s/observability/grafana-dashboard-otp-relay-live.yaml
+```
+
+The generator converts Grafana `dashboard.grafana.app/v2` exports into classic Grafana dashboard JSON for sidecar provisioning. After generation, verify refresh and timepicker settings:
+
+```bash
+grep -n '"refresh"' k8s/observability/grafana-dashboard-otp-relay-live.yaml
+grep -n '"timepicker"' k8s/observability/grafana-dashboard-otp-relay-live.yaml
+grep -n '"refresh_intervals"' k8s/observability/grafana-dashboard-otp-relay-live.yaml
+```
 
 ### User management (`users.xlsx`)
 
@@ -868,7 +1111,7 @@ curl -k -X POST \
 
 ---
 
-## 17. Validation Checklists
+## 18. Validation Checklists
 
 ### Phase 3 baseline (all PASS)
 
@@ -884,6 +1127,18 @@ curl -k -X POST \
 | Redis StatefulSet 3/3 | ✅ PASS |
 | Redis Sentinel 3/3 one-per-node | ✅ PASS |
 | Redis HAProxy 2/2 spread across workers | ✅ PASS |
+
+### Observability checklist
+
+- [ ] `observability` namespace pods are Running/Ready
+- [ ] `otp-relay-live-dashboard` ConfigMap exists
+- [ ] Generated dashboard JSON contains `refresh: 15s`
+- [ ] Generated dashboard JSON contains `timepicker.refresh_intervals`
+- [ ] Portal, Monitor, Nodes, Prometheus, Queue, Active user, Delivered today, iPhone, and Last ARP panels render as Stat panels
+- [ ] `otp_iphone_present` reports expected phone presence
+- [ ] `otp_monitor_arp_last_success_timestamp_seconds` updates while phone is reachable
+- [ ] Dashboard auto-refresh updates values without manual page refresh
+- [ ] Grafana dashboard is provisioned from source and cannot be manually saved from UI
 
 ### OTP business-flow checklist
 
@@ -927,7 +1182,7 @@ During drain, verify:
 
 ---
 
-## 18. SCH Production Alignment
+## 19. SCH Production Alignment
 
 ### Target architecture
 
@@ -957,7 +1212,7 @@ Monitor pod remains internal and unexposed.
 | HAProxy placement | Spread across nodes | ✅ 2 pods across workers validated |
 | Failover | Pod and node-level validation | ✅ Both validated |
 | Monitor | Internal only | ✅ No Service / no Ingress |
-| Documentation | Clear active docs | ✅ This document |
+| Documentation | Clear active docs | ✅ README + observability source/generated workflow documented |
 
 ### Remaining production items
 
