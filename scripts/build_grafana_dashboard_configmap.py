@@ -152,6 +152,63 @@ def _convert_time_settings(spec: dict[str, Any]) -> tuple[dict[str, str], str | 
     return time_range, str(refresh) if refresh else None, str(timezone) if timezone else None
 
 
+def _convert_timepicker_settings(spec: dict[str, Any]) -> dict[str, Any]:
+    """Convert Grafana v2 timeSettings metadata into classic dashboard timepicker.
+
+    Provisioned classic dashboards can carry refresh="15s" without exposing the
+    expected refresh choices in the UI unless the timepicker metadata is also
+    present. Preserve the v2 autoRefreshIntervals list so 15s is available and
+    selected consistently after provisioning.
+    """
+
+    time_settings = _as_dict(spec.get("timeSettings"))
+    classic_timepicker = _as_dict(spec.get("timepicker"))
+
+    refresh_intervals = _as_list(
+        time_settings.get("autoRefreshIntervals")
+        or classic_timepicker.get("refresh_intervals")
+    )
+    if not refresh_intervals:
+        refresh_intervals = [
+            "5s",
+            "10s",
+            "15s",
+            "30s",
+            "1m",
+            "5m",
+            "15m",
+            "30m",
+            "1h",
+        ]
+
+    time_options = _as_list(classic_timepicker.get("time_options"))
+    if not time_options:
+        time_options = [
+            "5m",
+            "15m",
+            "1h",
+            "6h",
+            "12h",
+            "24h",
+            "2d",
+            "7d",
+            "30d",
+        ]
+
+    timepicker = {
+        "refresh_intervals": [str(value) for value in refresh_intervals],
+        "time_options": [str(value) for value in time_options],
+    }
+
+    hide_timepicker = time_settings.get("hideTimepicker")
+    if hide_timepicker is not None:
+        timepicker["hidden"] = bool(hide_timepicker)
+    elif "hidden" in classic_timepicker:
+        timepicker["hidden"] = bool(classic_timepicker.get("hidden"))
+
+    return timepicker
+
+
 def _annotation_to_classic(annotation: dict[str, Any], index: int) -> dict[str, Any]:
     annotation_spec = _as_dict(annotation.get("spec"))
     query = _as_dict(annotation_spec.get("query"))
@@ -387,11 +444,18 @@ def _convert_v2_dashboard_to_classic(dashboard: dict[str, Any]) -> dict[str, Any
         "version": 1,
         "refresh": refresh or "15s",
         "time": time_range,
+        "timepicker": _convert_timepicker_settings(spec),
         "annotations": {"list": annotations},
         "panels": panels,
         "editable": spec.get("editable", True),
         "graphTooltip": spec.get("graphTooltip", 0),
-        "fiscalYearStartMonth": spec.get("fiscalYearStartMonth", 0),
+        "weekStart": _as_dict(spec.get("timeSettings")).get("weekStart", spec.get("weekStart", "")),
+        "fiscalYearStartMonth": (
+            _as_dict(spec.get("timeSettings")).get(
+                "fiscalYearStartMonth",
+                spec.get("fiscalYearStartMonth", 0),
+            )
+        ),
     }
 
     if "description" in spec:
@@ -434,6 +498,10 @@ def _sanitize_classic_dashboard(dashboard: dict[str, Any]) -> dict[str, Any]:
     # Folder identity from another Grafana instance can break the provider.
     for key in ["folderId", "folderUid", "folderTitle", "folderUrl"]:
         dashboard.pop(key, None)
+
+    dashboard["refresh"] = str(dashboard.get("refresh") or "15s")
+    dashboard.setdefault("time", {"from": "now-6h", "to": "now"})
+    dashboard["timepicker"] = _convert_timepicker_settings(dashboard)
 
     for panel in _as_list(dashboard.get("panels")):
         if not isinstance(panel, dict):
