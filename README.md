@@ -150,7 +150,7 @@ Monitor pod
 │
 ├── scripts/
 │   ├── build_help_docs.py               # Converts docs/help/ → frontend/help/
-│   ├── generate_grafana_dashboard_configmap.py
+│   ├── build_grafana_dashboard_configmap.py
 │   │                                    # Converts Grafana dashboard source → ConfigMap
 │   └── generate_sample_users.py
 │
